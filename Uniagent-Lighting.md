@@ -322,6 +322,31 @@ def claim_task(sftp, remote_dir, worker_id, timeout):
 - **done 幂等 + 清理**：重复执行同一任务时 reward 只记一次（训练侧收到 done 就评估，先到先得）；训练侧 finally 用 glob `{session}.task.json*` 一次清掉 task.json 与所有 `.claimed.*` 后缀文件；
 - 每个 task.json 的 session_id 唯一，本地脚本用 `session_id[-8:]` 区分配置/轨迹文件，互不覆盖；训练侧 `max_concurrent_sessions` 控制并发上限。
 
+**训练侧任务生命周期：done 触发什么 / 何时写 TQ / 何时删文件**（回答"训练侧是不是监测所有 task.json 变 done？有一个 done 就写 TQ 吗？"）：
+
+- **不是集中式监测**：训练侧没有"看所有 task.json 的监测器"。framework（`_run_prompt_sessions_to_tq`）用 `asyncio.gather` 并发驱动**每个 session 一个独立 runner 实例**（`external_agent_runner`），每个 runner **只轮询自己的 `<session_id>.done`**（`_wait_for_done`，5s 间隔）——per-session 文件天然隔离，多 worker 认领后各自对应的 session 各自等 done；
+- **done 出现 ≠ 写 TQ**：done 触发的第一步是**云侧 reward 评估**（沙箱内写隐藏测试 → pytest → `POST reward_info`）；reward 完成后 runner 返回，framework 才 `finalize_session`（Gateway 云侧物化轨迹）→ `_score_from_reward_info`（用 runner 上报的 reward 标注）→ **`_write_session_trajectories_to_tq` 把轨迹写 TQ**（`kv_batch_put`，NestedTensor，每轨迹一个 key）；
+- **"所有任务完成"的聚合点在 TQ tag，不在文件系统**：同一 prompt 的 `rollout.n` 个 session 都写完轨迹后，framework `kv_put(uid, tag={status: "finished"})`；训练侧 `ReplayBuffer.sample(global_steps)` 轮询 TQ，等该 step 的**全部 uid 都 finished** 才返回（失败 session 写 `status: "failure"` 同样算完成）——所以"什么时候开始训练"由 TQ 的 finished tag 决定；
+- **删除时机（每 session 自己删）**：runner 的 `finally` 在 reward 上报后、返回前执行——glob `{session}.task.json*`（含 `.claimed.*`）删除 + `<session>.done` 删除 + 停沙箱；超时场景（`_wait_for_done` 超时）先回收 claimed 文件（改名回 `.task.json` 供其他 worker 重试），再走同样的 finally 清理——**不存在集中清理，也没有遗留文件的累积**。
+
+```text
+单 session 完整时序（训练侧 framework ↔ 本地 worker 协作）：
+framework._run_session:
+  ① gateway_manager.create_session(session_id)          # Gateway 会话
+  ② runner(external_agent_runner)：
+       建腾讯沙箱 → 写 <session>.task.json
+       → [本地 worker 原子认领(.claimed) → 跑 agent → SSH touch <session>.done]
+       → _wait_for_done 轮询到自己的 done ✓
+       → 云侧 reward（沙箱 pytest）→ POST reward_info
+       → finally：删 {session}.task.json* + <session>.done + 停沙箱
+  ③ finalize_session → Gateway 云侧物化轨迹
+  ④ _score_from_reward_info（用 runner 的 reward 标注）
+  ⑤ 返回轨迹 → _run_prompt_sessions_to_tq 写 TQ（kv_batch_put）+ uid finished tag
+  ⑥ ReplayBuffer 等全部 uid finished → sample → GRPO 训练
+```
+
+> **面试一句话**：训练侧是"每 session 一个 runner、各等各的 done"（不是集中监测）；done 只触发 reward 评估，轨迹在 reward 完成后由 framework 物化并写 TQ，聚合点靠 TQ 的 uid finished tag（ReplayBuffer 等全部完成才训练）；task 文件由每个 runner 的 finally 自删（含 claimed 后缀），超时会先回收再清理——文件系统只是"任务下发与完成"的信令，真正的数据与同步都在 TQ。
+
 **黑盒 vs 白盒的完整对比**（面试高频）：
 
 | 维度 | 白盒 mini-swe-agent | 黑盒 Claude Code |
