@@ -515,6 +515,22 @@ def update_actor(self, data: TensorDict) -> TensorDict:
 
 > 面试一句话总结：**update_actor 完整链路：driver 注入 mini_batch 参数并发 KVBatchMeta 给 worker → worker 的 FSDPEngine.train_mini_batch 经 tqbridge 从 TQ kv_batch_get 拉变长字段 → 按 mini_batch/micro_batch 切分 → 每 micro-batch 前向算 ppo_loss + loss.backward()（FSDP 梯度聚合）→ optimizer_step（clip+step）→ 输出 metrics 经 kv_batch_put 写回 TQ → driver reduce_metrics 收集 actor/loss、grad_norm、mfu——数据"从 TQ 来、回 TQ 去"，driver 只做参数注入与指标聚合。**
 
+**数据分发（dispatch）机制补充：driver 的 batch 是怎么"到"各 worker 的**（面试必问"分发的是不是 KV"）：
+
+- **是的，走 dispatch**：worker 方法（`update_actor` / `compute_log_prob` / `infer_batch`）都用 `@register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name=...))` 装饰（`verl/workers/engine_workers.py`），driver 调用 `worker_group.update_actor(batch)` 时自动走"分发→执行→收集"；
+- **如何分发**（`verl/single_controller/base/decorator.py`）：
+  1. `_split_args_kwargs_data_proto(dp_size)`：把 batch **按 batch 维 chunk 成 dp_size 份**（`BatchData.chunk`；`_CHUNKABLE_TYPES = (TensorDict, DataProto, KVBatchMeta, BatchMeta)`，**KVBatchMeta 先转 BatchMeta 再按 keys 切分**，注释："early translate KVBatchMeta -> BatchMeta to prevent frequent controller communication during PUT/GET in each rank"）；
+  2. 每份 `parallel_put` 进 **Ray object store**（并行放，不直接传）；
+  3. `dp_rank_mapping = worker_group._dispatch_info[mesh_name]`（每个 global worker → 所属 dp rank 的映射，首次调用时 `_query_dispatch_info` 查询）；
+  4. 每个 worker（global_rank）只收 `arg[dp_rank_mapping[global_rank]]`——**自己 dp rank 那份分片**；
+  5. worker 执行 → collect 端按 `collect_mask` 收集 → `_concat_data_proto_or_future` concat 回 driver（或写 TQ）；
+- **分发的是"训练数据的批分片"，不是 KV cache**：
+  - **baseline**：dispatch 切分的是 **TensorDict/DataProto 的完整数据分片**（input_ids/attention_mask/position_ids/old_log_probs/advantages...），每个 worker 拿自己那部分数据；
+  - **master（TQ）**：dispatch 切分的是 **KVBatchMeta 的 keys 元数据分片**（每 worker 拿部分 key），worker 侧 tqbridge 再从 TQ `kv_batch_get` 拉自己那部分 key 的真实数据——**数据本体不随 RPC 走，仍在 TQ**；
+  - **KV cache 不参与分发**：KV cache 是模型在 GPU 上前向（remove-padding 路径）时在**显存里现场生成**的，不存在"分发 KV"这回事——分发的是输入样本，KV 是前向的产物；
+- **与 `_balance_batch` 的配合**：`_balance_batch` 先按 seq_len 负载均衡重排（`get_seqlen_balanced_partitions`，让每个 dp rank 分到的**总 token 数相近**），dispatch 再按 `dp_rank_mapping` 分片——**先均衡重排、再分片**，避免某个 rank 拿到一堆长序列导致前向/反向慢（straggler）；
+- **数值样例**：128 keys（或 128 条 TensorDict）÷ dp_size 16 = **每 worker 8 条**（`batch_size_per_dp = 8`）；`_balance_batch` 重排后这 8 条的总 token 数在各 rank 间相近（如各 ~5600 token）；TQ 版每 worker 拿到 8 个 key 后 `kv_batch_get(select_fields=...)` 拉自己那 8 条变长字段。
+
 ---
 
 ## 10. 前向传播与反向传播细节（FSDPEngine 内部）
