@@ -260,7 +260,7 @@ async def _wait_for_done(session_id: str, run_timeout: float) -> bool:
 
 **本地侧：`platform_local_agent.py`（WSL，白盒 mini-swe-agent），逐步操作：**
 
-**第 1 步（连训练机 + 等任务）**：paramiko SSH 连训练机（凭据在 `work/ucloud.env`），SFTP 轮询 `<PLATFORM_TEST_DIR>` 目录找最新的 `*.task.json`（`wait_for_task`）。
+**第 1 步（连训练机 + 原子认领任务）**：paramiko SSH 连训练机（凭据在 `work/ucloud.env`），SFTP 轮询 `<PLATFORM_TEST_DIR>` 目录并**原子认领**一个 `*.task.json`（`claim_task`：把 `task.json` rename 成 `task.json.claimed.<worker-id>`，**谁 rename 成功谁领到**，多 worker 并发互斥，rename 失败（已被别人领）就试下一个）。
 
 **第 2 步（建隧道）**：`TunnelForwarder` 用 paramiko **direct-tcpip** 把本地随机端口转发到训练机内网 `10.60.56.10:8001`（Gateway）——本地 `127.0.0.1:<port>` → 训练机 Gateway。之后 base_url 改写为 `http://127.0.0.1:<local_port><session_path>`。
 
@@ -296,7 +296,31 @@ class TunnelForwarder:
 **第 3 步（跑 claude）**：`claude --bare -p <task_text>` + `--model Qwen3-8B` + `--max-turns 60` + `--permission-mode bypassPermissions` + `--mcp-config`，`ANTHROPIC_BASE_URL` 指向隧道后的 Gateway session——Claude Code 在**本地 WSL** 编排，模型调用走云端，工具执行走 MCP→沙箱。
 **第 4 步**：完成后 touch done 标记。
 
-**多实例并行**：多个 WSL 终端（或一台机器多个进程）各自跑 `platform_local_agent.py`/`platform_local_claude.py`，各自轮询 task.json、各建各的隧道、各 attach 各自的沙箱——**训练侧 `max_concurrent_sessions` 控制并发**（平台化测试用 1，正式可调大）。每个 task.json 的 session_id 唯一，本地脚本用 `session_id[-8:]` 区分配置/轨迹文件，互不覆盖。
+**多 worker 并发认领（2026-08 升级，替换早期"扫描取第一个"弱认领）**：早期 P0 版 `wait_for_task` 只是"倒序排列表取第一个 task.json"，**不做原子互斥**——多个本地 worker 同时轮询会拿到同一个任务（重复执行）。升级为**原子 rename 认领**：
+
+```python
+# platform_local_agent.py —— claim_task：多 worker 并发安全的原子认领
+def claim_task(sftp, remote_dir, worker_id, timeout):
+    """认领 = 把 <session>.task.json 原子 rename 成 .claimed.<worker>。
+    谁 rename 成功谁领到；失败（FileNotFoundError）说明已被别人领 → 试下一个。"""
+    while time.time() < deadline:
+        tasks = sorted((f for f in listdir(remote_dir) if f.endswith(".task.json")), reverse=True)
+        for name in tasks:
+            claimed_name = f"{name}.claimed.{worker_id}"
+            try:
+                sftp.rename(f"{remote_dir}/{name}", f"{remote_dir}/{claimed_name}")  # 原子
+            except FileNotFoundError:
+                continue                      # 已被其他 worker 认领 → 试下一个
+            payload = json.loads(sftp.open(f"{remote_dir}/{claimed_name}").read())
+            return claimed_name, payload      # 认领成功
+        time.sleep(5)
+```
+
+- **互斥保证**：SFTP rename 在同一文件系统内是原子的——N 个 worker 同时 rename 同一个 task.json，只有一个成功，其余抛 FileNotFoundError 后自动试下一个候选，**一个任务永远只被一个 worker 认领**；
+- **启动方式**：每个 worker 一个进程，`--worker-id w1/w2/...`（认领后缀，必须互异）+ `--loop`（跑完一个继续认领下一个）；例如 4 个并发 `for i in 1 2 3 4; do python platform_local_agent.py --worker-id w$i --loop & done`；
+- **崩溃/超时回收**：worker 认领后崩溃，任务文件停在 `.claimed.*` 状态——训练侧 `_wait_for_done` 超时后按 `PLATFORM_RECLAIM_ON_TIMEOUT`（默认 1）把 claimed 文件**改名回 `.task.json`**，其他 worker 可再次原子认领重跑（`external_agent_runner.py`）；
+- **done 幂等 + 清理**：重复执行同一任务时 reward 只记一次（训练侧收到 done 就评估，先到先得）；训练侧 finally 用 glob `{session}.task.json*` 一次清掉 task.json 与所有 `.claimed.*` 后缀文件；
+- 每个 task.json 的 session_id 唯一，本地脚本用 `session_id[-8:]` 区分配置/轨迹文件，互不覆盖；训练侧 `max_concurrent_sessions` 控制并发上限。
 
 **黑盒 vs 白盒的完整对比**（面试高频）：
 
@@ -308,6 +332,36 @@ class TunnelForwarder:
 | 轨迹来源 | Gateway 云侧物化 | Gateway 云侧物化（Anthropic 适配） |
 | 关键难点 | 配置生成（api_base/attach 沙箱） | 黑盒无远程执行抽象 → 手写 MCP 工具转发 + 禁用内置工具 |
 | reward | 沙箱 pytest 判定 | 沙箱 pytest 判定 |
+
+**MCP 工具转发完整链路（黑盒，真实指令样例）**——"为什么黑盒保留了 Bash/Edit 还需要 MCP"的答案：
+
+- **前提**：官方 uni-agent 的 claude 在沙箱内、内置 Bash/Edit 就地 fork 执行，不需要 MCP；平台化把 claude 挪到本地后，**内置工具必须禁用**（否则在本地执行、改的是本地文件）——`platform_local_claude.py` 的 `--disallowedTools Bash Edit Read Write Glob Grep Agent Task WebFetch WebSearch`，同时 `--mcp-config` 挂上我们的 MCP server；
+- **MCP server**（`scripts/sandbox_mcp_server.py`）：手写 **stdio JSON-RPC 2.0**（每行一个消息，绕开 mcp 2.0 拆包 FastMCP 的坑），通过 `tools/list` 声明 Bash/Read/Write/Edit/Glob 五个同名工具，每个 handler 内部 `Sandbox.connect(E2B_SANDBOX_ID)` 连云端沙箱执行；
+- **真实指令样例**：claude 决定把 `/testbed/solution.py` 的 `return sorted(nums)` 改成 `nums.sort(); return nums`：
+
+```json
+// claude → MCP server（stdio 一行 JSON-RPC）
+{"jsonrpc":"2.0","id":5,"method":"tools/call",
+ "params":{"name":"Edit",
+           "arguments":{"file_path":"/testbed/solution.py",
+                        "old_string":"return sorted(nums)",
+                        "new_string":"nums.sort(); return nums"}}}
+```
+
+```python
+# sandbox_mcp_server.py → 转发到云端沙箱（真实实现）
+async def _tool_edit(args: dict) -> str:
+    sbx = await asyncio.to_thread(_get_sandbox)     # Sandbox.connect(sandbox_id=E2B_SANDBOX_ID)
+    data = await asyncio.to_thread(sbx.files.read, args["file_path"])    # 沙箱读
+    if count == 0: raise RuntimeError("old_string not found ...")
+    if count > 1: raise RuntimeError("old_string appears N times ...")   # 唯一匹配校验
+    await asyncio.to_thread(sbx.files.write, args["file_path"],
+        text.replace(old, new, 1).encode())          # ← 真正改文件在云端沙箱
+    return "edited /testbed/solution.py (1 replacement)"
+```
+
+- **完整链路**：claude 决策 → `tools/call(Edit, {...})`（JSON-RPC over stdio）→ `_HANDLERS["Edit"]` → `_tool_edit()` → `Sandbox.connect` → `sbx.files.read/write`（E2B SDK，云端沙箱落地）→ JSON-RPC 响应回 claude → 继续决策（下一步 `Bash` 跑 pytest 同样走 `_tool_bash` → `sbx.commands.run`）；
+- **一句话**：官方管"agent 进沙箱、工具就地执行"（不需要 MCP），我们管"agent 出沙箱、工具远程转发"（MCP 就是那把"工具执行位置从本地重定向到沙箱"的钥匙）——这也是简历"针对黑盒无远程执行抽象、手写 stdio JSON-RPC MCP 工具转发层"的由来。
 
 ### 3. 具体数值样例（真实 reward=1 轨迹逐字段拆解）
 
