@@ -340,13 +340,35 @@ agent_runners:
 
 > **面试一句话总结**：官方 Agent 抽象 = AgentRunner 协议 + 五步 runner 模板（解析任务 → 建沙箱 → 跑 agent → 评估 reward → 上报清理），接入新 agent 就是实现一个 runner 函数并在配置注册；白盒 harness 直接注入沙箱环境类，黑盒需要工具转发层。
 
+### 4. Agent 部署位置：官方 in-sandbox vs 本项目 agent-outside（关键对比）
+
+**官方 uni-agent 的黑白盒 agent 默认都在沙箱内部启动**（源码 + 官方文档双重确认）：
+
+- **Agent 抽象语义**（`uni_agent/agents/base.py`）：`Agent.run(*, sandbox, messages)`——"Every Agent receives a **started Sandbox**"，agent 拿到已启动的沙箱、**在沙箱内**解决任务；官方概念文档（`docs/source/concepts/agent.md`）明写："Black-box Agent: an external harness owns the loop and **runs as a process inside the Sandbox**"、"Ensure the external CLI is installed **inside the Sandbox**. Launch the harness through `sandbox.exec()`"；
+- **官方黑盒（Claude Code）**（`examples/blackbox_recipes/claude_code/claude_code_runner.py`）：sidecar 工具镜像（`@anthropic-ai/claude-code` npm 包，`FROM scratch` 根 `/opt/claude-code`）挂载进 SWE-bench 沙箱 → 沙箱内执行 `/opt/claude-code/bin/claude -p <task> --permission-mode bypassPermissions` → `ANTHROPIC_BASE_URL = http://127.0.0.1:<proxy_port>`（**沙箱内隧道**，`rewrite_gateway_url` 把 Gateway URL 重写为沙箱本地）→ claude 的 **Bash/Edit/Read/Write 工具就地 fork 执行**（agent 进程与文件系统/代码执行同处一个沙箱），不需要 MCP；
+- **官方白盒（mini-swe-agent）**（`uni_agent/agents/mini_swe_agent/agent.py`）：注释明写 "black-box agent launched **inside the sandbox**. NOT YET IMPLEMENTED"——计划把 mini-swe-agent 装进沙箱 venv、`sandbox.exec()` 启动；
+- **Gateway 的角色**：不是 agent 宿主，而是**模型端点代理 + 轨迹记录器**（session-scoped `base_url` 注入 `agent.model`）；agent 也可以不走 Gateway 直连外部模型 API（"External API inference bypasses the Gateway"）。
+
+**本项目（uniagent-lighting）是反向改造：agent 在外部（用户侧/本地），沙箱仅负责执行**：
+
+| 维度 | 官方 uni-agent（in-sandbox） | 本项目平台化（agent-outside） |
+|---|---|---|
+| agent 进程位置 | **沙箱内部**（claude 装沙箱 / 白盒计划装沙箱） | **用户侧/本地 WSL**（任意位置） |
+| 黑盒工具执行 | claude 自带工具**就地执行**（无需 MCP） | 内置工具 `--disallowedTools` 禁用 + **手写 stdio JSON-RPC MCP 转发层**把 Bash/Edit 转发到云端沙箱 |
+| 白盒工具执行 | harness 装沙箱，`sandbox.exec()` 启动 | harness 在本地，**环境类 `Sandbox.connect(attach_instance_id)` attach 沙箱**远程执行 |
+| 模型调用 | 沙箱内隧道 → Gateway | 本地 → SSH 隧道（paramiko direct-tcpip）→ Gateway |
+| 沙箱职责 | agent 宿主 + 执行环境（一个沙箱全包） | **仅执行**（代码/测试/reward 判定） |
+| 一句话 | 官方管"agent 进沙箱、工具就地跑" | 我们管"agent 出沙箱、工具远程转发/attach" |
+
+> 面试关键表述：**官方 uni-agent 的黑白盒 agent 默认在沙箱内部启动（Agent.run(sandbox) 语义 + claude_code_runner 沙箱内跑二进制 + 沙箱内隧道连 Gateway，工具就地执行不需要 MCP）；我们把 agent 挪到外部做"训练、推理、环境、奖励解耦"，因此白盒用 Environment attach 沙箱、黑盒手写 MCP 工具转发层把工具调用送回沙箱——"官方管 agent 进沙箱，我们管 agent 出沙箱"。**
+
 ---
 
 ## 3. Sandbox（官方抽象）：执行环境的多后端封装
 
 ### 1. 现有问题：为什么需要独立的沙箱
 
-Agent 的"思考"（决策、生成）和"行动"（执行代码、跑测试）是两类完全不同的工作：思考需要模型算力，行动需要安全隔离的代码执行环境。如果让 agent 直接在训练机或本地执行任意代码，有**安全风险**（不可信代码可能破坏环境）和**耦合问题**（执行环境绑定 agent 位置）。Uni-agent 的定位是"**沙箱只负责执行**"：代码执行、测试、reward 判定都在沙箱里完成，agent 和训练机都不碰执行环境。这样 agent / 沙箱 / 训练可以独立扩缩，沙箱也可以换成任何后端。
+Agent 的"思考"（决策、生成）和"行动"（执行代码、跑测试）是两类完全不同的工作：思考需要模型算力，行动需要安全隔离的代码执行环境。如果让 agent 直接在训练机或本地执行任意代码，有**安全风险**（不可信代码可能破坏环境）和**耦合问题**（执行环境绑定 agent 位置）。官方 uni-agent 的定位是"**沙箱承载执行**"（代码执行、测试、reward 判定都在沙箱里完成），且官方默认把 agent 也放进沙箱（见第 2 点第 4 小节）；**本项目进一步把 agent 挪到外部**，让沙箱只负责执行、agent 在任意位置——这样 agent / 沙箱 / 训练可以独立扩缩，沙箱也可以换成任何后端。
 
 ### 2. 方法论：官方 Sandbox 抽象是怎么设计的
 

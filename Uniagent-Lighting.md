@@ -392,6 +392,16 @@ async def _tool_edit(args: dict) -> str:
 - **完整链路**：claude 决策 → `tools/call(Edit, {...})`（JSON-RPC over stdio）→ `_HANDLERS["Edit"]` → `_tool_edit()` → `Sandbox.connect` → `sbx.files.read/write`（E2B SDK，云端沙箱落地）→ JSON-RPC 响应回 claude → 继续决策（下一步 `Bash` 跑 pytest 同样走 `_tool_bash` → `sbx.commands.run`）；
 - **一句话**：官方管"agent 进沙箱、工具就地执行"（不需要 MCP），我们管"agent 出沙箱、工具远程转发"（MCP 就是那把"工具执行位置从本地重定向到沙箱"的钥匙）——这也是简历"针对黑盒无远程执行抽象、手写 stdio JSON-RPC MCP 工具转发层"的由来。
 
+**为什么白盒能直接 attach、黑盒却要 disallowedTools + MCP（机制对比，面试必问）**：
+
+- **本质：白盒的工具是"我们的"（代码可控，白名单语义），黑盒的工具是"它的"（闭源闭环，只能黑名单做减法）**；
+- **白盒 attach** = 在训练机本地跑的 mini-swe-agent harness 通过 E2B `Sandbox.connect(sandbox_id=attach_instance_id)` 连到"runner 已建好的沙箱实例"（`tencent_e2b.py` 的 `_create()`），agent 循环的 `execute_actions` 里每个 action 走 `env.execute(action)` → `sandbox.commands.run` 在沙箱远端执行——工具集是 mini-swe-agent 的环境接口方法（`Environment.execute`），**执行位置由我们代码直接指定**（换环境类即可），所以"想 attach 就 attach"，不需要禁用/转发任何东西；
+- **黑盒 disallowedTools**：claude 二进制自带完整工具闭环（own loop + own tools + own subagents），我们无法改它内部，只能从外部黑名单。`--disallowedTools` 具体禁掉两类并各有原因：
+  - **`Agent` / `Task`（子代理 / 任务分解）**：会并行启动子进程/子 agent——① 子代理的 LLM 调用**不经过主 session 的 Gateway 轨迹**（或轨迹错乱），破坏 token-truth 轨迹的 tool-call/tool-result 对应结构 → **训练数据污染**；② 子进程不可控（资源爆炸、文件乱写）；③ RL 要的是"单 agent 决策轨迹"；
+  - **`WebFetch` / `WebSearch`（网络）**：SWE-bench 任务不需要联网；禁用保证**可复现 + 无信息泄露**（不能搜题/查 patch），轨迹纯净；
+  - 保留 `Bash/Edit/Read/Write/Glob/Grep` 的"同名 MCP 版本"（转发到沙箱）——真正在沙箱里改 `/testbed`、跑 pytest 的工具；
+- **对照结论**：attach 是"我们的工具连到沙箱"（白名单，代码说了算），disallowedTools + MCP 是"它的工具我们禁掉危险的、用同名 MCP 工具接管"（黑名单 + 协议拦截）——同一个"agent 在外、工具在沙箱"的目标，白盒靠换 Environment 实现、黑盒靠 MCP 转发，这是黑盒平台化额外多一层工程的根本原因。
+
 ### 3. 具体数值样例（真实 reward=1 轨迹逐字段拆解）
 
 以本项目真实跑通的一条**黑盒 reward=1 轨迹**（`blackbox_full_20260812/.../session-sample-0-rollout-0-3d3cf465...`，humanevalfix-Python-115 水桶问题）为样例，完整拆解"一次成功的分离式 RL 样本"：
