@@ -80,6 +80,14 @@ async def _handle_openai_chat_completions(self, session_id, payload):
 
 **Chain 机制（多轮轨迹怎么组织，关键设计）**：一次会话可以有**多条 chain**（agent 分支/重试会产生新 chain），每条 chain 是"一条独立可训练轨迹的构建现场"。`_select_chain()` 的匹配逻辑：用 incoming 消息的前缀哈希与 active chain 的 `message_tip_hash` 比对——**若 incoming 消息是某 chain 消息历史的前缀延伸（续链），匹配到该 chain**；**若 incoming 消息与某 chain 的"最后一次 assistant 之后"的部分不一致（即 agent 重写/回退了上一次的 assistant 响应），触发 rollback**：截断上次 assistant 的 token（从 `last_assistant_start` 记录的截断点删起），从该点重新生成，被丢弃的 trainable token 计入 `rollback_dropped_trainable_tokens` 统计。这保证**被回滚的 assistant 输出不会残留在训练轨迹里**（否则会让"未采纳的中间尝试"也参与 loss）。
 
+**子 agent 轨迹：官方不支持（重要澄清，面试易问）**——用户可能误以为 uni-agent 支持"子 agent 轨迹树"，实际**官方没有子轨迹的数据结构与机制**：
+
+- **`Trajectory` 是扁平结构**（`gateway/session/types.py`）：只有 `prompt_ids / response_ids / response_mask / response_logprobs / reward_info / num_turns / extra_fields` 等，**没有 `children` / `parent` 字段**——不存在"子轨迹"的表达能力；
+- **Gateway session 内是"线性链"而非树**（`session.py` 的 `ChainState`，docstring 明写 "One active **linear** trajectory chain"）：多条 chain（`chain_id`）是**轨迹断裂/回滚后分叉重开的线性链**（每条链物化一个 Trajectory），不是子 agent 嵌套；
+- **verl agent_loop 无 sub-agent**（`verl/verl/experimental/agent_loop/` 的 `ToolAgentLoop`）：只有 `max_user_turns / max_assistant_turns`（多轮）、`max_parallel_calls`（**并行工具调用**）——全仓库搜 `multi_agent / orchestrator / sub_agents` 零命中；
+- **官方 `claude_code` agent 默认禁用 Claude Code 的 subagent 能力**（`uni_agent/agents/claude_code/agent.py`）：`CLAUDE_CODE_FORK_SUBAGENT: "0"` + disallowedTools deny-list 含 Subagent；虽然配置了 `CLAUDE_CODE_SUBAGENT_MODEL`（pin 到主 model，因为 Claude Code 的 background/subagent 调用会打到 haiku+subagent 槽位，不 pin 则 vLLM 404）——**即使打开 fork，子代理调用也走主 session 的同一个 base_url（Gateway），作为主 session 内的事件记录，不产生独立子轨迹**；
+- 结论：**"子 agent 轨迹"在官方 uni-agent 里没有落点**（数据结构扁平 + session 线性链 + 无多 agent 编排），子代理要么被禁（官方默认），要么其调用混入主 session 事件、无法作为独立轨迹训练——如果要支持多 agent/子代理轨迹，需要自研扩展（如每个子代理开独立 session + 元数据关联）。
+
 **（4）MessageCodec（`session/codec.py`）——消息 ↔ token 的编解码**：`encode_full`（完整 prompt 编码成 token ids）、`encode_incremental`（增量消息编码，续轮用）、`canonicalize_message_for_prefix_comparison`（消息规范化用于前缀哈希比较）。codec 还负责**工具调用标记的解码**（`decode_response`：把模型输出的 token ids 解码成 assistant 消息，识别工具调用标记）和多模态数据提取（图片/视频 URL → 张量，`_codec.extract_multi_modal_data`）。
 
 **（5）多模态支持**：`GatewaySession` 的 `_prepare_generation_inputs` 通过 `_codec.extract_multi_modal_data(messages)` 提取图片/视频数据，`TrajectoryBuffer` 和 `Trajectory` 都有 `multi_modal_data` 字段；`framework/multi_modal_postprocess.py` 的 `compute_multi_modal_inputs` / `compute_position_ids` 在转换 TQ 字段时处理多模态（对应 verl 的多模态输入格式）。

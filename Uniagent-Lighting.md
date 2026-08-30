@@ -397,7 +397,7 @@ async def _tool_edit(args: dict) -> str:
 - **本质：白盒的工具是"我们的"（代码可控，白名单语义），黑盒的工具是"它的"（闭源闭环，只能黑名单做减法）**；
 - **白盒 attach** = 在训练机本地跑的 mini-swe-agent harness 通过 E2B `Sandbox.connect(sandbox_id=attach_instance_id)` 连到"runner 已建好的沙箱实例"（`tencent_e2b.py` 的 `_create()`），agent 循环的 `execute_actions` 里每个 action 走 `env.execute(action)` → `sandbox.commands.run` 在沙箱远端执行——工具集是 mini-swe-agent 的环境接口方法（`Environment.execute`），**执行位置由我们代码直接指定**（换环境类即可），所以"想 attach 就 attach"，不需要禁用/转发任何东西；
 - **黑盒 disallowedTools**：claude 二进制自带完整工具闭环（own loop + own tools + own subagents），我们无法改它内部，只能从外部黑名单。`--disallowedTools` 具体禁掉两类并各有原因：
-  - **`Agent` / `Task`（子代理 / 任务分解）**：会并行启动子进程/子 agent——① 子代理的 LLM 调用**不经过主 session 的 Gateway 轨迹**（或轨迹错乱），破坏 token-truth 轨迹的 tool-call/tool-result 对应结构 → **训练数据污染**；② 子进程不可控（资源爆炸、文件乱写）；③ RL 要的是"单 agent 决策轨迹"；
+  - **`Agent` / `Task`（子代理 / 任务分解）**：会并行启动子进程/子 agent——① **官方 uni-agent 没有子轨迹的数据结构**（`Trajectory` 扁平、Gateway session 内是线性 `ChainState`、verl agent_loop 无 sub-agent，见 `Uniagent.md`），子代理调用即使走主 session 的 Gateway 也无法作为独立轨迹表达，只能混入主 session 事件，**破坏 token-truth 轨迹的 tool-call/tool-result 对应结构 → 训练数据污染**；② 子进程不可控（资源爆炸、文件乱写）；③ RL 要的是"单 agent 决策轨迹"；
   - **`WebFetch` / `WebSearch`（网络）**：SWE-bench 任务不需要联网；禁用保证**可复现 + 无信息泄露**（不能搜题/查 patch），轨迹纯净；
   - 保留 `Bash/Edit/Read/Write/Glob/Grep` 的"同名 MCP 版本"（转发到沙箱）——真正在沙箱里改 `/testbed`、跑 pytest 的工具；
 - **对照结论**：attach 是"我们的工具连到沙箱"（白名单，代码说了算），disallowedTools + MCP 是"它的工具我们禁掉危险的、用同名 MCP 工具接管"（黑名单 + 协议拦截）——同一个"agent 在外、工具在沙箱"的目标，白盒靠换 Environment 实现、黑盒靠 MCP 转发，这是黑盒平台化额外多一层工程的根本原因。
