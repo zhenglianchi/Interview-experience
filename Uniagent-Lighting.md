@@ -296,38 +296,41 @@ class TunnelForwarder:
 **第 3 步（跑 claude）**：`claude --bare -p <task_text>` + `--model Qwen3-8B` + `--max-turns 60` + `--permission-mode bypassPermissions` + `--mcp-config`，`ANTHROPIC_BASE_URL` 指向隧道后的 Gateway session——Claude Code 在**本地 WSL** 编排，模型调用走云端，工具执行走 MCP→沙箱。
 **第 4 步**：完成后 touch done 标记。
 
-**多 worker 并发认领（2026-08 升级，替换早期"扫描取第一个"弱认领）**：早期 P0 版 `wait_for_task` 只是"倒序排列表取第一个 task.json"，**不做原子互斥**——多个本地 worker 同时轮询会拿到同一个任务（重复执行）。升级为**原子 rename 认领**：
+**多 worker 并发认领（2026-08 升级，替换早期"扫描取第一个"弱认领）**：早期 P0 版 `wait_for_task` 只是"倒序排列表取第一个 task.json"，**不做原子互斥**——多个本地 worker 同时轮询会拿到同一个任务（重复执行）。升级为**原子 rename 认领**（`scripts/platform/platform_local_agent.py`，与仓库 `docs/任务剖析-外部形态.md` §7.5 一致）：
 
 ```python
-# platform_local_agent.py —— claim_task：多 worker 并发安全的原子认领
-def claim_task(sftp, remote_dir, worker_id, timeout):
-    """认领 = 把 <session>.task.json 原子 rename 成 .claimed.<worker>。
-    谁 rename 成功谁领到；失败（FileNotFoundError）说明已被别人领 → 试下一个。"""
+# platform_local_agent.py —— wait_for_task：多实例并发安全的原子认领
+def wait_for_task(sftp, remote_dir, timeout):
+    deadline = time.time() + timeout
     while time.time() < deadline:
-        tasks = sorted((f for f in listdir(remote_dir) if f.endswith(".task.json")), reverse=True)
+        _recover_stale_claims(sftp, remote_dir, timeout)   # 先回收过期认领（7.5.4）
+        files = sorted(sftp.listdir(remote_dir), reverse=True)
+        tasks = [f for f in files if f.endswith(".task.json")]
         for name in tasks:
-            claimed_name = f"{name}.claimed.{worker_id}"
+            claimed = f"{name}.claimed"
             try:
-                sftp.rename(f"{remote_dir}/{name}", f"{remote_dir}/{claimed_name}")  # 原子
-            except FileNotFoundError:
-                continue                      # 已被其他 worker 认领 → 试下一个
-            payload = json.loads(sftp.open(f"{remote_dir}/{claimed_name}").read())
-            return claimed_name, payload      # 认领成功
+                sftp.rename(f"{remote_dir}/{name}", f"{remote_dir}/{claimed}")  # ★ 原子认领
+            except OSError:
+                continue          # 已被其他实例抢走 → 试下一个
+            with sftp.open(f"{remote_dir}/{claimed}") as fh:
+                payload = json.loads(fh.read().decode())
+            return claimed, payload   # 认领成功：文件状态 <id>.task.json → <id>.task.json.claimed
         time.sleep(5)
+    raise TimeoutError(...)
 ```
 
-- **互斥保证**：SFTP rename 在同一文件系统内是原子的——N 个 worker 同时 rename 同一个 task.json，只有一个成功，其余抛 FileNotFoundError 后自动试下一个候选，**一个任务永远只被一个 worker 认领**；
-- **启动方式**：每个 worker 一个进程，`--worker-id w1/w2/...`（认领后缀，必须互异）+ `--loop`（跑完一个继续认领下一个）；例如 4 个并发 `for i in 1 2 3 4; do python platform_local_agent.py --worker-id w$i --loop & done`；
-- **崩溃/超时回收**：worker 认领后崩溃，任务文件停在 `.claimed.*` 状态——训练侧 `_wait_for_done` 超时后按 `PLATFORM_RECLAIM_ON_TIMEOUT`（默认 1）把 claimed 文件**改名回 `.task.json`**，其他 worker 可再次原子认领重跑（`external_agent_runner.py`）；
-- **done 幂等 + 清理**：重复执行同一任务时 reward 只记一次（训练侧收到 done 就评估，先到先得）；训练侧 finally 用 glob `{session}.task.json*` 一次清掉 task.json 与所有 `.claimed.*` 后缀文件；
-- 每个 task.json 的 session_id 唯一，本地脚本用 `session_id[-8:]` 区分配置/轨迹文件，互不覆盖；训练侧 `max_concurrent_sessions` 控制并发上限。
+- **互斥保证**：SFTP `rename` 在同一文件系统内是原子的——N 个实例同时 poll，**只有 rename 成功的那一个拿到该任务**，其余 `OSError → continue` 去找下一个文件，互不冲突——**一个任务永远只被一个实例认领**；
+- **过期回收（`_recover_stale_claims`）**：认领实例正常处理完会删 claimed；若**崩溃残留**，其他实例发现 claimed 文件 **mtime 超过 `--timeout`** 视为失效，把它 `rename` 回 `.task.json` 重新认领——与内部形态"session 失败 → abort → framework 统计重试"的失败重试语义对齐（回收在**本地侧**，不是训练侧）；
+- **`--max-tasks` 循环处理**：每个实例一个进程，`--max-tasks N` 控制单实例连续处理 N 个任务（`while processed < args.max_tasks: wait_for_task → process_one_task(隧道→agent→touch done) → sftp.remove(claimed)`），默认 1——多实例 = 多个进程各自 `--max-tasks`，无需 worker-id（rename 原子性本身互斥）；
+- **done 幂等 + 清理**：重复执行同一任务时 reward 只记一次（训练侧收到 done 就评估，先到先得）；本地实例处理完 `sftp.remove(claimed)`，训练侧 finally 同时清理 `task_file` 与 `task_file.claimed` 双路径 + `<session>.done`；
+- 每个 task.json 的 session_id 唯一，本地脚本用 `session_id[-8:]` 区分配置/轨迹文件，互不覆盖；训练侧 `max_concurrent_sessions` 控制并发上限（并发 N 个 session → 服务器 platform_test/ 同时出现 N 个 task.json，本地 N 个实例竞争认领）。
 
 **训练侧任务生命周期：done 触发什么 / 何时写 TQ / 何时删文件**（回答"训练侧是不是监测所有 task.json 变 done？有一个 done 就写 TQ 吗？"）：
 
 - **不是集中式监测**：训练侧没有"看所有 task.json 的监测器"。framework（`_run_prompt_sessions_to_tq`）用 `asyncio.gather` 并发驱动**每个 session 一个独立 runner 实例**（`external_agent_runner`），每个 runner **只轮询自己的 `<session_id>.done`**（`_wait_for_done`，5s 间隔）——per-session 文件天然隔离，多 worker 认领后各自对应的 session 各自等 done；
 - **done 出现 ≠ 写 TQ**：done 触发的第一步是**云侧 reward 评估**（沙箱内写隐藏测试 → pytest → `POST reward_info`）；reward 完成后 runner 返回，framework 才 `finalize_session`（Gateway 云侧物化轨迹）→ `_score_from_reward_info`（用 runner 上报的 reward 标注）→ **`_write_session_trajectories_to_tq` 把轨迹写 TQ**（`kv_batch_put`，NestedTensor，每轨迹一个 key）；
 - **"所有任务完成"的聚合点在 TQ tag，不在文件系统**：同一 prompt 的 `rollout.n` 个 session 都写完轨迹后，framework `kv_put(uid, tag={status: "finished"})`；训练侧 `ReplayBuffer.sample(global_steps)` 轮询 TQ，等该 step 的**全部 uid 都 finished** 才返回（失败 session 写 `status: "failure"` 同样算完成）——所以"什么时候开始训练"由 TQ 的 finished tag 决定；
-- **删除时机（每 session 自己删）**：runner 的 `finally` 在 reward 上报后、返回前执行——glob `{session}.task.json*`（含 `.claimed.*`）删除 + `<session>.done` 删除 + 停沙箱；超时场景（`_wait_for_done` 超时）先回收 claimed 文件（改名回 `.task.json` 供其他 worker 重试），再走同样的 finally 清理——**不存在集中清理，也没有遗留文件的累积**。
+- **删除时机（每 session 自己删）**：runner 的 `finally` 在 reward 上报后、返回前执行——**双路径清理** `task_file` 与 `task_file.claimed`（本地实例认领会把 task.json rename 成 `.claimed`，两种名字都删）+ `<session>.done` 删除 + 停沙箱；本地实例侧处理完也 `sftp.remove(claimed)`——**不存在集中清理，也没有遗留文件的累积**（崩溃残留的 claimed 由本地侧 `_recover_stale_claims` 按 mtime 回收）。
 
 ```text
 单 session 完整时序（训练侧 framework ↔ 本地 worker 协作）：
@@ -335,10 +338,11 @@ framework._run_session:
   ① gateway_manager.create_session(session_id)          # Gateway 会话
   ② runner(external_agent_runner)：
        建腾讯沙箱 → 写 <session>.task.json
-       → [本地 worker 原子认领(.claimed) → 跑 agent → SSH touch <session>.done]
+       → [本地实例 wait_for_task 原子认领(.claimed) → 跑 agent → SSH touch <session>.done
+          → 本地 sftp.remove(claimed)]
        → _wait_for_done 轮询到自己的 done ✓
        → 云侧 reward（沙箱 pytest）→ POST reward_info
-       → finally：删 {session}.task.json* + <session>.done + 停沙箱
+       → finally：删 task.json + task.json.claimed + <session>.done + 停沙箱
   ③ finalize_session → Gateway 云侧物化轨迹
   ④ _score_from_reward_info（用 runner 的 reward 标注）
   ⑤ 返回轨迹 → _run_prompt_sessions_to_tq 写 TQ（kv_batch_put）+ uid finished tag
