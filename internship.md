@@ -35,8 +35,9 @@
 
 - 一轮训练：dataloader 出 32 个 prompt（`train_batch_size=32`），`rollout.n=4` → 128 个 rollout 任务交给 agent 环境；
 - agent 执行后有失败/超时 → 假设 120 个 triplet 成功回传；
-- **baseline**：120 → `pad_dataproto_to_divisor(120, 16)` = 128（8 条 dummy）→ 前向算 old_log_prob → unpad 回 120 → is_drop 过滤 10 条 → 110 → `floor(110/32)*32` = 96 → `_update_actor`；
-- **master（TQ）**：120 个 triplet 直接以**变长 NestedTensor** 写 TQ（`daemon.get_train_data_batch` → `kv_batch_put`），不再 pad/unpad；`_balance_batch` 用 **upsample（复制样本）** 替代 pad 补零，is_drop 在 tags 里标记、`_compute_*` 时过滤——**数据形状两方案差异巨大**。
+- **baseline（agent-lightning 改造后，`upgrade/verl-0.8.0` 分支）**：120 → `pad_dataproto_to_divisor(120, divisor=lcm(dp_size, mini_batch))` 向上 pad（如到 128）→ 前向算 old_log_prob → unpad 回 120 → is_drop 过滤 10 条 → 110 → **向上补齐**：`if n_transition % per_gpu_divisor != 0: floor_pad_size = per_gpu_divisor - n_transition % per_gpu_divisor; pad_dataproto_to_divisor(batch, per_gpu_divisor)`（pad 到 `per_gpu_divisor = world_size × (mini_batch×n // world_size)` 的倍数，被 pad 样本的 `response_mask/token_level_rewards` 置 0，不参与 loss）→ `_update_actor`（override 后 mini_batch_size=32 不乘 n）；
+- **master（TQ）**：120 个 triplet 直接以**变长 NestedTensor** 写 TQ（`daemon.get_train_data_batch` → `kv_batch_put`），不再 pad/unpad；`_balance_batch` 用 **upsample（合成 no-op 样本补齐到 batch_multiple=lcm(dp, mini_batch×n)）** 替代 pad 补零，`is_padding` 标记不进 PPO/entropy/KL，is_drop 在 tags 里标记、`_compute_*` 时过滤——**数据形状两方案差异巨大，但都是"向上补齐"而非丢弃**；
+- ⚠️ 注意：`VERL_UPGRADE_ANALYSIS.md` 里的 "110 → `floor(110/32)*32` = 96 丢弃 14 条" 是 **原生 verl 0.8.0（agent-lightning 改造前）** 的 floor 行为，改造后两个分支都改为向上补齐（master upsample / baseline pad），**不存在"丢弃数据"**。
 
 > 面试一句话总结：**master（TQ）与 verl-0.8.0（无 TQ）的差异 = 数据载体与字段布局：TQ 版把训练数据按 key 存进 TransferQueue（变长 NestedTensor），driver 只拿 KVBatchMeta 按需 kv_batch_get/put，省掉 pad/unpad 整包搬运；无 TQ 版用 DataProto 整包带着走、padded 布局——同一套 GRPO 逻辑，两条完全不同的数据通路。**
 
@@ -665,7 +666,7 @@ def _compute_old_log_prob(self, batch: DataProto):
 
 ### 3. 具体数值样例
 
-- 96 条（舍入后）进 `_update_actor`：`to_tensordict`（96×1024 padded）→ `left_right_2_no_padding`（保留实际 token）→ 塞 mini_batch_size=128 → RPC 到 16 worker → 每 worker 6 条 → `make_iterator` 断言 6 % 8 ≠ 0（**ERROR 2**，第 16 点）；
+- 补齐后的 batch（如 128 条，含 pad/upsample）进 `_update_actor`：`to_tensordict`（128×1024 padded）→ `left_right_2_no_padding`（保留实际 token）→ 塞 mini_batch_size=128 → RPC 到 16 worker → 每 worker 8 条 → `make_iterator` 断言 8 % 8 = 0 ✓（若 batch 数不足导致 per-GPU 非整除则触发 **ERROR 2**，见第 16 点）；
 - 每阶段数据量：driver 内存中 batch 字段随 union 增长（input_ids+attention_mask+position_ids+response_mask+old_log_probs+ref_log_prob+advantages+returns+rm_scores ≈ 9 个字段 × 128 × 1024 × 8B ≈ 9 MB 常驻）；
 - 对比 TQ：同 128 样本，TQ 里按需拉字段（每个阶段 2-8 个字段、变长），driver 常驻只有 KVBatchMeta（KB 级）。
 
@@ -728,7 +729,7 @@ def _compute_old_log_prob(self, batch: DataProto):
 
 ### 3. 具体数值样例
 
-- 同一批 96 条（baseline）vs 120 keys（master）：baseline 每阶段 pad/unpad 往返 2 次（128→120→96），master 全程变长只在 ppo_loss 里转 padded；
+- 同一批数据（baseline pad/补齐后 ~128 条 vs master 120 keys + upsample）：baseline 每阶段 pad/unpad 往返 2 次（128→120→补齐），master 全程变长只在 ppo_loss 里转 padded；
 - 4 个 micro-batch × to_padded_tensor ≈ 15s（master 净增），2 个 infer 阶段（old_log_prob/ref）各省 ~1s（master 净省）；
 - 结果：master update_actor 17s vs baseline 2s（+15s），ref+old_log_prob master -2s——**净 +13s/step，这是 TQ 方案当前的主要性能代价（有明确修复方案）**。
 
@@ -805,19 +806,22 @@ def _update_actor(self, batch: DataProto) -> DataProto:
 
 - 效果：`mini_batch_size_per_gpu = 32/16 = 2`，per-GPU 一定是 2 的倍数（agent-lightning 已保证总 batch 是 32 的倍数）→ 断言永远通过。
 
-**数据流链条**（两版本完整对比）：
+**数据流链条**（含原生 verl 与 agent-lightning 改造后的对比）：
 ```
-0.6.1：128(rollout) → 120(triplet) → pad16→128 → old_log_prob → unpad→120
-       → is_drop→110 → floor32→96 → update_actor（dispatch rebalance 兼容）
-0.8.0：120 → pad64→128 → old_log_prob → unpad→120 → is_drop→110
-       → floor32→96 → update_actor（override 后 mini_bsz_per_gpu=2 ✓）
-master(TQ)：120 triplet → NestedTensor 写 TQ → balance_batch upsample → update_actor（无 pad 往返）
+原生 verl 0.6.1（改造前）：128(rollout) → 120(triplet) → pad16→128 → old_log_prob → unpad→120
+       → is_drop→110 → floor32→96（丢弃 14 条）→ update_actor（dispatch rebalance 兼容）
+原生 verl 0.8.0（改造前）：120 → pad64→128 → old_log_prob → unpad→120 → is_drop→110
+       → floor32→96（丢弃 14 条）→ update_actor（原生 mini_bsz=128 → per-GPU 断言可能炸）
+baseline（agent-lightning 改造后）：120 → pad(lcm(dp,mini))→128 → old_log_prob → unpad→120
+       → is_drop→110 → 向上 pad 到 per_gpu_divisor（response_mask 置 0）→ update_actor（override 后 mini_bsz=32 ✓）
+master(TQ)：120 triplet → NestedTensor 写 TQ → balance_batch upsample（合成 no-op 补齐）→ update_actor（无 pad 往返）
 ```
+> 注意：`floor32→96` 只存在于**原生 verl 0.6.1/0.8.0（agent-lightning 改造前）**；改造后两个分支都是**向上补齐**（baseline pad dummy + response_mask 置 0、master upsample no-op 样本），**不丢弃任何真实 triplet**（丢弃的是 padding 标记，不参与 loss）。
 
 ### 3. 具体数值样例
 
-- daemon 产出 100 条：0.8.0 原版 pad 到 112 → per-GPU 7 → ERROR 1；修复后 pad 到 128 → per-GPU 8 ✓；
-- daemon 产出 96 条：0.8.0 原版 mini_batch_size=128 → per-GPU 6 → ERROR 2；override 后 mini_batch_size=32 → per-GPU 2 ✓；
+- daemon 产出 100 条：原生 0.8.0 原版 pad 到 112 → per-GPU 7 → ERROR 1；修复后 pad 到 128 → per-GPU 8 ✓；
+- daemon 产出 96 条：原生 0.8.0 原版 mini_batch_size=128 → per-GPU 6 → ERROR 2；override 后 mini_batch_size=32 → per-GPU 2 ✓（且 agent-lightning 对不足的 batch 是向上 pad 补齐，不再有 floor 丢弃）；
 - 含义：**agent 场景 batch 大小动态波动（0~128），必须让"pad 除数"和"mini_batch 语义"都适配 agent 的 triplet 展开模型**——这是升级 verl 做 AgenticRL 的核心兼容性工作。
 
 > 面试一句话总结：**0.6.1→0.8.0 的坑是两处整除断言：prepare_micro_batches 要求总 batch 是 world_size×micro_bsz 的倍数（pad 除数 16→64），_update_actor 的 make_iterator 要求是 mini_batch_size 的倍数（override 去掉 ×rollout.n，因为 agent 已把 n 条 response 展开成 triplet）——agent 动态 batch 大小在 0.8.0 的固定尺寸断言下必然踩雷，这正是实习"修复升级引入的数据流兼容问题"的内容。**
@@ -888,7 +892,7 @@ TQ 的 StorageManager 后端之一（MooncakeStorageManager/MooncakeStoreClient�
 
 ## 核心数字
 
-- `train_batch_size=32`、`rollout.n=4` → 128 rollouts/step；triplet 120 → balance 128（master）/ pad128→120→110→96（baseline）
+- `train_batch_size=32`、`rollout.n=4` → 128 rollouts/step；triplet 120 → master upsample 到 128 / baseline pad 补齐到 per_gpu_divisor（都向上补齐，不丢弃真实样本；原生 verl 才是 floor32→96）
 - `ppo_mini_batch_size=32`、`micro_batch_size_per_gpu=4`、DP=16 → per-GPU 8 条 → 2 micro-batch
 - 性能：TQ 读取 0.5s；nested→padded 4×3-4s ≈ 15s（修复后 ~0.05s）；infer -2s；update_weights +5s（CPU 竞争）
 - 断言：总 batch % 64 == 0（prepare_micro_batches）；per-GPU % mini_bsz_per_gpu == 0（make_iterator）
