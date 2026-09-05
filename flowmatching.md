@@ -182,55 +182,113 @@ $$\frac{\partial p_t}{\partial t} = -\nabla \cdot (p_t \, v) \;+\; \tfrac{1}{2} 
 
 ---
 
-## 6. 边缘保持 SDE 的构造：加扩散 + score 修正 drift
+## 6. 边缘保持 SDE 的构造：加扩散 + score 修正 drift（一步步推导）
 
-### 1. 现有问题
+### 1. 现有问题：既要"随机性"，又不能扰动"粒子群的形状"
 
-要随机性（密度）→ 加扩散 $g(t)dW$；但扩散破坏边缘 → 必须同时改 drift。改多少？答案藏在 Fokker-Planck 方程里。
+RL 需要密度 → 每一步必须有随机性；但第 5 点说过，**随便加噪声会把边缘分布 $p_t$ 抹宽**，生成质量退化。这一节回答一个问题：**怎么加噪声，才能让每一步转移有随机性（有密度），同时让"粒子群在每个时刻的形状 $p_t$"和确定性 ODE 完全一样？**
 
-### 2. 方法论（核心推导：drift 修正 = 加 $\tfrac12 g^2 \nabla\log p_t$）
+先把后面要出现的"角色"全部介绍清楚（后面用到时不再解释）：
 
-**目标**：找一个随机过程，它的边缘分布 $p_t$ 与确定性 ODE **完全相同**，但转移有随机性。
+| 记号 | 含义 | 在本项目里 |
+|---|---|---|
+| $x_t$ | $t$ 时刻的粒子（一个"半成品"样本，1D 就是个数，真实是动作张量）| SDE 去噪状态 |
+| $t$ | 时间；SmolVLA 里 $t=1$ 噪声、$t=0$ 动作，去噪是 $t$ **减小** | 去噪步 |
+| $v(x_t,t)$ | 速度场：模型预测"粒子该往哪推"（确定性 ODE 的方向）| `denoise_step` 输出 |
+| $g(t)$ | 扩散系数：我们**自己选**的噪声强度（$g(t)=\eta\sqrt t$）| `diffusion_scale` |
+| $p_t(x)$ | 边缘分布：所有粒子在时刻 $t$ 的"密度形状" | 不用显式算 |
+| $s(x_t,t)$ | score：$s=\nabla_x\log p_t(x)$——密度"增长最快的方向" | 后面推出的闭式 |
+| $W$ / $\xi$ | 布朗运动 / 它的离散增量（$\xi\sim\mathcal{N}(0,1)$）| 采样噪声 |
+| $h$ | 去噪步长（$h=1/\text{num\_steps}$）| `step_size` |
 
-**推导**（只改 drift 为 $v + \text{修正项}$，加扩散 $g\,dW$）：
-$$dx = \big(v(x,t) + c(x,t)\big)\,dt + g(t)\,dW$$
+### 2. 方法论（一步步，每一步说明"为什么走到下一步"）
 
-它的密度满足 Fokker-Planck：
-$$\frac{\partial p_t}{\partial t} = -\nabla \cdot\big(p_t (v + c)\big) + \tfrac12 g^2 \Delta p_t = \underbrace{-\nabla\cdot(p_t v)}_{\text{ODE 项}} \underbrace{-\nabla\cdot(p_t c) + \tfrac12 g^2 \Delta p_t}_{\text{希望它}=0}$$
+**第 1 步：先学会"读"随机微分方程（SDE）**——后面所有推导的语法。
 
-要让边缘保持（= 只留 ODE 项），需要：$-\nabla\cdot(p_t c) + \tfrac12 g^2 \Delta p_t = 0$，即
-$$\nabla\cdot(p_t c) = \tfrac12 g^2 \Delta p_t$$
+一个 SDE 写成 $dx = f(x,t)\,dt + g(t)\,dW$，它说的是"粒子怎么随时间动"，分成两股力：
+- **漂移项 $f(x,t)\,dt$**：确定性的"推"，每走一小段时间 $dt$，粒子沿 $f$ 方向走 $f\cdot dt$；
+- **扩散项 $g(t)\,dW$**：随机性的"抖"，$dW$ 是布朗运动增量，可以理解为 $dW \approx \sqrt{dt}\cdot\xi$（$\xi\sim\mathcal{N}(0,1)$），所以每步抖动的标准差是 $g\sqrt{dt}$。
 
-**猜一个 $c$**：令 $c = \tfrac12 g^2 \,\nabla\log p_t$（score 的倍数），验证：
-$$\nabla\cdot(p_t \cdot \tfrac12 g^2 \nabla\log p_t) = \tfrac12 g^2\, \nabla\cdot\big(p_t \nabla\log p_t\big) = \tfrac12 g^2\, \nabla\cdot(\nabla p_t) = \tfrac12 g^2 \Delta p_t$$
-（用恒等式 $p_t \nabla\log p_t = \nabla p_t$，因为 $\nabla\log p_t = \nabla p_t / p_t$。）——**两边相等，扩散项被精确抵消**。
+> 为什么写成"$dt$ 和 $dW$"而不是直接写增量？因为这是连续时间的记法；我们最终落地的离散式就是 $x_{t-h} = x_t + (\text{漂移})\cdot h + (\text{扩散})\cdot\sqrt{h}\cdot\xi$——$dt\to h$、$dW\to\sqrt h\,\xi$。**先记住：$dt$ 变成步长 $h$，$dW$ 变成 $\sqrt h\cdot\xi$，系数 $g$ 不变。**
 
-**结论（正向时间 $t$ 增大的写法）**：
-$$dx = \big(v(x,t) + \tfrac12 g(t)^2 \underbrace{\nabla\log p_t(x)}_{=\;s(x,t),\,\text{score}}\big)\,dt + g(t)\,dW$$
-- 多出来的 drift 修正 $\tfrac12 g^2 s$ 把粒子**拉向高概率区**（score 指向概率上升方向）；
-- 扩散 $g\,dW$ 把粒子**推散**；两者在 Fokker-Planck 里**精确抵消** → $p_t$ 与 ODE 完全一致 → **边缘保持**。
+**第 2 步：为什么扩散会"破坏边缘"——先看密度是怎么被搬运的。**
 
-**SmolVLA 是去噪方向（$t$ 减小），drift 修正项变号**（反向时间下 $\nabla\log p$ 的贡献反号）：
-$$x_{t-h} = x_t - h\Big(v - \tfrac12 g(t)^2 s\Big) + g(t)\sqrt{h}\,\xi, \qquad \xi \sim \mathcal{N}(0, I)$$
-这正是 `sde.py` 的 `marginal_preserving_transition`：
+想象一大群粒子（对应 $p_t$）。粒子群形状 $p_t$ 的变化只有两种来源：
+1. **漂移搬形状（无噪声）**：速度场 $v$ 把每个粒子往确定方向推——密度像"流体"被搬运，**不会变宽**（粒子数守恒，只是位置整体移动/变形）。这个搬运规律叫 **Liouville 方程**（第 5 点出现过）：
+$$\frac{\partial p_t}{\partial t} = -\nabla\cdot(p_t\, v)$$
+2. **扩散抹形状（有噪声）**：每个粒子额外随机游走——密度被"抹平"，高密度处被削、低密度处被填。
+
+> 1D 数值直觉：如果 $t$ 时刻粒子分布是 $\mathcal{N}(0,\sigma^2)$，给每个粒子加一个方差 $\delta^2$ 的独立随机扰动（就是扩散），新分布是 $\mathcal{N}(0,\sigma^2+\delta^2)$——**方差变大 = 峰变矮变宽 = 边缘被破坏**。确定性 ODE 没有这种"加宽"，所以它的 $p_t$ 是我们想要的标准。
+
+**第 3 步：引入"搬运 + 抹平"的完整方程（Fokker-Planck），把目标翻译成数学。**
+
+一个既有漂移 $f$ 又有扩散 $g$ 的过程，它的密度变化同时包含上面两种机制，由 **Fokker-Planck 方程**描述：
+$$\frac{\partial p_t}{\partial t} = \underbrace{-\nabla\cdot(p_t\, f)}_{\text{漂移搬形状（同 Liouville）}} \;+\; \underbrace{\tfrac12 g(t)^2\,\Delta p_t}_{\text{扩散抹形状（新增）}}$$
+（$\Delta p_t=\nabla\cdot\nabla p_t$ 是 Laplacian，1D 里就是二阶导 $p_t''$；系数 $\tfrac12 g^2$ 来自随机游走的数学。）
+
+**现在目标变成一句话**：我们要找一个漂移 $f$，使得上式**恰好等于 Liouville 的结果**（即扩散项被漂移"偷吃"掉）：
+$$\underbrace{-\nabla\cdot(p_t f) + \tfrac12 g^2\Delta p_t}_{\text{我们的 SDE 的密度演化}} \;=\; \underbrace{-\nabla\cdot(p_t v)}_{\text{ODE 的密度演化（目标）}}$$
+
+**第 4 步：设出候选形式，列出"未知修正项要满足的方程"。**
+
+很自然地设：漂移 $f = v + c$——"ODE 的推法 $v$ + 一个待定的修正 $c$"。代入上式并化简（把 $v$ 的部分约掉）：
+$$-\nabla\cdot(p_t v) - \nabla\cdot(p_t c) + \tfrac12 g^2\Delta p_t = -\nabla\cdot(p_t v)\ \Longrightarrow\ \boxed{\nabla\cdot(p_t\, c) = \tfrac12 g^2\,\Delta p_t}$$
+> 这一步得到的方程是说：**修正项 $c$ 造成的"密度流"$\nabla\cdot(p_t c)$，必须恰好等于扩散造成的"抹平"$\tfrac12g^2\Delta p_t$**——一进一出，边缘不动。未知数只剩 $c$。
+
+**第 5 步：解出 $c$——为什么是 score（$\nabla\log p_t$）？**
+
+先看一个"帮忙的恒等式"（1D 逐步验算，多维同理）：对任何正的密度 $p$，
+$$p\,\nabla\log p \;=\; p\cdot\frac{\nabla p}{p} \;=\; \nabla p \;\Longrightarrow\; \nabla\cdot(p\,\nabla\log p) = \nabla\cdot(\nabla p) = \Delta p$$
+（1D 写法：$\nabla\log p = p'/p$，所以 $p\cdot\nabla\log p = p'$，再求导 $=p''=\Delta p$。）
+
+现在**"猜"修正项 $c=\tfrac12 g^2\,\nabla\log p_t$**——这不是凭空猜，动机是：扩散在"抹平"（把粒子从高密度推到低密度），要抵消它就需要一股**把粒子拉回高密度**的力，而 $\nabla\log p_t$ 正好指向"密度增长最快的方向"（score 的几何意义）；系数 $\tfrac12 g^2$ 与扩散同源，保证精确抵消。验证：把 $c$ 代入恒等式，
+$$\nabla\cdot(p_t\, c) = \nabla\cdot\Big(p_t\cdot\tfrac12 g^2\nabla\log p_t\Big) = \tfrac12 g^2\,\nabla\cdot(p_t\nabla\log p_t) = \tfrac12 g^2\,\Delta p_t$$
+正好等于第 4 步要求的右边——**方程被满足，$c$ 解出来了**。
+
+**第 6 步：组装——得到"边缘保持 SDE"，再把离散式对准 SmolVLA 的去噪方向。**
+
+- **正向时间（$t$ 增大）的连续形式**：把 $f=v+c$ 代回：
+$$dx = \Big(v(x,t) + \tfrac12 g(t)^2\underbrace{\nabla\log p_t(x)}_{=\,s(x,t)\ \text{score}}\Big)dt + g(t)\,dW$$
+三股力各司其职：$v\,dt$ 负责"跟着 ODE 走"，$\tfrac12g^2s\,dt$ 负责"把被扩散推散的粒子拉回高密度"，$g\,dW$ 负责"提供随机性（密度）"——三者合力下密度演化只剩 Liouville 项 → **边缘 $p_t$ 与 ODE 完全相同**。
+
+- **SmolVLA 的去噪方向（$t$ 减小，从 $t$ 到 $t-h$）的离散式**——这是代码里真正用的：
+$$x_{t-h} = x_t - h\,v + \tfrac12 h\,g^2\,s + g\sqrt{h}\,\xi = x_t - h\Big(v - \tfrac12 g^2 s\Big) + g\sqrt{h}\,\xi,\qquad \xi\sim\mathcal{N}(0,1)$$
+
+> **为什么符号从正向的"$+$"变成这里的"$-$"（最容易被绕晕的地方）**：注意我们**没有**在推导正向连续 SDE 的"时间反转"——那需要反向 SDE 定理；我们只是把**同一条"边缘保持"结论**直接写成去噪方向的离散更新。逐项看：
+> - $-h\,v$：去噪 = 沿 $-v$ 走回数据（ODE 那部分，时间反向所以 $v$ 前是负号）；
+> - $+\tfrac12 h g^2 s$：**收拢修正不变**——不管正走反走，扩散 $g\sqrt h\,\xi$ 都在抹平密度，所以都要加"指向高密度"的 $+\tfrac12 h g^2 s$ 来抵消它；
+> - $g\sqrt h\,\xi$：随机性（这就是我们想要的"密度来源"）。
+> 把后两项合并进括号就得到实现写法 $v-\tfrac12 g^2s$。**所以"$-$"不是 score 反号，而是把"去噪的 $-v$ 和收拢的 $+\tfrac12g^2s$"写进同一个括号的结果。**
+
+**第 7 步：对准 `sde.py` 的代码（逐行变量注释）**——上面离散式的每一项都在这里：
 
 ```python
-# mean = x_t - h * (v - 0.5*g(t)^2*score)  and  std = g(t)*sqrt(h)
+# sde.py marginal_preserving_transition —— 一行一个变量
 score = score_from_velocity(x_t, velocity, time)
+#    s = -(x_t + (1-t)*v) / t            （第 7 点推出的闭式 score，指向高密度的量）
 g_t = diffusion_scale(time, eta, x_t)
+#    g = eta * sqrt(t)                    （我们选的扩散系数；eta 越大噪声越大）
 reverse_drift = velocity.float() - 0.5 * g_t.square() * score
+#    = v - 0.5*g^2*s                      （括号里那项：去噪速度 v 减去收拢修正）
 mean = x_t.float() - float(step_size) * reverse_drift
+#    = x_t - h*(v - 0.5*g^2*s)            （转移均值 ≈ ODE 去噪步 + 收拢）
 std = g_t * math.sqrt(step_size)
+#    = g*sqrt(h)                          （转移标准差 = 随机性大小）
 ```
 
-### 3. 具体数值样例（一维验证"扩散项被修正抵消"）
+### 3. 具体数值样例（1D 高斯：扩散抹平 vs 修正抵消的解析验证）
 
-1 维、某时刻 $t$：假设边缘 $p_t(x) = \mathcal{N}(x; \mu=0, \sigma^2=1)$（为手算方便假设成标准高斯），则 $\nabla\log p_t(x) = -x$（高斯 score 就是 $-x$），取 $g=0.05$：
-- 扩散项贡献：$\tfrac12 g^2 \Delta p_t$（正的抹平）；
-- drift 修正项：$\nabla\cdot(p_t \cdot \tfrac12 g^2 s) = \tfrac12 g^2 \Delta p_t$（完全一样）→ 相减为 0 ✓；
-- 实际例子：$g^2 = 0.0025$，修正 drift $= \tfrac12\times0.0025\times(-x) = -0.00125x$——对 $x=0.3$ 是 $-0.000375$，很小但**恰好等于扩散在该点的反向补偿**，所以长期演化边缘不变。
+设某时刻 $t$ 的边缘恰好是标准高斯 $p_t(x)=\mathcal{N}(x;0,1)$（为手算取简单情形），取 $g=0.05$。三个量的显式函数：
+- score：$s=\nabla\log p_t=-x$（标准高斯的 score 就是 $-x$，指向原点=密度最高处）；
+- 拉普拉斯：$\Delta p_t = p_t''(x) = (x^2-1)p_t(x)$（高斯二阶导）；
+- 恒等式检验：$p_t\cdot s = p_t\cdot(-x) = -x p_t$，其散度 $= \frac{d}{dx}(-xp_t) = -p_t - x p_t' = -p_t + x^2p_t = (x^2-1)p_t = \Delta p_t$ ✓（第 5 步恒等式的具体版）。
 
-> 面试一句话总结：**边缘保持 SDE = 在 ODE 的速度 $v$ 上加"扩散 $g\,dW$ + drift 修正 $\pm\frac12g^2s$"（$s=\nabla\log p_t$ 是 score）：Fokker-Planck 里扩散项被修正项精确抵消（用恒等式 $p_t\nabla\log p_t=\nabla p_t$ 验证），边缘分布 $p_t$ 与确定性 ODE 完全相同——随机性有了，质量不降。**
+**"抹平 vs 抵消"在 $x=0$（峰顶）的数值**：
+- 扩散项的抹平效果：$\tfrac12 g^2\Delta p_t(0) = \tfrac12\times0.0025\times(-1)\times p_t(0) = -0.00125\,p_t(0)$（峰顶密度在**减少**——被抹平）；
+- 修正项造成的流：$\nabla\cdot(p_t\,c)$ 中 $c=\tfrac12g^2s=-0.00125x$，故 $p_t c = -0.00125\,x p_t$，其散度在 0 处 $= -0.00125(p_t+xp_t')\big|_0 = -0.00125\,p_t(0)$——与扩散项**完全相等**（都是 $-0.00125\,p_t(0)$）→ 相减为 0 → 峰顶密度不因噪声而流失 ✓；
+- 实际大小：$g^2=0.0025$，$x=0.3$ 处修正 drift 分量 $=\tfrac12\times0.0025\times(-0.3)=-0.000375$——非常小，因为 $\eta=0.05$ 的扩散本来就弱；**它存在的意义不是"大"，而是"恰好等于扩散在该点的反向补偿"**，让长期演化边缘不变。
+
+> 面试一句话总结：**边缘保持 SDE 的构造 = 在 ODE 速度 $v$ 上加两样东西：扩散 $g\,dW$（给随机性/密度）与修正 drift $\tfrac12 g^2 s$（$s=\nabla\log p_t$ 指向高密度，把被扩散推散的粒子拉回去）；用 Fokker-Planck 验证——修正项造成的密度流 $\nabla\cdot(p_t\cdot\tfrac12g^2\nabla\log p_t)=\tfrac12g^2\Delta p_t$ 恰好抵消扩散项，密度演化只剩 ODE 的 Liouville 项，所以边缘不变、质量不降；去噪方向的离散式 $x_{t-h}=x_t-h(v-\tfrac12g^2s)+g\sqrt h\,\xi$ 里的"$-$"只是把 $-v$ 与 $+\tfrac12g^2s$ 写进同一括号的结果，收拢修正本身永远是 $+$（指向高密度）。**
 
 ---
 
