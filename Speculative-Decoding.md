@@ -430,9 +430,161 @@ A/B 实验（`spec_bench_ab.py`）：同批 HumanEvalFix prompt（32 prompts × 
 
 ---
 
-# 四、面试问答与进阶
+# 四、最新进展：Block 并行投机（DFlash / DSpark，2026 DeepSeek V4 系）
 
-## 11. 高频追问：何时投机无效 / MTP vs EAGLE / 与 CUDA Graph
+> 素材：vLLM speculators 官方文档（`dflash.md` / `dspark.md`）、DFlash（arXiv:2602.06036，Z Lab）、DSpark（arXiv:2607.05147，DeepSeek）、本地 vLLM `vllm/v1/spec_decode/dflash.py` + `qwen3_dflash` 模型、本地 sglang `srt/speculative/` 的 `dflash_worker_v2.py` 与 `dspark_components/`。前 10 点（EAGLE 系列 + vLLM 集成）是"自回归草稿"路线；本部分是 2026 年的**"块级并行草稿"路线**——理解它能答"投机解码下一步往哪走"。
+
+## 11. DFlash：diffusion-LLM 块级草稿（非因果 mask token + 对 target hidden states 做 cross-attention）
+
+### 1. 现有问题
+
+- EAGLE-1/2/3 的草稿是**自回归**的：draft 网络逐 token 出草稿（即便 EAGLE-2/3 用树形并行化验证，**草稿生成本身仍是逐 token 串行**）——草稿成本 = 逐 token 成本 $\times$ 草稿数，k 拉长草稿开销线性涨；
+- 能不能"**一次前向直接预测一整块 token**"？Medusa 试过并行头，但它只条件于真实前缀、无自回归、无 target 中间特征，长草稿质量衰减快（前文第 3 点）——需要一个"既块级并行、又吃到 target 全部上下文特征"的草稿。
+
+### 2. 方法论
+
+**DFlash**（"Block Diffusion for Flash Speculative Decoding"，Z Lab，arXiv:2602.06036）用**小 diffusion-LLM 草稿模型**：单次前向预测一个 token 块，条件 = **target 模型的 hidden states**（EAGLE 系思想 + 块级并行的结合）：
+
+```text
+① target 前向一次：产出 fused context features（target hidden states）
+   （vLLM：pass_hidden_states_to_model=True，把 target 中间层 hidden 传给 draft）
+② 组装 draft 输入：context hidden states ⊕ mask token embeddings（占位）
+   （vLLM 注释："Only next_token_ids and mask tokens are query tokens,
+     all other context is K/V"——query 只有 1+block 个，其余全是 K/V）
+③ draft layers（Qwen3 式 transformer 层，但用【非因果 bidirectional attention】
+   + KV cache）：每个 query 同时 attend verifier hidden states 与 mask token
+   embeddings → 一次前向并行产出整块 token 的 logits
+   （vLLM 的 use_non_causal / dflash_has_any_non_causal 检测模型是否非因果）
+④ 输出经 target 共享的 LM head → 词表 logits → 采样整块草稿
+```
+
+**Anchor Point 机制**（块验证怎么组织）：
+
+```text
+1. Select anchors：在序列里选锚点位置
+2. Predict blocks：每个锚点单次前向预测一个 token 块
+3. Verify blocks：target 并行验证各块
+4. Accept：取最长有效前缀
+```
+
+**`sample_from_anchor` 开关**（两种采样语义，DFlash 与 DSpark 的关键分界）：
+- `False`（DFlash 默认）：**锚点是 bonus token**，只有 mask token 位预测 → 每块产出 `block_size - 1` 个投机 token（slot 0 不训练）；
+- `True`（DSpark 默认）：**锚点与所有 mask 位都采样预测未来** → 每块产出 `block_size` 个投机 token（与 DSpark 论文一致）。
+
+**为什么快**：草稿从"k 次串行前向"变成"1 次块级前向"（块内并行、非因果 attention 一次算完），同步请求下官方称比 EAGLE-3 大 **2-3×** 的加速；草稿模型是 Qwen3 式层但**可配任意 target**（verifier 无关）。
+
+**代码锚点**（vLLM `dflash.py` 的 `DFlashProposer`）：
+
+```python
+# vllm/v1/spec_decode/dflash.py —— DFlash 的关键设计点
+pass_hidden_states_to_model=True,      # target hidden states 传给 draft（cross-attn 的 context K/V）
+# "Only next_token_ids and mask tokens are query tokens, all other context is K/V"
+self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
+# DFlash 用 input embeddings 嵌入 mask token（占位 query）
+# 非因果 attention：dflash_has_any_non_causal(hf_config) → use_non_causal
+```
+
+### 3. 具体数值样例
+
+- `block_size = 8`、`max_anchors = 4`：每锚点一次前向出 7 个投机 token（sample_from_anchor=False），4 锚点共 4 条候选路径并行，target 一次验证（树形）；
+- 对比 EAGLE-3（k=3 自回归草稿）：DFlash 单块 8 token 的草稿生成 = 1 次 draft 前向 vs EAGLE-3 的 3 次串行 draft 前向——**草稿阶段延迟从 $O(k)$ 降为 $O(1)$（块内并行）**；
+- 代价：非因果 attention 的 KV cache 更大、draft 层要容纳"mask query + context"同时 attend，显存略增；训练要用 diffusion-LLM 式的块目标（一次性学整块）。
+
+> 面试一句话总结：**DFlash = 块级并行的 EAGLE：小 diffusion-LLM 草稿把 target hidden states 当 context K/V、mask token 占位当 query，用非因果 attention 一次前向预测一整块 token（anchor 机制 + 最长有效前缀接受），草稿成本从 O(k) 串行降到 O(1) 块级，同步请求比 EAGLE-3 快 2-3×。**
+
+---
+
+## 12. DSpark：Markov head + Confidence head（置信度调度的半自回归投机）
+
+### 1. 现有问题
+
+- DFlash 的纯块并行有个内在缺陷：**块内 token 之间没有依赖**（每个 mask 位只条件于 target 上下文与锚点，不条件于"块内前一个预测的 token"）——所以块越长、越靠后的位置接受率越低（接受率沿块衰减）；
+- 另一个问题：**不知道"这块值得验证到第几个位置"**——验证太浅浪费草稿，太深浪费 target 前向；
+- DeepSeek 在 V4 上给出的答案：给 DFlash 加两个头，把"块内依赖"和"验证深度"都学出来。
+
+### 2. 方法论
+
+**DSpark**（"Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation"，DeepSeek，arXiv:2607.05147）在 DFlash 的 block 并行主干上**加两个头**（draft 模型继承 DFlash，架构与训练其余不变，可配任意 verifier）：
+
+```text
+① Markov head（恢复块内依赖 → "半自回归"）：
+   低秩 logit bias B = W1 @ W2：
+     W1 把"块内前一个 token"（verifier 词表）嵌入到 markov_rank=256 维
+     W2 投影回 draft 词表 → 加到 DFlash logits 上
+   三变体：vanilla（只由前 token）/ gated（按 backbone hidden 门控）/ rnn（块内跨位置递归）
+   （--markov-rank 0 关闭 = 纯 DFlash；块内每个位置现在"知道"前一个预测的 token）
+② Confidence head（预测每位置接受概率 → 调度验证深度）：
+   线性头从 backbone hidden state（+ markov 前 token embedding，
+   --confidence-head-with-markov）预测该位置将被 target 接受的概率；
+   用 BCE 训练（--confidence-head-alpha 加权）
+③ 置信度调度：接受概率低的块位置 = "再验证也白搭" → 动态决定
+   这块验证到第几个位置（对应 sglang 的 verify-window/topk 规划）
+```
+
+- **为什么"半自回归"**：块内用 Markov bias 只恢复"前一个 token"的一阶依赖（不是完整自回归）——成本远低于逐 token 自回归，但已足够抑制块末端接受率衰减；
+- **`sample_from_anchor=True`**（DSpark 默认）：锚点与 mask 都预测 → 每块 `block_size` 个投机 token；
+- **服务端接入**：vLLM `--speculative-config '{"method": "dspark", ...}'`；sglang 为 DeepSeek-V4 加了 `DSparkWorkerV2`（`srt/speculative/dspark_components/`：`dspark_planner.py` 的 VerifyWindow/topk 规划、`dspark_verify.py` 的 accept_and_finalize、`dspark_kv_inject.py` KV 注入、`dspark_disaggregation.py` PD 分离支持、`dspark_sps.py`/`dspark_sts.py` 校准表）；llama.cpp、NVIDIA NeMo AutoModel 也有实现。
+
+**代码锚点**（sglang DSpark 组件——真实工程面）：
+
+```python
+# sglang/srt/speculative/dspark_components/dspark_planner.py
+#   VerifyWindow / ScheduleVerifyLensTopk / compute_sort_survival —— 按置信度规划验证窗口
+# dspark_worker_v2.py
+class DSparkWorkerV2(BaseSpecWorker):
+    def carries_confidence(self) -> bool: ...   # 是否携带置信度（调度依据）
+    def forward_batch_generation(self, ...): ... # draft 一次出整块
+# dspark_verify.py
+class TargetVerifyExecutor:
+    def accept_and_finalize(self, ...): ...     # 按置信度截断的块验证
+# dspark_disaggregation.py
+def build_dspark_disagg_draft_input(...): ...   # PD 分离下的草稿（配合 Mooncake 类 KV 传输）
+```
+
+### 3. 具体数值样例
+
+- 一个 block_size=8 的块，Markov bias 让第 $i$ 位条件于第 $i-1$ 位：末位接受率从纯并行的 $\approx \alpha^8$ 恢复到接近 $\alpha$（每步条件接受率）——**块内依赖是"接受率不随深度衰减"的关键**；
+- Confidence head 输出每位置接受概率，如 $[0.95, 0.9, 0.85, 0.6, 0.3, 0.1, \dots]$ → 调度器决定**只验证前 4 个位置**（第 4 位后概率 < 阈值），省下 target 对"注定被拒位置"的前向；
+- 训练：DFlash 块目标 + Markov bias（交叉熵）+ confidence head（BCE，$\alpha$ 加权）多任务联合。
+
+> 面试一句话总结：**DSpark = DFlash + 两个头：低秩 Markov head（$B=W_1W_2$ 把块内前一个 token 的 bias 加到草稿 logits，恢复"半自回归"依赖、抑制块末端接受率衰减）+ confidence head（预测每位置接受概率、用置信度动态调度验证深度）——把"块级并行"从"赌整块"变成"知道该信多远"，DeepSeek V4 生产使用。**
+
+---
+
+## 13. 定位与速答：DFlash/DSpark vs EAGLE vs Medusa vs MTP
+
+### 1. 现有问题
+
+新方法很多，面试要能一句话定位彼此关系。
+
+### 2. 方法论（草稿路线的三代数 + 对比表）
+
+| 方法 | 草稿形态 | 是否自回归 | 是否用 target 特征 | 加速特点 |
+|---|---|---|---|---|
+| 独立 Draft Model | 单 token | 是 | 否 | 简单但 α 低 |
+| EAGLE-1/2/3 | 单 token / 树形 | 是（浅层） | 是（倒数第二层 / 多层 feature） | α 高、c 低（本项目方案） |
+| Medusa | 并行头 | 否 | 否（只条件真前缀） | k≥2 质量衰减 |
+| **DFlash** | **token 块（非因果）** | **否（块内并行）** | **是（target hidden 当 K/V）** | **草稿 O(1)、比 EAGLE-3 快 2-3×** |
+| **DSpark** | **token 块 + Markov bias** | **半自回归（一阶）** | **是（+ confidence head）** | **块末端 α 不掉 + 置信度调度** |
+| MTP（DeepSeek） | 训练时多头 | 否 | 主模型内部 | 无额外模型、随主模型同步 |
+
+**三个必答点**：
+1. **EAGLE vs DFlash/DSpark**：EAGLE 是"自回归草稿 + target feature"，草稿生成串行；DFlash/DSpark 是"块级并行草稿 + target feature + 非因果 attention"，草稿生成一次出块——**同一"target feature 条件化"思想，一个串行一个并行**；
+2. **Medusa vs DFlash**：都是并行出多 token，但 Medusa 只条件真实前缀、无 target 特征、无块间依赖；DFlash 的每个 query 同时 attend target hidden states 与 mask token（信息量大得多）；
+3. **DSpark 与 EAGLE-2 的"置信度"区别**：EAGLE-2 用 draft 输出的 top-1 概率近似接受率调树宽；DSpark 用**专门训练的 confidence head** 预测逐位置接受概率来调度验证深度——一个是启发式、一个是学出来的。
+
+### 3. 具体数值样例（定位我们的项目）
+
+- 本项目用 EAGLE-3（k=3）：自回归浅层草稿，实测 +41.7%（第 10 点）——是"串行草稿"路线的成熟选择；
+- 若换 DSpark（block_size=8）：草稿从 3 次串行变 1 次块前向 + Markov bias 保末端接受率，单请求理论加速窗口更大，但需要训练新 speculator 且同步请求收益才明显（batch 大时被分摊）——**选型看场景：兼容/成熟选 EAGLE-3，极限单请求吞吐/DeepSeek V4 系选 DSpark**。
+
+> 面试一句话总结：**草稿三代数：单 token 自回归（Draft/EAGLE）→ 树形（EAGLE-2/3）→ 块级并行（DFlash/DSpark）；EAGLE 与 DFlash 共用"target feature 条件化"，区别在草稿串行 vs 块并行；DSpark 又用 Markov head（半自回归）与 confidence head（学出来的验证深度调度）补上块并行的两个短板——Medusa 无 target 特征、MTP 在模型内部，各有定位。**
+
+---
+
+# 五、面试问答与进阶
+
+## 14. 高频追问：何时投机无效 / MTP vs EAGLE / 与 CUDA Graph
 
 ### 1. 现有问题
 
@@ -477,6 +629,8 @@ A/B 实验（`spec_bench_ab.py`）：同批 HumanEvalFix prompt（32 prompts × 
 | EAGLE-1 | feature 外推：token embedding ⊕ hidden state → 预测 feature → 共享 LM head | `EAGLE/eagle/model/cnets.py` |
 | EAGLE-2 | 置信度感知动态树 | EAGLE 仓库 |
 | EAGLE-3 | free-style 训练 + 多层 feature 融合（aux hidden state） | `EAGLE/eagle/modeling_eagle.py`、`vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py` |
+| DFlash | 块级 diffusion-LLM 草稿：非因果 mask token query + cross-attn target hidden states，一次前向出整块 | `vllm/v1/spec_decode/dflash.py`、`qwen3_dflash` 模型、sglang `dflash_worker_v2.py`；vLLM speculators `dflash.md` |
+| DSpark | DFlash + Markov head（低秩 bias 半自回归）+ confidence head（置信度调度验证深度） | sglang `srt/speculative/dspark_components/`、vLLM `"method": "dspark"`；arXiv:2607.05147 |
 | 树形草稿 | 多分支一次验证，贪心选最长接受前缀 | `EAGLE/eagle/modeling_eagle.py`（node/Tree） |
 | vLLM 抽象 | Proposer（eagle.py/medusa.py/ngram_proposer.py）+ RejectionSampler | `vllm/v1/spec_decode/`、`vllm/v1/worker/gpu/spec_decode/rejection_sampler.py` |
 | 项目集成 | verl engine_kwargs → speculative_config JSON；dp=1 避死锁；LoRA 需 merge；drafter 静态 | `uniagent-lighting/scripts/run_grpo_dual_async_mooncake_ucloud.sh`、`spec_bench_ab.py` |
