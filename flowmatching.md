@@ -265,6 +265,23 @@ return -(x_f + (1.0 - time_b) * velocity_f) / time_b
 - $t=1$（纯噪声）：$s = -x_1/1 = -x_1$。而 $p_1 = \mathcal{N}(0,I)$ 的 score 确实是 $-x$ ✓；
 - $t \to 0$（逼近数据）：$s = -(x_t + v)/t \to \infty$——因为 $p_t$ 收缩成数据的 delta 分布，score 发散，合理（代码要求 $t \in (0,1]$）。
 
+**score 在项目 forward 里到底怎么算（完整计算链，贴合 `sde.py`）**——强调三点：score **不需要额外网络**、**不需要算梯度**、**只是速度 $v$ 的闭式函数**：
+
+```text
+输入：一个去噪步的 (x_t, t)
+  ① model.denoise_step(x_t, t) ──► v_θ(x_t, t)          ← 唯一一次神经网络前向
+  ② score_from_velocity(x_t, v_θ, t)                     ← 纯公式，无网络
+        s = -(x_t + (1-t)·v_θ) / t                       ← 一行代公式
+  ③ diffusion_scale(t, eta) → g = eta·√t
+  ④ reverse_drift = v_θ − ½·g²·s                        ← score 修正 drift
+  ⑤ mean = x_t − h·reverse_drift；std = g·√h
+输出：p(x_{t-h}|x_t) = N(mean, std²)   （采样/求 logp 用）
+```
+
+- **为什么 score 不用学**：Tweedie 把"混合分布 score"归约为"各高斯成分 score 的后验平均"，而线性路径下这个平均恰好坍缩成只用 $v$ 的闭式——**score 的信息完全来自速度网络 $v_\theta$**（$v$ 是模型"看到 $x_t$ 该往哪推"的浓缩）；
+- **为什么不用梯度**：$\nabla_x\log p_t$ 虽然写作"对 $x$ 求导"，但推导后它是 $x_t, v, t$ 的**代数表达式**，前向一次就算出，不需要反向传播（$\nabla_x\log p$ 里的"梯度"是数学记号，不是要 backprop 的计算图）；
+- **float32**：公式里全 `.float()`（bf16 会引入漂移，破坏采集/重打分一致性）。
+
 ### 3. 具体数值样例（完整手算 score + 转移）
 
 延续第 4 点的 toy：$t=1.0$，$x_t=0.3$，$v=0.7$，取 $\eta=0.05$（$g(t)=\eta\sqrt{t}$）、$h=0.1$：
@@ -386,9 +403,113 @@ element_log_probs: Tensor   # (num_steps, chunk_size, max_action_dim) = (10, 10,
 
 ---
 
-# 五、面试问答与速查
+# 五、完整样例：一个 token 从噪声到动作（逐步演算 + 逐行对照 sde.py + 反向传播）
 
-## 11. 高频追问速答
+> 本部分是"越详细越好"的落地：**把真实流程（`num_steps=10`、chunk $10\times7$）压缩成"1 维 × 4 步"便于手算**（$h=1/4=0.25$，$\eta=0.2$ 取大一点让噪声可见；项目真实 $\eta=0.05$）。模拟设定：toy 数据动作 $a=0.5$、起始噪声 $x_1=\epsilon=0.8$、速度网络已学好（$v_\theta=0.3$ 恒定——因线性路径 $v=\epsilon-a$ 恒定）；每步采样噪声 $\xi$ 为给定模拟值。**所有数字按 `sde.py` 公式算出并经脚本校验自洽**；除维度外与项目代码逐行一致。
+
+## 11. 样例设定与"每步到底发生什么"（逐行对照 `sample_sde_chunk`）
+
+项目 `sample_sde_chunk` 的去噪主循环（`sde_sampling.py`）：
+
+```python
+step_size = 1.0 / model.config.num_steps          # 真实 1/10=0.1；本例 num_steps=4 → 0.25
+state = noise.detach().float()                     # x_1 = ε = 0.8
+for step in range(model.config.num_steps):         # 4 步
+    time = 1.0 - step * step_size                  # t = 1.0, 0.75, 0.5, 0.25
+    velocity = model.denoise_step(x_t=state, ...)  # ① 网络前向 → v_θ(x_t, t)（本例恒 0.3）
+    transition = marginal_preserving_transition(state, velocity, time, step_size, eta)
+    #   ②③④⑤：score → g → drift → μ, σ（sde.py 三行）
+    next_state = sample_transition(transition)     # ⑥ 采样 x_{t-h} = μ + σ·ξ
+    element_log_probs.append(gaussian_log_prob(...))  # ⑦ 记录这步 logp
+    states.append(next_state); state = next_state
+```
+
+**一个去噪步的内部 7 步**（对照 `sde.py` 的 `marginal_preserving_transition` + `gaussian_log_prob`）：
+
+```python
+score = score_from_velocity(x_t, velocity, time)      # ② s = -(x_t+(1-t)v)/t
+g_t = diffusion_scale(time, eta, x_t)                 # ③ g = η·√t
+reverse_drift = velocity - 0.5 * g_t^2 * score        # ④ drift = v − ½g²s
+mean  = x_t - step_size * reverse_drift               # ⑤ μ = x_t − h·drift
+std   = g_t * sqrt(step_size)                         # ⑤ σ = g·√h
+# sample_transition: x_{t-h} = μ + σ·ξ（ξ~N(0,1)，结果 .detach()）
+# gaussian_log_prob:  -0.5[(x-μ)/σ]² − logσ − 0.5·log(2π)
+```
+
+## 12. 完整采样表：4 步全中间量逐步演算
+
+参数：$x_1=0.8$，$v=0.3$（恒定），$\eta=0.2$，$h=0.25$，噪声 $\xi=[0.6,-0.5,1.2,-0.3]$。
+
+| step | $t$ | $x_t$ | $v_\theta$ | score $s$ | $g=\eta\sqrt t$ | drift | $\mu$ | $\sigma$ | $\xi$ | $x_{t-h}$ | logp |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 1.00 | 0.8000 | 0.3 | -0.8000 | 0.2000 | 0.3160 | 0.7210 | 0.1000 | 0.6 | 0.7810 | 1.2036 |
+| 1 | 0.75 | 0.7810 | 0.3 | -1.1413 | 0.1732 | 0.3171 | 0.7017 | 0.0866 | -0.5 | 0.6584 | 1.4025 |
+| 2 | 0.50 | 0.6584 | 0.3 | -1.6168 | 0.1414 | 0.3162 | 0.5794 | 0.0707 | 1.2 | 0.6642 | 1.0102 |
+| 3 | 0.25 | 0.6642 | 0.3 | -3.5569 | 0.1000 | 0.3178 | 0.5848 | 0.0500 | -0.3 | 0.5698 | 2.0318 |
+
+**逐步演算（step 1，$t=0.75$，完整展开）**：
+1. 模型前向：$v_\theta(0.7810, 0.75) = 0.3$（本例恒值）；
+2. score：$s = -(x_t+(1-t)v)/t = -(0.7810 + 0.25\times0.3)/0.75 = -0.8560/0.75 = -1.1413$；
+3. 扩散尺度：$g = \eta\sqrt{t} = 0.2\times\sqrt{0.75} = 0.1732$，$g^2 = 0.03$；
+4. 修正 drift：$v - \tfrac12 g^2 s = 0.3 - 0.5\times0.03\times(-1.1413) = 0.3 + 0.0171 = 0.3171$（比纯 $v$ 多 $+0.0171$，即 score 修正项）；
+5. 转移均值：$\mu = x_t - h\times\text{drift} = 0.7810 - 0.25\times0.3171 = 0.7017$；
+6. 标准差：$\sigma = g\sqrt{h} = 0.1732\times0.5 = 0.0866$；
+7. 采样：$x_{0.5} = \mu + \sigma\xi = 0.7017 + 0.0866\times(-0.5) = 0.6584$；
+8. logp：$\log\mathcal{N}(0.6584; 0.7017, 0.0866^2) = -0.5\big(\frac{0.6584-0.7017}{0.0866}\big)^2 - \log 0.0866 - 0.919 = 1.4025$。
+
+**关键观察**：
+- **score 的数值演化**：$t=1$ 时 $s=-x_1=-0.8$（纯高斯 score），越靠近数据 $s$ 越负越大（$-3.56$）——因为 $p_t$ 越窄、概率山脊越陡（$t\to0$ 发散）；
+- **$\mu$ 贴着 ODE 走**：ODE 轨迹（每步 $-h\cdot0.3=-0.075$）为 $0.725\to0.650\to0.575\to0.500$；SDE 的 $\mu$ 为 $0.721\to0.702\to0.579\to0.585$——**每步均值都几乎等于 ODE 步**，这就是"边缘保持"在单条路径上的体现（随机性只在 $\sigma\xi$ 上）；
+- **最终动作**：$x_0 = 0.5698$ vs ODE 的 $0.5000$——本例 $\eta=0.2$ 噪声偏大，累积偏移 $0.07$；项目 $\eta=0.05$ 时 $\sigma$ 小 4 倍，$x_0$ 与 ODE 几乎重合；
+- **每步 σ 递减**（0.1→0.0866→0.0707→0.05）：$g(t)=\eta\sqrt t$ 随 $t\to0$ 收缩——越接近动作越确定，保证最终输出质量。
+
+## 13. log-prob、轨迹总 logp、重打分与 ratio
+
+- **每步 logp** 见上表；轨迹总 logp = 各步之和（Markov 链）：
+$$\log p(\text{trajectory}) = 1.2036 + 1.4025 + 1.0102 + 2.0318 = 5.6481\ \text{nats}$$
+- **重打分（RL 训练时）**：固定采集的 states $(0.8,\,0.7810,\,0.6584,\,0.6642,\,0.5698)$，只把某一步的 $v_\theta$ 换成新权重（模拟"策略更新了一点"）。例：**只有 step 2 的 $v$ 从 0.3 变成 0.28**（其余步不变）：
+  - 重算 step 2：$t=0.5$，$x_t=0.6584$，$v'=0.28$ → $s'=-(0.6584+0.5\times0.28)/0.5=-1.5968$ → $\text{drift}'=0.28-0.5\times0.02\times(-1.5968)=0.29597$ → $\mu'=0.6584-0.25\times0.29597=0.5844$（原 $\mu=0.5794$）；
+  - 新 logp：$\log\mathcal{N}(0.6642; 0.5844, 0.0707^2) = 1.0936$（原 1.0102，$\Delta=+0.0834$）；
+  - 轨迹总 logp 变为 $5.7315$；**ratio $=\exp(5.7315-5.6481)=e^{0.0834}=1.087$**——这就是 GRPO 里"新策略相对旧策略这条轨迹被高估了 8.7%"的含义；
+- **直觉**：$v$ 减小 → $\mu$ 减小 → 更接近实际采样值 $0.6642$ → 该状态在新策略下"更可能" → logp 上升 → ratio>1 → GRPO 提高这条轨迹的权重。
+
+## 14. 反向传播：梯度如何从 logp 穿回速度网络
+
+**两条梯度路径**：
+
+**① CFM 训练（速度回归）**——简单直接：
+$$\mathcal{L}_{\text{CFM}}=\tfrac12\big\|v_\theta(x_t,t)-(\epsilon-a)\big\|^2 \quad\Rightarrow\quad \frac{\partial L}{\partial\theta} = \big(v_\theta - (\epsilon-a)\big)\cdot\frac{\partial v_\theta(x_t,t)}{\partial\theta}$$
+梯度 = 速度残差 × 网络 BP——标准监督学习。
+
+**② RL 重打分（logp 对策略参数）**——链式穿过"去噪转移"：
+$$\frac{\partial \log p_\theta}{\partial\theta}=\sum_t \frac{\partial\log\mathcal{N}(x_{t-h};\mu_t,\sigma_t^2)}{\partial\mu_t}\cdot\frac{\partial\mu_t}{\partial v_t}\cdot\frac{\partial v_\theta(x_t,t_t)}{\partial\theta}$$
+
+逐项（$x_t$ 是**固定状态**，detach 不参与梯度，所以每步独立、无跨步二阶链）：
+- $\dfrac{\partial\log\mathcal{N}}{\partial\mu_t}=\dfrac{x_{t-h}-\mu_t}{\sigma_t^2}$（高斯 logp 对均值）；
+- $\dfrac{\partial\mu_t}{\partial v_t}=-h\Big(1+\tfrac12 g_t^2\,\tfrac{1-t_t}{t_t}\Big)$（因为 $\mu_t=x_t-h(v-\tfrac12g^2s)$ 且 $s=-(x+(1-t)v)/t$，score 项也依赖 $v$）；
+- $\dfrac{\partial v_\theta(x_t,t_t)}{\partial\theta}$：速度网络自己的 BP（$x_t$ 固定 → 只穿网络层）。
+
+**完整数值（本例 4 步的 $w_t = \partial\log p_t/\partial v_t$，脚本校验）**：
+
+| step | $t$ | $x_{t-h}$ | $\mu_t$ | $\sigma_t$ | $\partial\log N/\partial\mu$ | $\partial\mu/\partial v$ | $w_t=\partial\log p_t/\partial v$ |
+|---|---|---|---|---|---|---|---|
+| 0 | 1.00 | 0.7810 | 0.7210 | 0.1000 | $6.000$ | $-0.25000$ | $-1.5000$ |
+| 1 | 0.75 | 0.6584 | 0.7017 | 0.0866 | $-5.774$ | $-0.25125$ | $+1.4506$ |
+| 2 | 0.50 | 0.6642 | 0.5794 | 0.0707 | $16.971$ | $-0.25250$ | $-4.2851$ |
+| 3 | 0.25 | 0.5698 | 0.5848 | 0.0500 | $-6.000$ | $-0.25375$ | $+1.5225$ |
+
+- **$w_t$ 的含义**：该步 logp 对"速度"的敏感度（$\Sigma=-2.812$）；最终梯度 $= \sum_t w_t \cdot \partial v_\theta(x_t,t_t)/\partial\theta$——**$|w_t|$ 大的步（step 2）主导训练**（它离 $\mu$ 最远、$\sigma$ 小，logp 对 $\mu$ 最敏感）；
+- **为什么 $\partial\mu/\partial v$ 总在 $-0.25$ 附近**：$\mu=x_t-hv+\tfrac12 hg^2s$，第一项贡献 $-h=-0.25$，score 项因 $g^2$ 很小只微调（$<0.4\%$）——**速度每 +0.1，均值约 −0.025**；
+- **符号直觉**：step 1 的 $x_{t-h}<\mu$（采样值在均值左边）→ 增大 $\mu$ 会远离采样值 → logp 降 → 要增大 logp 应减小 $\mu$ → 应减小 $v$（$\partial\mu/\partial v<0$）→ $w_t>0$（step 1/3）；step 0/2 相反（采样值在右边）→ $w_t<0$；
+- **项目里梯度流向**：verl GRPO 的 policy loss（用 `flow_log_prob` 重打分得到 logp）→ `loss.backward()` 只穿过 **velocity 网络（action expert）** 与"$\mu\to$logp"这条闭式链——prefix cache 与采样状态都 detach，梯度不穿 VLM、不穿采样噪声。
+
+> **样例一句话总结**：一个 token 的 SDE 生成 = 4（真实 10）步"前向出 $v$ → 闭式 score → 修正 drift → 高斯转移采样 → logp"，每步 $\mu$ 贴着 ODE、$\sigma$ 随 $t$ 收缩；轨迹 logp 是各步之和，重打分时固定状态只换 $v$ 得 ratio（例：step2 $v$ 变 0.28 → logp +0.083 → ratio 1.087）；反向传播 $\partial\log p/\partial\theta=\sum_t w_t\,\partial v_\theta/\partial\theta$，$w_t=\frac{x-\mu}{\sigma^2}\cdot\big[-h(1+\frac12g^2\frac{1-t}{t})\big]$ 就是"每步 logp 对速度的敏感度"，$|w_t|$ 大的步主导梯度——梯度只穿 velocity 网络，状态与 VLM 都冻结。
+
+---
+
+# 六、面试问答与速查
+
+## 15. 高频追问速答
 
 **Q1：ODE 和 SDE 到底差在哪？**
 ODE 每步确定（$x_{t-h}=x_t-hv$，无密度）；SDE 每步加高斯噪声（$x_{t-h}\sim\mathcal{N}(x_t-h(v-\frac12g^2s),\,g^2h)$，有密度）。共同点：均值路径几乎一致 → 生成质量相当。
@@ -420,7 +541,7 @@ flow matching 学"速度"（路径是直线插值，一步可跳到端点），D
 **Q10：这套东西在 RL 里的完整角色？**
 把"不可训的确定性生成"变成"可训的带密度生成"——SDE 采样给轨迹密度，GRPO 用密度算 ratio 更新 action expert，prefix KV cache + remove-padding 让重打分高效（详见 `SmolVLA-VERL.md`）。
 
-## 12. 面试一句话总结（背诵版）
+## 16. 面试一句话总结（背诵版）
 
 - **Flow Matching**：学速度场 $v$，把噪声沿直线路径 $x_t=t\epsilon+(1-t)a$ 推到动作，训练=条件流匹配 MSE，推理=ODE 积分；
 - **ODE 无密度**：$x_{t-h}=x_t-hv$ 确定性 → delta 分布 → RL 算不了 ratio；
