@@ -507,9 +507,158 @@ $$\frac{\partial \log p_\theta}{\partial\theta}=\sum_t \frac{\partial\log\mathca
 
 ---
 
-# 六、面试问答与速查
+# 六、从一条轨迹到 GRPO 权重更新（完整 RL 流程串联）
 
-## 15. 高频追问速答
+> 第 5 章把"一条轨迹怎么生成、密度怎么算、梯度怎么穿回速度网络"走完了；本章**继续往下**：一条轨迹入库后如何参与 GRPO、如何变成一次权重更新、如何回到下一轮采集——把整个 RL 闭环串一遍。继续沿用第 5 章的 1D 样例数值（4 去噪步、old/new logp、ratio），并**逐步贴 SmolVLA-Verl 项目源码**（`verl-vla/src/verl_vla/models/smolvla/` 的 `grpo.py`、`trainable_model.py` 与 `src/smolvla_verl/trainer/grpo_libero.py`）。
+
+## 15. 全流程总览：一条轨迹的完整生命线（12 步）
+
+```text
+① on-policy 采集：最新权重 rollout（SDE，eta=0.05）→ 轨迹 = SmolVLATrajectory
+   （states 11×10×7 + element_log_probs 10×10×7 + mask + eta，见第 10 点）
+② 轨迹入库：观测/SDE 状态/logp 存下（本项目走服务器 session / TQ，见 internship.md）
+③ 组队：reset-matched——同 (task, init_state, env_seed) 采 G=4 条，仅策略噪声不同
+   （GRPO 组基线成立的前提，collect_remote.py / grpo_libero.py 的任务生成）
+④ reward 判定：环境执行完 → 沙箱判成功/失败（二进制 0/1）→ reward_info 上报
+⑤ 组优势：compute_group_advantages（组内 reward 减均值，见第 16 点）
+⑥ 重打分三份 logp：ref（固定 base）/ old（采集时存的 element_log_probs）/
+   new（当前权重 recompute_log_probs）（见第 17 点）
+⑦ per-step ratio = exp(new − old)，clip 到 [1−ε, 1+ε]（clip_epsilon=0.2）
+⑧ k3 KL：exp(logp_ref − logp_new) − (logp_ref − logp_new) − 1（锚定固定 base）
+⑨ GRPO loss = −Σ min(ratio, clip(ratio))·adv / 分母 + β·Σ k3（见第 18 点）
+⑩ loss.backward()：梯度链 = ∂L/∂logp_t → w_t（第 14 点）→ ∂v_θ/∂θ → 只更新 action expert
+⑪ optimizer.step()（clip_grad_norm=1.0）→ save_pretrained 单权重夹
+⑫ 权重同步：rollout/vLLM 引擎重载最新权重 → 下一轮（on-policy，否则 logp 对不上）
+```
+
+## 16. 组优势：compute_group_advantages（源码 + 数值）
+
+```python
+# verl-vla/src/verl_vla/models/smolvla/grpo.py —— 真实源码
+def compute_group_advantages(rewards: Tensor, *, use_std: bool = False, eps: float = 1e-6) -> Tensor:
+    """Input shape (number_of_groups, group_size). The default deliberately
+    does not divide by standard deviation (the Dr.GRPO convention)."""
+    advantages = rewards.float() - rewards.float().mean(dim=1, keepdim=True)
+    if use_std:
+        advantages = advantages / (rewards.float().std(dim=1, keepdim=True, unbiased=False) + eps)
+    return advantages.detach()
+```
+
+**数值**：我们这条 1D 轨迹所在的组（reset-matched）4 条 rollout 的 reward = $[1, 0, 1, 0]$：
+- 组均值 $= 0.5$；
+- 优势 = reward − 均值 $= [+0.5, -0.5, +0.5, -0.5]$；
+- 我们这条（reward=1）拿到 **adv = +0.5**（不除 std——Dr.GRPO 约定，方差归一化是可选 `use_std`）；
+- 全成功 $[1,1,1,1]$ 或全失败组的优势全 0 → **无学习信号，整组跳过**（`grpo_libero.py`：`if all(s == successes[0] ...): continue`）。
+
+## 17. 三份 logp 与 per-step ratio（源码 + 数值）
+
+重打分需要三份逐去噪步 logp（形状 `(episodes, chunks, denoise_steps)`，本项目实现里每个 chunk 单独算）：
+
+```python
+# verl-vla/src/verl_vla/models/smolvla/trainable_model.py —— 三个 hook（真实签名）
+def flow_log_prob(self, obs, trajectory, *, valid_positions=None) -> Tensor:
+    """Rescore a fixed trajectory under current weights (differentiable)."""
+    # 内部: prepare_policy_prefix + recompute_log_probs（固定 states，换 v_θ 重算高斯参数）
+
+def flow_policy_loss(self, logp, old_logp, ref_logp, advantages, *, clip_epsilon, kl_beta, valid_steps=None):
+    """FlowGRPO policy loss: clipped ratio + in-loss reference KL."""
+    return grpo_loss(logp, old_logp, ref_logp, advantages,
+                     clip_epsilon=clip_epsilon, kl_beta=kl_beta, valid_steps=valid_steps)
+```
+
+**三份 logp 的来源**（与第 13 点样例对应）：
+- **old** = 采集时存的 `element_log_probs`（轨迹里现成，不重算）：本例分步 $[1.2036,\,1.4025,\,1.0102,\,2.0318]$（和 $5.6481$）；
+- **new** = 当前权重 `recompute_log_probs` 重打分：本例只有 step 2 变（$v$ 0.3→0.28 使 $\mu'=0.5844$）→ 分步 $[1.2036,\,1.4025,\,1.0936,\,2.0318]$（和 $5.7315$）；
+- **ref** = 固定 base 权重重打分（KL 锚定用，不参与 ratio）。
+
+**per-step ratio**（只发生在模型输出的 action token 上，`loss_mask` 挡掉 padding/未执行位）：
+
+| step | old logp | new logp | ratio $=\exp(\text{new}-\text{old})$ | clip 后（ε=0.2）|
+|---|---|---|---|---|
+| 0 | 1.2036 | 1.2036 | 1.000 | 1.000 |
+| 1 | 1.4025 | 1.4025 | 1.000 | 1.000 |
+| 2 | 1.0102 | 1.0936 | **1.087** | 1.087（未触发）|
+| 3 | 2.0318 | 2.0318 | 1.000 | 1.000 |
+
+**数值一致性守卫**（训练正确性的第一道闸，`grpo_libero.py`）：首个 chunk 的 `ratio_mean` 偏离 1 超过 `RATIO_TOLERANCE=0.05` 直接 `raise`——本例 ratio_mean $=(1+1+1.087+1)/4=1.0218$ 通过（若重打分与采集数值路径不一致，ratio_mean 会大幅漂移并炸掉训练，见第 10 点）。
+
+## 18. GRPO loss：逐项公式 × 源码 × 数值
+
+```python
+# verl-vla/src/verl_vla/models/smolvla/grpo.py —— 真实源码（精简）
+def k3_kl_estimate(logp, ref_logp):
+    log_ratio = (ref_logp.detach().float() - logp.float()).clamp(-10.0, 10.0)
+    return torch.exp(log_ratio) - log_ratio - 1.0
+
+def grpo_loss(logp, old_logp, ref_logp, advantages, *, clip_epsilon, kl_beta, valid_steps=None, sample_weights=None):
+    """logp has shape (episodes, control_chunks, denoise_steps). One scalar episode
+    advantage is broadcast across both inner axes."""
+    log_ratio = (logp.float() - old_logp.detach().float()).clamp(-20.0, 20.0)
+    ratio = torch.exp(log_ratio)
+    advantage = advantages.detach().float()[:, None, None]          # episode 标量 → 广播到每步
+    unclipped = ratio * advantage
+    clipped = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantage
+    pg_loss = -(torch.minimum(unclipped, clipped) * weighted_valid).sum() / denominator
+    kl = k3_kl_estimate(logp, ref_logp)
+    kl_loss = (kl * weighted_valid).sum() / denominator
+    loss = pg_loss + float(kl_beta) * kl_loss
+    return loss, metrics   # ratio_mean / clip_fraction / advantage_mean ...
+```
+
+**逐项数值**（本例单条轨迹，adv=+0.5 广播到 4 步，β=0.01，episode 均衡分母先简化看单步）：
+- **policy gradient 项**：每步贡献 $-\min(\text{ratio}_t,\,1)\times0.5$（clip 未触发时 $\min(\text{unclipped},\text{clipped})$ 就是 unclipped）：
+  - step 0/1/3：$-\min(1.0\times0.5,\ 1.0\times0.5) = -0.5$（ratio=1，无信号，纯"维持"）；
+  - step 2：$-\min(1.087\times0.5,\ 1.087\times0.5) = -0.5435$（**ratio>1 使这条轨迹被强化**——它在新策略下更可能）；
+- **KL 项**（锚定固定 base，防漂移）：假设某步 $\log p_{ref}-\log p_{new}=0.1$ → $k_3 = e^{0.1}-0.1-1 = 0.00517$ → $\times\beta=0.01$ → $5.17\times10^{-5}$（小但持续存在，累积防漂移；第一版无锚定策略漂移、采集成功率掉到 45% 的教训）；
+- **归一化与加权**（`grpo.py` 的 `sample_weights` + `denominator`）：每条 episode 权重 $1/(E\cdot C_e)$、chunk 折扣 $\gamma^{C-1-c}$（$\gamma=0.99$），失败长 episode 不主导梯度（详见 `SmolVLA-VERL.md` 第 6 点）——真实 loss 是"整组 batch"的加权聚合，单条只是其中一项。
+
+## 19. 权重更新与 on-policy 闭环（grpo_libero.py 训练循环源码）
+
+真实训练循环（`src/smolvla_verl/trainer/grpo_libero.py`，每条 episode 逐 chunk 重打分 → 损失 → 反传 → 更新）：
+
+```python
+for e in episodes:
+    adv = e["advantage"]
+    n_chunks = len(e["chunks"])
+    ep_weight = 1.0 / (n_episodes * n_chunks)                 # episode 均衡加权
+    for cpos, (dp, traj, valid_positions) in enumerate(e["chunks"]):
+        with torch.no_grad(), model.rollout_context():
+            ref_per_step = ref.flow_log_prob(dp, traj, valid_positions=...).unsqueeze(1).cpu()
+        with model.rollout_context():
+            logp = model.flow_log_prob(dp, traj, valid_positions=...).unsqueeze(1)   # 可微（new）
+            old_per_step = (traj.element_log_probs * ... ).sum(dim=(-1, -2)).unsqueeze(1)  # old 直接用采集值
+        chunk_adv = adv * (args.chunk_discount ** (n_chunks - 1 - cpos))             # reward-to-go
+        loss, metrics = grpo_loss(logp, old_per_step, ref_per_step, chunk_adv_tensor,
+                                  clip_epsilon=..., kl_beta=..., sample_weights=...)
+        if not checked_ratio:                                 # 首 chunk ratio 守卫
+            drift = abs(float(metrics["ratio_mean"].cpu()) - 1.0)
+            if drift > RATIO_TOLERANCE: raise RuntimeError("... collection and rescoring are on different numeric paths ...")
+        loss.backward()                                        # ← 第 14 点梯度链在此触发
+        ...
+torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+optim.step(); optim.zero_grad()
+model.save_pretrained(str(save_dir))                          # 单权重夹覆盖
+```
+
+**闭环要点**：
+- **old 不重算**：直接取 `traj.element_log_probs`（采集时存的）——所以采集与重打分必须同一数值路径（第 10 点），否则 ratio≠1 守卫炸；
+- **ref 用 no_grad**、**new 走可微** `flow_log_prob`：`loss.backward()` 的梯度只穿 new 这条路（→ velocity 网络 + 第 14 点的闭式链），old/ref/状态全 detach；
+- **单权重夹**：`save_pretrained(save_dir)` 每轮覆盖 → rollout/vLLM 引擎重载最新权重 → 下一轮采集（第 15 点 ⑫）——**严格 on-policy**：若 rollout 用旧权重采集，重打分 ratio 基准就错了；
+- **结束**：`STOP_AT`/`ROUNDS` 到 → 官方 10×10 评估（`eval_parallel.sh`，确定性 ODE）→ 本项目实测 15 轮 63.0% 与 base 持平（`RESULTS.md`）。
+
+## 20. 把梯度链与 GRPO 串成一句话（第 14 点 ↔ 第 18 点）
+
+$$ \frac{\partial L_{\text{GRPO}}}{\partial \theta} \;=\; \underbrace{\sum_t \underbrace{\frac{\partial L}{\partial \log p_t}}_{\text{18点：}-\min(r_t,1)\cdot \text{adv}\cdot(\text{加权})}\cdot \underbrace{\frac{\partial \log p_t}{\partial v_t}}_{w_t\ \text{（14点：}-1.5,1.45,-4.29,1.52\text{）}}\cdot \frac{\partial v_\theta(x_t,t_t)}{\partial\theta}}_{\text{只穿 velocity 网络}} $$
+
+- 第 18 点给出**外层权重**（adv=+0.5 与 ratio 决定这条轨迹被强化还是弱化），第 14 点给出**内层敏感度**（$w_t$ 决定该步 logp 对速度变化的响应），两者乘上网络 BP 才是最终梯度；
+- 例：step 2 同时是"ratio>1（被强化）"与"$|w_2|=4.29$ 最大（最敏感）"的步——**它对梯度贡献最大**，训练主要"修正"这一位置的去噪行为；
+- 完整闭环：**SDE 采样（第 5 章）→ 入库成组 → 组优势（16）→ 三份 logp/ratio（17）→ GRPO loss（18）→ 反传更新（19，链在 14）→ 权重同步 → 下一轮 on-policy**——flowmatching.md 到此把"为什么 SDE、怎么算密度、怎么训"全部串完。
+
+---
+
+# 七、面试问答与速查
+
+## 21. 高频追问速答
 
 **Q1：ODE 和 SDE 到底差在哪？**
 ODE 每步确定（$x_{t-h}=x_t-hv$，无密度）；SDE 每步加高斯噪声（$x_{t-h}\sim\mathcal{N}(x_t-h(v-\frac12g^2s),\,g^2h)$，有密度）。共同点：均值路径几乎一致 → 生成质量相当。
@@ -541,7 +690,7 @@ flow matching 学"速度"（路径是直线插值，一步可跳到端点），D
 **Q10：这套东西在 RL 里的完整角色？**
 把"不可训的确定性生成"变成"可训的带密度生成"——SDE 采样给轨迹密度，GRPO 用密度算 ratio 更新 action expert，prefix KV cache + remove-padding 让重打分高效（详见 `SmolVLA-VERL.md`）。
 
-## 16. 面试一句话总结（背诵版）
+## 22. 面试一句话总结（背诵版）
 
 - **Flow Matching**：学速度场 $v$，把噪声沿直线路径 $x_t=t\epsilon+(1-t)a$ 推到动作，训练=条件流匹配 MSE，推理=ODE 积分；
 - **ODE 无密度**：$x_{t-h}=x_t-hv$ 确定性 → delta 分布 → RL 算不了 ratio；
