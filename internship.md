@@ -1,9 +1,9 @@
 # Internship 完全指南：verl GRPO 训练全流程（TQ vs 无 TQ 双方案）
 
 > 对应实习核心工作"升级 verl 0.6.1→0.8.0 以支持 TransferQueue（TQ）的 MoonCake 存储后端接入，实现数据 RDMA 高速传输"与"将训练入口由 RayPPOTrainer 迁移至 PPOTrainer"。一句话知识框架：
-> **同一个 AgenticRL/GRPO 训练，两条数据通路：① master 分支（TQ 接入）用 TransferQueue 做"KV 数据仓库"——训练数据以变长 NestedTensor 按 key 存在 TQ 里，driver 只拿 KVBatchMeta（keys+tags），各阶段按需 `kv_batch_get/put` 读写；② verl-0.8.0（无 TQ）用 DataProto 做"整包搬运"——数据在 driver 手里整体 pad/unpad、随 RPC 发给 worker。两条路 rollout 与训练阶段的读写位置、字段布局、异步方式完全不同，性能差异（update_actor ±15s）根因就在字段布局（nested vs padded）。**
+> **同一个 AgenticRL/GRPO 训练，两条数据通路：① master 分支（TQ 接入）用 TransferQueue 做"KV 数据仓库"——训练数据以变长 NestedTensor 按 key 存在 TQ 里，driver 只拿 KVBatchMeta（keys+tags），各阶段按需 `kv_batch_get/put` 读写；② verl-0.8.0（无 TQ）用 DataProto 做"整包搬运"——数据在 driver 手里整体 pad/unpad、随 RPC 发给 worker。两条路 rollout 与训练阶段的读写位置、字段布局、异步方式完全不同；性能上 TQ 的收益是**规模依赖**的——它用一笔固定的 Store 读写开销换掉 Driver 单点，小数据量倒挂、大数据量（ChartQA 6.1 GB）净收益 −66.50s（−6.27%），详见第 15 点。**
 >
-> 素材来源：本地 `agent-lightning`（master，TQ 接入，`AgentLightningTrainer(PPOTrainer)`）、`verl-v0.8.0`（baseline，`AgentLightningTrainer(RayPPOTrainer)`）、`transferqueue`（v0.1.8）、`agent-lightning/TQ_PERF_COMPARE_AND_FIX.md`、`agent-lightning/VERL_UPGRADE_ANALYSIS.md`。配套阅读：`Agent-Lighting.md`（三件套）、`TQ.md`（TransferQueue 组件）、`Mooncake.md`（存储后端）、`Parallel.md`（并行维度）。
+> 素材来源：本地 `agent-lightning`（master，TQ 接入，`AgentLightningTrainer(PPOTrainer)`）、`verl-v0.8.0`（baseline，`AgentLightningTrainer(RayPPOTrainer)`）、`transferqueue`（v0.1.8）、`TQ接入方案与量化收益.md`（定稿实测）、`agent-lightning/VERL_UPGRADE_ANALYSIS.md`；`agent-lightning/TQ_PERF_COMPARE_AND_FIX.md` 仅作早期小数据量观测记录（其中的 nested→padded 归因已被证伪）。配套阅读：`Agent-Lighting.md`（三件套）、`TQ.md`（TransferQueue 组件）、`Mooncake.md`（存储后端）、`Parallel.md`（并行维度）。
 
 ---
 
@@ -29,7 +29,7 @@
 
 - verl 0.8.0 原生是 **DataProto 数据流**（`RayPPOTrainer`）：一次 rollout 产生一个 DataProto（含 input_ids/attention_mask/position_ids/response_mask/rm_scores 等全部字段），driver 持有它，每个计算阶段（old_log_prob/ref/advantage/update_actor）都是"整包 → RPC 给 worker → 结果 union 回来"；
 - TQ 接入后（`main_ppo_sync.PPOTrainer`）：数据不再整体搬，而是**按 key 存进 TransferQueue**（partition=train/val），driver 只拿 KVBatchMeta（keys + tags），每个阶段用 `tq.kv_batch_get(keys, select_fields=...)` 按需拉字段、算完 `tq.kv_batch_put` 写回——**数据留存在 TQ（可落 Mooncake 存储后端、跨机 RDMA 传输），driver/worker 只搬运"元数据 + 需要的字段"**；
-- 关键差异：TQ 存的是**变长 NestedTensor**（不 pad），而 DataProto 流是 **padded** 后再按需 unpad——这个布局差异是性能差异的根因（第 15 点）。
+- 关键差异（**只是数据布局差异，不是性能结论**）：TQ 存的是**变长 NestedTensor**（不 pad），而 DataProto 流是 **padded** 后再按需 unpad。两者各有代价：TQ 省掉 pad/unpad 往返，但每次计算都要**从 Store 读字段**（固定读取成本）；padded 流数据在手、无读取成本，但每阶段要 pad/unpad。**哪边更快取决于数据规模**（见第 15 点的实测：小数据量 TQ 倒挂、大数据量 TQ -6.27%）。
 
 ### 3. 具体数值样例（同一轮训练的数据形状）
 
@@ -292,7 +292,7 @@ tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=tags)
 ```
 
 **② 关键设计点**：
-- **不 pad**：直接保存变长序列，`list_of_dict_to_tensordict` 把它们包成 **NestedTensor（jagged）**——这是 TQ 能"零 pad 传输"的根本（对应 `TQ_PERF_COMPARE` 里"master 数据几乎全部 nested"）；
+- **不 pad**：直接保存变长序列，`list_of_dict_to_tensordict` 把它们包成 **NestedTensor（jagged）**——这是 TQ "零 pad 存储/传输"的根本（对应早期记录 `TQ_PERF_COMPARE_AND_FIX.md` 里"master 数据几乎全部 nested"的观察；注意这只是布局差异，不是性能差异的原因，见第 15 点）；
 - **每样本一个 key**：`{data_id}_{rollout_id}_{turn_index}`，TQ 里每个 key 是一份完整训练样本（含 input_ids/attention_mask/position_ids/token_level_scores/rm_scores/response_mask/loss_mask/uid/num_turns）；
 - **tags 携带元数据**：`seq_len`（长度，供 `_compute_metrics` 的 offsets 计算）、`is_drop`（prompt 过长标记，第 5 点过滤的依据）；
 - **position_ids 免计算**：unpadded 序列 position_ids 就是 `arange(seq_len)`（M-RoPE 模型除外）；
@@ -350,26 +350,27 @@ class ReplayBuffer:
 - **daemon 异步等待**：`_async_run_until_finished` 每 5s `store.wait_for_rollouts` 拉完成的任务，异步收集（不阻塞 agent 执行）；
 - **agent 执行本身异步并行**：128 个 rollout 在远端 agent 环境并发执行（沙箱并行 + vLLM 并发），driver 的 `replay_buffer.sample` 只是"等结果"。
 
-**② 开销是否被 rollout 吃掉（bench 实证，`TQ_PERF_COMPARE_AND_FIX.md`）**：
+**② 开销是否被 rollout 吃掉（bench 实证）**：
 
-| 阶段 | master（TQ） | baseline（无 TQ） | 结论 |
-|---|---|---|---|
-| 生成 rollout | 基本相当 | 基本相当 | 相同（agent 执行占大头） |
-| ref + old_log_prob | **快约 2s** | — | TQ 变长数据省 pad/unpad，infer 反而快 |
-| **update_actor** | **慢约 15s** | — | **未被 rollout 掩盖**（串行训练阶段） |
-| update_weights | 慢约 5s | — | CPU 竞争（TQ 栈 vs FSDP offload 传输） |
+| 阶段 | master（TQ） | 结论 |
+|---|---|---|
+| 生成 rollout | 大数据量下 **-5.95%**（省 Driver 侧回收+重构） | 不是推理变快，而是省"生成结果回收到 Driver 再组织" |
+| 数据分发收集（transit） | 大数据量下 **-7.85%** | 分发物从 190~245 MB 实数据变成近 0 的 KVBatchMeta |
+| compute_log_prob / ref | 大数据量下快（-8.73% / -11.95%） | 结果直接写回 Store，省 Driver 侧 concat |
+| **update_actor** | 大数据量下 **-5.46%**；**小数据量下曾观测到 +15s** | 见第 15 点：TQ 收益**依赖数据规模**，小数据量会倒挂 |
+| compute_advantage（adv） | **+2.66s（+2216%）** | **TQ 固定读取开销的直接体现**（多读写 Store 的 reward 字段） |
 
-- **TQ 读取本身不是瓶颈**：`update_actor` 内 worker 侧 TQ 读取仅约 0.5s（已排除）；
-- **开销没有被 rollout 吃掉的部分**：训练侧 `update_actor` 是**串行**的（agent 已全部完成、GPU 空闲等训练），TQ 数据读出来后 `ppo_loss` 的 nested→padded 转换（第 11/15 点）直接暴露成 +15s——**rollout 时间掩盖了 TQ 的写入（daemon 侧与 agent 执行并行），掩盖不了训练侧的转换开销**；
-- **被 rollout 吃掉的部分**：daemon 的 `get_train_data_batch`（triplet→NestedTensor 构建 + kv_batch_put）发生在 agent 执行期间/完成后，其耗时被 agent 执行的墙钟掩盖（不额外增加 step 时间）。
+- **TQ 的读取开销是真实存在的固定成本**：`adv` 阶段 +2.66s 就是证据（要从 Store 读 `token_level_scores` 等字段再写回 `advantages/returns`）；早期小数据量实验里 `update_actor` +15s、`update_weights` +5s 同样是这类开销，只是当时被误归因到字段布局（第 15 点详述）；
+- **被 rollout 吃掉的部分**：daemon 的 `get_train_data_batch`（triplet→NestedTensor 构建 + kv_batch_put）发生在 agent 执行期间/完成后，其耗时被 agent 执行的墙钟掩盖（不额外增加 step 时间）——**TQ 的写入是"顺带完成"的，读取才是额外成本**；
+- **什么时候划算**：数据量小 → Driver 单点瓶颈根本不显现，TQ 的固定读取开销没有收益可抵 → 净倒挂；数据量大（如 ChartQA 6.1 GB 多模态）→ Driver 的"回收+重构+分发+汇聚"成为实质瓶颈 → 净收益 **-6.27%**（第 15 点完整表）。
 
 ### 3. 具体数值样例
 
 - 一轮 step 总时长 ~7 分钟（agent 执行占 ~6 分钟）：TQ 写入（kv_batch_put 120 key ≈ 数十 ms）与 triplet 构建（~1s）都发生在 agent 执行期间 → **被 rollout 墙钟完全掩盖**；
-- 训练阶段（agent 已完成）：`replay_buffer.sample` 返回后，old_log_prob/ref/advantage/update_actor 串行执行——其中 update_actor 的 nested→padded 转换 4 个 micro-batch 累计 ~15s **全额暴露**；
-- 结论话术：**"TQ 的写入开销被 rollout 吃掉（并行发生），但训练侧 nested→padded 的转换开销是串行的、没被吃掉，这是 update_actor +15s 的来源；TQ 读取本身 0.5s 可忽略。"**
+- 训练阶段（agent 已完成）：`replay_buffer.sample` 返回后，old_log_prob/ref/advantage/update_actor 串行执行——TQ 在这里的额外读取开销（adv +2.66s）会全额暴露，因为没有任何并行工作掩盖它；
+- 结论话术：**"TQ 的写入开销被 rollout 吃掉（并行发生），读取开销是固定成本：数据量小时它是纯负担（update_actor 曾 +15s），数据量大时它换来的是 Driver 单点消除（ChartQA 6.1GB 净收益 -6.27%）——收益取决于数据规模。"**
 
-> 面试一句话总结：**异步有三层：ReplayBuffer 后台线程每 1s 轮询 TQ 元数据、daemon 每 5s 异步拉完成任务、agent 远端并发执行——训练只等"状态 tag"不看执行过程；开销上，TQ 写入/构建被 rollout 墙钟掩盖，但训练侧 ppo_loss 的 nested→padded 转换（每 micro-batch 重复）是串行的、没被掩盖，实测 update_actor 慢 15s 的根因就在这里。**
+> 面试一句话总结：**异步有三层：ReplayBuffer 后台线程轮询 TQ 元数据、daemon 异步拉完成任务、agent 远端并发执行——训练只等"状态 tag"不看执行过程；开销上，TQ 的写入/构建被 rollout 墙钟掩盖，而读取是固定成本（adv +2.66s 就是证据）——所以 TQ 的净收益取决于数据规模：小数据量倒挂，大数据量（ChartQA 6.1GB）净收益 -6.27%（第 15 点）。**
 
 ---
 
@@ -597,12 +598,12 @@ def optimizer_step(self):
 
 ### 1. 现有问题
 
-GRPO 的损失到底怎么算？为什么 TQ 版在这里慢 15s？——`ppo_loss` 的**字段布局转换**是答案。
+GRPO 的损失到底怎么算？TQ 版与 baseline 在这一步有什么实现差异？——两者的损失公式与 FSDP 引擎完全共用，**唯一的差异在字段布局**：TQ 读出的字段是 NestedTensor，需要在 `ppo_loss` 里转成 padded；baseline 本来就是 padded，这一步是 no-op。这只是布局差异，**不是** TQ 性能表现的原因（原因见第 15 点）。
 
 ### 2. 方法论（`verl/workers/utils/losses.py:85-91`）
 
 ```python
-# verl/workers/utils/losses.py —— ppo_loss 的字段准备（TQ_PERF_COMPARE 的 15s 根因点）
+# verl/workers/utils/losses.py —— ppo_loss 的字段准备
 def ppo_loss(data, ...):
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
@@ -620,17 +621,17 @@ def ppo_loss(data, ...):
     # loss = pg_loss + kl_beta * kl_loss
 ```
 
-- **baseline（无 TQ）**：字段本来就是 **padded 普通张量**，`to_padded_tensor()` 是 **no-op**，每次 micro-batch 零成本；
-- **master（TQ）**：从 TQ 读出的字段**几乎全是 NestedTensor**，`ppo_loss` 每个 micro-batch 都要 `select(...).to_padded_tensor()` **真转换**一次，加上 `index_select_tensor_dict`、`micro_batch.to(device)`、nested 求和都作用在 10+ 个 nested 字段上——昇腾 NPU 上 `torch.nested` 算子多为慢速/回退路径，4 个 micro-batch 累计 ≈ **15s**；
-- 修复方案（`TQ_PERF_COMPARE_AND_FIX.md` 方案 A）：`train_mini_batch` 入口一次性把 loss 字段（response_mask/loss_mask/old_log_probs/ref_log_prob/advantages/returns/rm_scores/...）转 padded，`input_ids/position_ids` 保持 nested（remove-padding 前向需要）——**每个 update_actor 只转一次，而不是每 micro-batch 转 4 次**。
+- **baseline（无 TQ）**：字段本来就是 **padded 普通张量**，`to_padded_tensor()` 是 **no-op**（零成本）；
+- **master（TQ）**：从 TQ 读出的字段**几乎全是 NestedTensor**，`to_padded_tensor()` 会真的执行一次布局转换；这是"读出即变长"带来的**布局差异**，本身不构成可归因的性能瓶颈（真正的固定开销是 `kv_get` 这笔读取，见第 15 点）；
+- **注意**：这个转换是"TQ 需要多做的事"，但**不能**把它当成 TQ 变慢的全部原因——实测表明 TQ 的净收益/倒挂**主要取决于数据规模**（小数据量时 TQ 的读取+适配成本没有 Driver 收益可抵，大数据量时 Driver 单点消除远超这些成本），详见第 15 点。
 
 ### 3. 具体数值样例
 
-- 4 个 micro-batch × 每次 `to_padded_tensor`（10 个 nested 字段 × 每条 700 token）≈ 每次 3-4s → 4 次 ≈ 15s（实测 master update_actor 17s vs baseline 2s）；
-- 修复后：`train_mini_batch` 入口转一次 ≈ 0.05s，`ppo_loss` 内变 no-op → update_actor 回落到 ~2-5s；
-- 数值等价性：loss_mask 转 padded 后 `batch_num_tokens = loss_mask.sum()` 不变（padding 补 0）；ratio 只在 response_mask=1 的位置计算。
+- 转换量级：4 个 micro-batch × 10+ 个 nested 字段 × 每条约 700 token 的 `select(...).to_padded_tensor()`，本质是 **O(数据量) 的内存布局操作**，与序列总长度成正比；
+- **不要给这一步编造量级**：早期曾推测"昇腾 NPU 上 `torch.nested` 走慢速回退路径、4 个 micro-batch 累计约 15s"，并据此提过"入口一次性转换"的优化（未实施）。该推测已被大数据量实验证伪——同一份嵌套字段在 ChartQA 6.1 GB 下 `update_actor` 反而快了 6.76s（第 15 点）。因此这一步只能作为**布局差异的技术事实**陈述，不能作为性能差异的解释；
+- 数值等价性：loss_mask 转 padded 后 `batch_num_tokens = loss_mask.sum()` 不变（padding 补 0）；ratio 只在 response_mask=1 的位置计算——**布局转换只影响内存形态、不影响 loss 数值**。
 
-> 面试一句话总结：**ppo_loss 是 GRPO 的核心（ratio=exp(logp-old_logp)，clip 到 [1-ε,1+ε] 乘 advantage，加 k3 KL 惩罚，loss_mask 归一化）；TQ 版慢 15s 的根因就是它每 micro-batch 调一次 to_padded_tensor（nested→padded 真转换，昇腾回退路径），baseline 是 no-op——修复 = train_mini_batch 入口一次性转换，input_ids 保持 nested 走 remove-padding 前向。**
+> 面试一句话总结：**ppo_loss 是 GRPO 的核心（ratio=exp(logp-old_logp)，clip 到 [1-ε,1+ε] 乘 advantage，加 k3 KL 惩罚，loss_mask 归一化）；TQ 版与 baseline 在这一步的差异只是"字段是 nested 还是 padded"——TQ 多做一次布局转换，但不影响 loss 数值，也不是 TQ 性能表现的主因（主因是数据规模，见第 15 点）。**
 
 ---
 
@@ -740,52 +741,107 @@ def _compute_old_log_prob(self, batch: DataProto):
 | 归一化 | batch_num_tokens = loss_mask.sum + DP all_reduce | 相同 |
 | 结果收集 | 输出 kv_batch_put 写回 TQ → driver reduce_metrics | worker 返回 TensorDict → `tu.get(output,"metrics")` |
 | 常驻数据 | driver 只持 KVBatchMeta（KB 级） | driver 持 9+ 字段 DataProto（MB 级） |
-| **update_actor 耗时** | **慢 ~15s**（nested→padded 转换，昇腾回退路径） | ~2s（to_padded_tensor no-op） |
-| old_log_prob/ref | **快 ~2s**（变长免 pad/unpad，remove-padding 前向） | 慢 ~2s（pad 往返 + GPU unpad） |
+| **update_actor 的额外成本** | 需 `kv_get` 按需读字段（**TQ 的固定开销**）；字段为 nested，`ppo_loss` 内做一次布局转换（布局差异，非成本主因） | 无读取成本（数据在手）；`to_padded_tensor` 为 no-op |
+| old_log_prob/ref | 结果直接 `kv_put` 写回 Store（省 driver 侧 concat） | 结果 union 回 driver（集中拼接热点） |
+| **大数据量实测（ChartQA 6.1GB，step2–5 均值）** | **update_actor -5.46%、old_log_prob -8.73%、ref -11.95%、adv +2.66s** | 见第 15 点完整表（Baseline 为参照） |
 
 ### 3. 具体数值样例
 
-- 同一批数据（baseline pad/补齐后 ~128 条 vs master 120 keys + upsample）：baseline 每阶段 pad/unpad 往返 2 次（128→120→补齐），master 全程变长只在 ppo_loss 里转 padded；
-- 4 个 micro-batch × to_padded_tensor ≈ 15s（master 净增），2 个 infer 阶段（old_log_prob/ref）各省 ~1s（master 净省）；
-- 结果：master update_actor 17s vs baseline 2s（+15s），ref+old_log_prob master -2s——**净 +13s/step，这是 TQ 方案当前的主要性能代价（有明确修复方案）**。
+- 同一批数据（baseline pad/补齐后 ~128 条 vs master 120 keys + upsample）：baseline 每阶段 pad/unpad 往返 2 次（128→120→补齐），master 全程变长、只在 `ppo_loss` 里转一次 padded；
+- **TQ 的额外成本是"从 Store 按需读字段"这笔固定开销**：它不随数据规模缩小而消失，因此小数据量下无从抵消（早期小数据量实测 update_actor +15s、update_weights +5s），数据量大时被 Driver 单点消除的收益远远覆盖（ChartQA 实测 update_actor **−6.76s**）；
+- 结论：**update_actor 阶段 TQ 是快还是慢，取决于数据规模而不是字段布局本身**（完整收益表见第 15 点）。
 
-> 面试一句话总结：**update_actor 阶段两方案的差异高度集中：数据读取（TQ 变长 vs driver padded）、传输（元数据 vs 全量 RPC）、字段布局（nested vs padded）；前向反向与 FSDP 引擎完全共用——性能账 = update_actor 因 nested→padded 慢 15s，但 old_log_prob/ref 因变长免 pad 快 2s，净 +13s/step，修复点在 train_mini_batch 一次性转换。**
+> 面试一句话总结：**update_actor 阶段两方案的差异集中在数据读写路径：TQ 是"元数据分发 + worker 按需 kv_get + 结果写回 Store"（多一笔固定的 Store 读取开销，字段是 nested、在 ppo_loss 内做一次布局转换），baseline 是"数据在手 + pad/unpad 往返 + 结果 union 回 driver"（无读取成本但 Driver 侧集中拼接）；前向反向与 FSDP 引擎完全共用——孰快孰慢由数据规模决定（第 15 点：ChartQA 6.1 GB 下 TQ 的 update_actor −5.46%，小数据量下曾倒挂 +15s）。**
 
 ---
 
-## 15. 性能差异根因与修复（TQ_PERF_COMPARE 的完整结论）
+## 15. TQ 收益的规模依赖：小数据量倒挂 vs 大数据量净收益
 
 ### 1. 现有问题
 
-为什么 TQ 接入后训练反而慢？15s + 5s 的根因与修复，面试必问。
+同一个 TQ 方案，在小数据量实验中表现为**变慢**（update_actor 多约 15s、update_weights 多约 5s），在 ChartQA 多模态 6.1 GB 实验中却**全环节胜出**（单步 −66.50s，−6.27%）。这两种观测必须用同一套机制解释：**TQ 不是"无条件更快"，它是用一笔固定的 Store 读写开销，去换掉 Driver 单点瓶颈；数据量越大越划算，数据量小则倒挂。**
 
-### 2. 方法论（根因链 + 修复方案）
+面试真正想听的也不是"TQ 更快"，而是"你什么时候会选它、什么时候不选它"。
 
-**已确认/已排除的事实**（`TQ_PERF_COMPARE_AND_FIX.md`）：
-1. trainer 基类不同（PPOTrainer vs RayPPOTrainer），但 worker 类/FSDP engine/超参完全一致；
-2. batch 规模一致（245 左右 triplet，pad 后都是 128 的倍数）——排除；
-3. **TQ 读取不是瓶颈**（worker 侧 TQ 读取仅 ~0.5s）——排除；
-4. **根因 = 训练数据字段布局**：baseline `left_right_2_no_padding` 只把 input_ids/position_ids/loss_mask 转 nested，response_mask/old_log_probs/ref_log_prob/advantages/returns/... 都是 **padded 普通张量**；master 从 TQ 读出的**几乎全部是 nested**。
+### 2. 方法论
 
-**慢 15s 的机制**（update_actor）：
-- `ppo_loss`（losses.py:85-91）每个 micro-batch 执行 `data.select(fields).to_padded_tensor()`；
-- baseline：字段已 padded → no-op；
-- master：10+ 个 nested 字段真转换 + `index_select_tensor_dict`/`micro_batch.to(device)`/nested 求和 → 昇腾 NPU 的 `torch.nested` 是慢速/回退路径 → 4 个 micro-batch 累计 ~15s；
-- 为什么 infer（old_log_prob/ref）反而快 2s：纯前向不吃 ppo_loss 的转换，master 变长数据还省掉 baseline 的 pad/unpad 与 GPU unpad 开销。
+#### 2.1 两次观测，先摆事实
 
-**慢 5s 的机制**（update_weights）：TQ 栈（controller + 8 storage unit actor + store server + llm_proxy + replay buffer 轮询线程 + 每步上百次临时线程/事件循环）与 FSDP `param_offload=true/optimizer_offload=true` 的 host 侧传输/汇聚**抢 CPU 和内存带宽**。
+| 观测 | 环境 | 现象 |
+|---|---|---|
+| 观测 A（早期，小数据量） | agent-lightning 接入 TQ 后的初步对比（`TQ_PERF_COMPARE_AND_FIX.md`） | `update_actor` +约 15s、`update_weights` +约 5s，TQ 整体不占优 |
+| 观测 B（定稿，ChartQA 6.1 GB，step 2–5 均值） | 单机 node10，Baseline = verl 0.8.0 `RayPPOTrainer`，TQ = lighting-update | 单步 1060.30s → 993.80s，**−66.50s（−6.27%）**，六个分项里五项全面变快 |
 
-**修复方案**（方案 A，最小改动）：
-- `train_mini_batch` 入口把 loss 字段（response_mask/loss_mask/old_log_probs/ref_log_prob/advantages/returns/token_level_rewards/token_level_scores/rm_scores/entropy）**一次性** `torch.nested.to_padded_tensor`，input_ids/position_ids 保持 nested（remove-padding 前向需要）；
-- 效果：ppo_loss 的 to_padded_tensor 变 no-op，每 update_actor 只转一次（~0.05s vs 4×3-4s）；预期 update_actor 从 ~17s 回到 ~2-5s；
-- 方案 C（update_weights -5s）：TQ controller/storage 限定 CPU、`SimpleStorage.num_data_storage_units` 8→1-2、`TQ_NUM_THREADS` 调低、关闭 `_update_tq_reward_async` 对照验证。
+> 数据出处：观测 B 的完整表格在 `TQ接入方案与量化收益.md` 第三章；观测 A 是当时的现场记录。
+
+#### 2.2 早期归因（已被推翻，但值得讲）
+
+观测 A 当时的假设是**训练数据字段布局**：Baseline 的 `left_right_2_no_padding` 只把 `input_ids`/`position_ids`/`loss_mask` 转 nested，`response_mask`/`old_log_probs`/`ref_log_prob`/`advantages`/`returns` 等仍是 padded 普通张量；而从 TQ 读出的样本几乎**全部是 nested**。于是推理出：`ppo_loss`（`losses.py` 里对 loss 字段逐 micro-batch 调 `to_padded_tensor`）在 Baseline 是 no-op、在 TQ 是真转换，昇腾上 `torch.nested` 走慢速路径，4 个 micro-batch 累计约 15s，并据此提出了"在 `train_mini_batch` 入口一次性转换"的修复方案。
+
+这个方案**没有实施**，而且它作为性能解释是**错的**。反证很直接：
+
+- TQ 侧的数据布局在观测 B 里一字未改，仍是从 Store 读出 nested；如果 nested→padded 真是 15s 级瓶颈，那么数据量从早期实验放大到 6.1 GB 之后只会更严重；
+- 实测却相反：ChartQA 下 `ppo_update_actor` 由 123.87s 降到 117.11s（−6.76s，−5.46%），`old_log_prob` −3.68s、`ref` −3.62s。同一份 nested 代码，在大数据量下不是负担而是净收益。
+
+结论：**nested vs padded 是真实的实现差异（值得作为技术事实记录），但它不是性能差异的原因，更不需要"修复"。**
+
+#### 2.3 正确解释：一笔固定开销 vs 一个随规模增长的瓶颈
+
+**（a）TQ 侧新增了一笔固定开销：从 Store 读写数据。**
+
+最干净的证据就是 `ppo_adv`：Baseline 0.12s → TQ 2.78s，**+2.66s（+2216%）**。这是唯一不退反进的指标，原因也不神秘——TQ 下 `compute_advantage` 需要在 Driver 侧先 `kv_batch_get` 把 `token_level_scores`、log probs、values 等字段从 Store 捞回来，算完再 `kv_batch_put` 写回 `advantages`/`returns`；Baseline 的这些字段本来就已经在 Driver 内存里，直接算。
+
+这笔开销与数据规模**弱相关**：无论一个 step 里有多少条轨迹，barrier 检查、元数据往返、字段读取的"固定部分"都在那里。它不随 Driver 瓶颈的缓解而消失。
+
+**（b）Baseline 侧的瓶颈是 Driver 单点，而它的代价随数据规模增长。**
+
+Baseline 的每个 step 都要把生成结果**全量回收到 Driver**，在 Driver 上做 padding、截断、建 tensor、组 batch，再把 190~245 MB 的实际张量分发出去，算完的结果也回到 Driver 做 concat。这条路径的成本近似正比于轨迹总数据量。
+
+**（c）所以收益是两者的差，小数据量下差为负。**
+
+早期实验数据量小 → 那 190~245 MB 的分发/回收与 Driver 侧组 batch 本来就不贵，Driver 单点瓶颈"看不见"；而 TQ 那笔固定的 Store 读写开销照样要付 → 净结果是倒挂。数据量放大到 6.1 GB 后，Driver 侧的成本被按比例放大，TQ 的固定开销被摊薄 → 收益显现并覆盖掉 2.66s 的 adv 回退。
+
+用一张表把这条逻辑钉死：
+
+| | 规模小（早期实验） | 规模大（ChartQA 6.1 GB） |
+|---|---|---|
+| TQ 固定开销（Store 读写、barrier、元数据往返） | 照付，占比高 | 照付，被摊薄 |
+| Baseline Driver 单点成本（全量回收 + 组 batch + 190~245 MB 分发 + 结果 concat） | 小，瓶颈不显现 | 大，成为主成本 |
+| 净效果 | **倒挂**（update_actor +15s、update_weights +5s） | **净收益**（−66.50s，−6.27%） |
+
+> 注意 update_weights 那 +5s 也要一并归位：TQ 栈（controller、8 个 storage unit actor、store server、llm_proxy、replay buffer 轮询线程）与 FSDP `param_offload=true`/`optimizer_offload=true` 的 host 侧搬运共享 CPU 与内存带宽，这是**固定的资源竞争**，性质与 adv 的固定读取开销同类，同样不随 Driver 瓶颈缓解而消失；它在大数据量下被更大的总收益覆盖。
 
 ### 3. 具体数值样例
 
-- 修复前后：update_actor 17s → 2-5s（-12~15s）；update_weights -5s；保持 infer -2s 收益 → **整体 step 时间从 +13s 变为 -2~-7s（TQ 方案反超）**；
-- 验证闭环：`[BENCH-LOSS] to_padded_tensor` 应降到 ~0.000s；`[BENCH-TRAIN]` 每 micro-batch 回落；`actor/loss`、`actor/grad_norm` 数值一致（转换不引入偏差）。
+#### 3.1 ChartQA 6.1 GB 实测（step 2–5 平均值，`TQ接入方案与量化收益.md` 3.2）
 
-> 面试一句话总结：**TQ 慢的根因不在传输而在字段布局：TQ 存的变长 NestedTensor 在 ppo_loss 每 micro-batch 都要转 padded（昇腾回退路径，4 次 ≈15s），baseline 本来 padded 是 no-op；修复 = train_mini_batch 入口一次性转换（input_ids 保持 nested 走 remove-padding），update_weights 慢 5s 是 TQ 栈与 FSDP offload 抢 CPU——修完后 TQ 方案在 infer 上还快 2s，整体反超。**
+| 环节 | 指标 | Baseline (s) | TQ (s) | Delta (s) | Delta (%) |
+|---|---|---:|---:|---:|---:|
+| Rollout | `gen_total` | 670.41 | 630.50 | −39.91 | −5.95% |
+| 数据分发收集 | `transit_total` | 193.45 | 178.26 | −15.19 | −7.85% |
+| 训练 | `ppo_old_log_prob` | 42.15 | 38.47 | −3.68 | −8.73% |
+| 训练 | `ppo_ref` | 30.30 | 26.68 | −3.62 | −11.95% |
+| 训练 | `ppo_adv` | 0.12 | 2.78 | **+2.66** | **+2216%** |
+| 训练 | `ppo_update_actor` | 123.87 | 117.11 | −6.76 | −5.46% |
+| **总计** | | **1060.30** | **993.80** | **−66.50** | **−6.27%** |
+
+三个部分分别看：Rollout −39.91s、数据分发收集 −15.19s、训练合计 −11.40s（−5.80%）。前两项合计贡献约 55.1s，占总收益的 82.9%——**收益主要落在"数据搬运"而不是"模型计算"**，这正好印证了"只替换数据通路，不替换计算逻辑"的改造原则。
+
+#### 3.2 把"固定开销"这一项单独拎出来算
+
+- 固定开销的可见部分：`ppo_adv` +2.66s；
+- 大数据量下的总收益：−66.50s；
+- 覆盖倍数：66.50 / 2.66 ≈ **25 倍**——即在这个数据规模下，TQ 每付出 1s 的 Store 读写代价，能省下约 25s 的 Driver 侧搬运与重构。
+
+反过来推早期实验为什么倒挂：当数据量小、Driver 侧可省的部分（全量回收 + 组 batch + 分发）本来就很小，而 TQ 的固定代价（adv 读写 + TQ 栈与 FSDP offload 的 CPU/带宽竞争）在 15s + 5s 量级时，**分母太小、分子照付**，净结果必然为负。这就是"规模依赖"的量化含义。
+
+#### 3.3 面试怎么回答"为什么一开始慢后来快"
+
+一句话框架：**先承认观测、再否定错误归因、最后给出可外推的机制。**
+
+> 早期小数据量下 TQ 确实更慢，我们当时归因到 nested/padded 字段布局，但那个判断后来被自己的大数据实验证伪了——同一份 nested 代码在 ChartQA 6.1 GB 上 `update_actor` 反而快 6.76s。真正的原因是 TQ 有一笔**固定的 Store 读写开销**（最直接的证据是 `ppo_adv` 从 0.12s 涨到 2.78s），而它换来的是**消掉 Driver 单点**——Driver 全量回收、组 batch、190~245 MB 分发、结果 concat 这些成本是随数据量线性增长的。数据量小时 Driver 不构成瓶颈，固定开销就纯亏；数据量放大到 6.1 GB 后，66.50s 的收益把 2.66s 的开销覆盖了 25 倍，整体单步降 6.27%。
+
+> 面试一句话总结：**TQ 的收益是规模依赖的——它用一笔固定的 Store 读写开销（`ppo_adv` +2.66s 是直接证据）去换 Driver 单点的消除，而 Driver 侧的全量回收/组 batch/分发成本随数据量增长；小数据量下瓶颈不显现所以倒挂（早期 update_actor +15s、update_weights +5s），ChartQA 6.1 GB 下收益 −66.50s（−6.27%）、覆盖倍数约 25 倍。早期把它归因成 nested→padded 布局问题是错的，该"修复"从未实施，也不需要实施。**
 
 ---
 
@@ -854,23 +910,23 @@ TransferQueue（partition=train/val），每 key 一个样本的 NestedTensor �
 **Q2：KVBatchMeta 和 DataProto 的区别？**
 KVBatchMeta = keys + tags + fields 集合（元数据，KB 级）；DataProto = 完整字段数据（MB 级）。前者配 TQ 按需拉取，后者整包携带。
 
-**Q3：update_actor 数据读取耗时？**
-TQ 读取 ~0.5s（可忽略）；真正慢的是 nested→padded 转换（~15s，可修复为一次性转换）。
+**Q3：update_actor 阶段 TQ 的额外开销在哪？**
+TQ 侧多出的是"从 Store 按需读字段"这笔**固定开销**（`kv_get` + 元数据往返），字段形态是变长 NestedTensor、`ppo_loss` 内做一次布局转换；但这笔开销不是慢的主因——早期曾估到 ~15s，已被大数据量实验证伪（ChartQA 下 `update_actor` 反而 −6.76s）。可见的固定开销证据是 `ppo_adv` +2.66s（见第 15 点）。
 
 **Q4：rollout 和训练怎么并行？**
 agent 执行并发 + ReplayBuffer 后台轮询 TQ tag + daemon 异步收集；训练在 rollout 全部完成后串行开始（当前同步 step，未来可 pipeline 重叠）。
 
-**Q5：TQ 写入开销被 rollout 吃掉了吗？**
-是——daemon 的 triplet 构建 + kv_batch_put 与 agent 执行并行，被墙钟掩盖；但训练侧 ppo_loss 转换是串行的、没被掩盖（15s 暴露）。
+**Q5：TQ 的写入/读取开销分别被什么掩盖或暴露？**
+写入（`kv_batch_put`）与 agent 执行、daemon 收集并行发生，被墙钟掩盖；读取（`kv_get` + adv 阶段的 `kv_batch_get`）发生在训练关键路径上，是**串行暴露的固定成本**——`ppo_adv` 0.12s → 2.78s 就是它最干净的一次测量。
 
 **Q6：为什么 infer（old_log_prob/ref）TQ 反而快？**
-变长数据免 pad/unpad 往返 + remove-padding 前向天然契合；baseline 每阶段 GPU unpad 有开销。
+变长数据免 pad/unpad 往返 + remove-padding 前向天然契合；baseline 每阶段 GPU unpad 有开销。ChartQA 实测 `old_log_prob` −8.73%、`ref` −11.95%。
 
 **Q7：两方案 FSDP 引擎一样吗？**
 完全一样（FSDPEngine.forward_backward_batch 共用），差异只在数据输入形态与传输方式。
 
-**Q8：修复 15s 的落地方式？**
-train_mini_batch 入口一次性 to_padded_tensor（input_ids/position_ids 保持 nested），ppotrainer 内转换变 no-op；验证 loss/grad_norm 数值一致。
+**Q8：那 TQ 到底什么时候该用？**
+看数据规模——TQ 是"用固定 Store 读写开销换掉 Driver 单点"，收益 = Driver 侧省下的搬运（随数据量线性增长）− 固定开销。小数据量下 Driver 不成瓶颈，纯亏（早期 update_actor +15s、update_weights +5s）；ChartQA 6.1 GB 下净赚 66.50s（−6.27%），覆盖倍数约 25 倍。
 
 **Q9：0.8.0 升级为什么报 14%8 != 0？**
 0.8.0 的 _update_actor 把 mini_batch_size 乘了 rollout.n（128），而 agent 已展开 triplet——override 去掉乘法后 per-GPU mini_batch=2，永远整除。
@@ -883,7 +939,7 @@ TQ 的 StorageManager 后端之一（MooncakeStorageManager/MooncakeStoreClient�
 - **两方案本质**：TQ = 数据仓库（变长 NestedTensor 按 key 存，driver 拿元数据按需读写）；无 TQ = driver 整包 DataProto（padded，pad/unpad 往返）；
 - **rollout 读写**：agent 执行 + span 存 store + daemon 转 triplet + `kv_batch_put` 写 TQ（master）/ `union` 进 DataProto（baseline）；HTTP 在任务派发与 Agent→LLMProxy→vLLM 推理两处；
 - **update_actor 读写**：tqbridge `kv_batch_get` 从 TQ 拉变长字段 → FSDP train_mini_batch → 前向 ppo_loss + backward → optimizer_step → 输出写回 TQ；baseline 是 driver 转换 + RPC 全量传；
-- **性能账**：TQ 读取 0.5s 可忽略；nested→padded 转换 +15s（修复：入口一次性转换）；infer -2s；update_weights CPU 竞争 +5s；
+- **性能账**：TQ 的收益是规模依赖的——固定开销 = Store 读写（`ppo_adv` +2.66s 是直接证据）+ TQ 栈与 FSDP offload 抢 CPU（早期 update_weights +5s）；换来 Driver 单点消除（全量回收 + 组 batch + 190~245 MB 分发 + 结果 concat）。小数据量倒挂（早期 update_actor +15s），ChartQA 6.1 GB 净收益 −66.50s（−6.27%，覆盖倍数约 25×）；nested/padded 只是布局差异，不是性能原因；
 - **升级坑**：0.8.0 两处整除断言（pad 除数 64、mini_batch 不乘 n）——agent 动态 batch 的兼容性修复。
 
 ---
@@ -901,16 +957,17 @@ TQ 的 StorageManager 后端之一（MooncakeStorageManager/MooncakeStoreClient�
 | `verl/trainer/ppo/ray_trainer.py` | `RayPPOTrainer`：DataProto 整包流（`_compute_old_log_prob/_update_actor`） | baseline |
 | `verl/workers/engine_workers.py` | `ActorRolloutRefWorker.update_actor` / `TrainingWorker.train_mini_batch` | 共用 |
 | `verl/workers/engine/fsdp/transformer_impl.py` | `FSDPEngine.forward_backward_batch/optimizer_step`（前向反向） | 共用 |
-| `verl/workers/utils/losses.py` | `ppo_loss`（nested→padded 转换点，15s 根因） | 共用 |
+| `verl/workers/utils/losses.py` | `ppo_loss`（TQ 路径字段为 nested，此处做布局转换） | 共用 |
 | `transferqueue/transfer_queue/` | TQ：controller/client/StorageManager/Mooncake backend | master |
-| `agent-lightning/TQ_PERF_COMPARE_AND_FIX.md` | 性能对比与修复方案 | 文档 |
+| `TQ接入方案与量化收益.md` | 定稿实测：ChartQA 6.1 GB 分项收益表（第三章） | 文档 |
+| `agent-lightning/TQ_PERF_COMPARE_AND_FIX.md` | 早期小数据量观测记录（nested→padded 归因已证伪） | 文档 |
 | `agent-lightning/VERL_UPGRADE_ANALYSIS.md` | 0.6.1→0.8.0 数据流与 ERROR 分析 | 文档 |
 
 ## 核心数字
 
 - `train_batch_size=32`、`rollout.n=4` → 128 rollouts/step；triplet 120 → master upsample 到 128 / baseline pad 补齐到 per_gpu_divisor（都向上补齐，不丢弃真实样本；原生 verl 才是 floor32→96）
 - `ppo_mini_batch_size=32`、`micro_batch_size_per_gpu=4`、DP=16 → per-GPU 8 条 → 2 micro-batch
-- 性能：TQ 读取 0.5s；nested→padded 4×3-4s ≈ 15s（修复后 ~0.05s）；infer -2s；update_weights +5s（CPU 竞争）
+- 性能：TQ 固定开销 = `ppo_adv` 从 0.12s → 2.78s（+2.66s，唯一回退项）；ChartQA 6.1 GB 实测单步 1060.30s → 993.80s（**−66.50s，−6.27%**），其中 `gen_total` −39.91s、`transit_total` −15.19s、训练合计 −11.40s；覆盖倍数 ≈ 25×；小数据量下反而倒挂（早期 update_actor +15s、update_weights +5s）
 - 断言：总 batch % 64 == 0（prepare_micro_batches）；per-GPU % mini_bsz_per_gpu == 0（make_iterator）
 
 ## 简历亮点 ↔ 本文章节映射
@@ -920,5 +977,6 @@ TQ 的 StorageManager 后端之一（MooncakeStorageManager/MooncakeStoreClient�
 | verl 0.6.1→0.8.0 升级（数据流兼容修复） | 第 16 点（两个 ERROR + override） |
 | TQ MoonCake 存储后端接入、RDMA 高速传输 | 第 6、8 点（kv_batch_put/get）+ `Mooncake.md`/`TQ.md` |
 | RayPPOTrainer → PPOTrainer 迁移 | 第 1、9 点（两 trainer 数据流差异） |
-| 昇腾 NPU 单/双机全链路 | 第 15 点（torch.nested 回退路径）+ `Communication.md` |
+| 昇腾 NPU 单/双机全链路 | 第 15 点（TQ 收益的规模依赖：固定 Store 读写开销 vs Driver 单点）+ `Communication.md` |
+| TQ 接入的量化收益（−66.50s / −6.27%） | 第 15 点（ChartQA 6.1 GB 实测表）+ 第 7、14 点 |
 | 训练/推理/环境/奖励解耦 | 第 2、4、7 点（TQ 数据面 + HTTP 推理面 + 异步） |
