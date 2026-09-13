@@ -340,6 +340,314 @@ backend:
 
 ---
 
+## 6. SimpleStorage 与 MooncakeStore 的内存分配（双机怎么分）
+
+### 1. 现有问题：两种后端的内存"记账口径"完全不同
+
+面试里问"TQ 吃多少内存、双机怎么分"，最难的地方在于 **SimpleStorage 和 MooncakeStore 根本不是同一套账**：
+
+- **SimpleStorage 按"样本条数"记账**：配置项叫 `total_storage_size`（默认 100000），单位是**条样本**，不是字节；而且它是"准入配额"，**不是预分配**——真正吃多少 RAM 取决于每条样本的字段有多宽。
+- **MooncakeStore 按"字节"记账，而且是 per client**：`global_segment_size`（默认 4 GiB）和 `local_buffer_size`（默认 1 GiB）的单位是字节，但注释明确写着 **per client**——**每个客户端进程各自挂一份**，集群总量是各 client 之和，不是全局一份。
+
+由此带来三个具体的坑：
+
+1. **单纯看默认值会误判**：`total_storage_size: 100000` 看着很安全，但如果每条样本 68 KiB，两台机器各 50000 条就是 **6.5 GiB** 量级的 CPU 内存，可能直接把节点打爆；
+2. **Mooncake 的容量是硬约束**：TQ 起的 `mooncake_master` 带 `--eviction_high_watermark_ratio=1.0 --eviction_ratio=0.0 --allow_evict_soft_pinned_objects=false`（`storage/bootstrap/mooncake_bootstrap.py:91-94`），加上客户端侧 `with_hard_pin = True`（`storage/clients/mooncake_client.py:87`）与 `-default_kv_lease_ttl=999999`（同 bootstrap `:89`）——**eviction 实际上被关闭了**，TQ 把 Mooncake 当 KV 数据库用而不是当 cache 用。段写满不会淘汰老对象，**只会写失败**；
+3. **"双机"到底分几份内存，取决于有几个 `tq.init()` 进程**，而不是有几台机器。这是最容易被面试官追问的点。
+
+### 2. 方法论：两套分配机制是怎么落地的
+
+#### （1）SimpleStorage：按条数切给 N 个 Ray actor，SPREAD 铺到各机器，数据懒分配
+
+**第一步：按条数均分。** 启动时对总数做向上取整除法（`storage/bootstrap/simple_storage_bootstrap.py:45`）：
+
+$$ \text{storage\_unit\_size} = \left\lceil \frac{\text{total\_storage\_size}}{\text{num\_data\_storage\_units}} \right\rceil $$
+
+默认 `total_storage_size: 100000`、`num_data_storage_units: 2`（`config.yaml:27,30`）→ 每个 unit **50000 条**。config 原注释还给了选参建议（`config.yaml:28-29`）：
+
+```yaml
+    # Number of distributed storage units.
+    # Recommended: >= 2 x number of nodes for load balancing.
+    num_data_storage_units: 2
+```
+
+**第二步：每个 unit 是一个 Ray actor，放进 SPREAD 的 placement group。** 关键代码（`simple_storage_bootstrap.py:37-46`）：
+
+```python
+storage_placement_group = get_placement_group(num_data_storage_units, num_cpus_per_actor=1)
+
+for storage_unit_rank in range(num_data_storage_units):
+    storage_node = SimpleStorageUnit.options(
+        placement_group=storage_placement_group,
+        placement_group_bundle_index=storage_unit_rank,      # rank i ↔ 第 i 个 bundle
+        name=f"TransferQueueStorageUnit#{storage_unit_rank}",
+    ).remote(
+        storage_unit_size=math.ceil(total_storage_size / num_data_storage_units),
+    )
+```
+
+而 placement group 的定义只有 CPU、没有内存（`utils/common.py:41-42`）：
+
+```python
+bundle = {"CPU": num_cpus_per_actor}          # num_cpus_per_actor=1
+placement_group = ray.util.placement_group([bundle for _ in range(num_ray_actors)], strategy="SPREAD")
+```
+
+**这两行决定了双机的内存分布**：`strategy="SPREAD"` 让 Ray 尽量把每个 bundle 放到**不同的节点**，`bundle_index=rank` 又把 unit 和 bundle 一一绑定，所以 **2 个 unit 在双机集群上正好一机一个**；`bundle` 只声明 CPU、不声明 memory，意味着 **Ray 不会为存储预留任何内存**——unit 所在节点的内存是被"顺带占用"的，可能和训练进程抢内存。
+
+**第三步（最关键）：配额 ≠ 预分配。** `StorageUnitData` 内部就是一个嵌套 dict + 一个计数集合（`storage/simple_storage.py:63-69`）：
+
+```python
+def __init__(self, storage_size: int):
+    # field_name -> {global_index: data} nested dict
+    self.field_data: dict[str, dict] = {}
+    # Capacity upper bound (not pre-allocated list length)
+    self.storage_size = storage_size
+    # Track active global_index keys for O(1) capacity checks
+    self._active_keys: set = set()
+```
+
+源码注释直接写明 `Capacity upper bound (not pre-allocated list length)`——**`storage_unit_size` 只是计数上限，不是 mmap / 预申请**。超限的判定是"新 key 数 + 已有 key 数 > 配额"，**直接抛错、不淘汰**（`simple_storage.py:105-111`）：
+
+```python
+new_global_keys = [k for k in global_indexes if k not in self._active_keys]
+if len(self._active_keys) + len(new_global_keys) > self.storage_size:
+    raise ValueError(
+        f"Storage capacity exceeded: {len(self._active_keys)} existing + "
+        f"{len(new_global_keys)} new > {self.storage_size}"
+    )
+```
+
+释放靠显式 `clear()`，注释是 `Remove data at given global index keys, immediately freeing memory.`（`simple_storage.py:125-126`）。**所以 SimpleStorage 的真实内存公式是：**
+
+$$ \text{RAM} \approx \sum_{\text{field}} \left(\text{已存样本数} \times \text{单条 field 字节数}\right) $$
+
+配额单位是"条"，内存单位是"字节"，**两者之间差一个"单条样本平均宽度"**，这就是所有误判的来源。
+
+#### （2）MooncakeStore：按字节配，而且是"每个客户端进程各自一份"
+
+**第一步：配置与代码默认值一致，都是 4 GiB / 1 GiB，注释点明 per client**（`config.yaml:49-52`）：
+
+```yaml
+    # Global memory segment size in bytes **per client** for mounting (default: 4GB)
+    global_segment_size: 4294967296
+    # Local buffer size in bytes **per client** (default: 1GB)
+    local_buffer_size: 1073741824
+```
+
+对应客户端代码（`storage/clients/mooncake_client.py:62-63`）：
+
+```python
+self.global_segment_size = int(config.get("global_segment_size", 4096 * 1024 * 1024))
+self.local_buffer_size = int(config.get("local_buffer_size", 1024 * 1024 * 1024))
+```
+
+**第二步：这两个值在 `setup()` 里被"分配 + 注册"成两块真实内存**，不是上限声明（`mooncake_client.py:86-98`）：
+
+```python
+self.replica_config = ReplicateConfig()
+self.replica_config.with_hard_pin = True          # 对象硬 pin，不可被淘汰
+
+self._store = MooncakeDistributedStore()
+ret = self._store.setup(
+    self.local_hostname,        # 本机地址（为空则取 Ray 节点 IP）
+    self.metadata_server,       # HTTP 元数据服务
+    self.global_segment_size,   # ← 数据段：本机分配并挂载给 master
+    self.local_buffer_size,     # ← 传输缓冲：本机分配并注册
+    self.protocol,              # tcp / rdma
+    self.device_name,
+    self.master_server_address,
+)
+```
+
+下钻到 Mooncake 侧（`mooncake-store/src/real_client.cpp`）可以看到两者都是**真分配**：
+
+- `local_buffer_size` → `ClientBufferAllocator::create(local_buffer_size, protocol, use_hugepage)` + `RegisterLocalMemory(...)`（`real_client.cpp:636-643`），即"本机中转缓冲"，RDMA 收发时的 staging 区；
+- `global_segment_size` → 循环 `MountSegment(ptr, size, protocol)`（`real_client.cpp:702-707` 起），内存来自 `allocate_buffer_mmap_memory` / RDMA 下的 `allocate_buffer_numa_segments`（`:720-727`），**当段大于 `max_mr_size` 时自动拆成多个 mapped_shm**（注释 `:653-655`），RDMA 下还会按有网卡的 NUMA 节点分段以打满多张 NIC（`:684-700`）。
+
+所以 Mooncake 的两块内存是 **setup 阶段就预分配并 pin 住的常驻内存**（不是用到才涨），而 `local_buffer_size` 若配 0 则跳过注册（`:649-651`）；顺带一提，Mooncake 的 C++ binding 自身默认只给 16 MB（`mooncake-integration/store/store_py.cpp:1560`），**4 GiB 是 TQ 显式指定的**。
+
+**第三步：谁来当 client？——每个 `tq.init()` 进程一个。** 链路是：`init()` → `_maybe_create_tq_client(final_conf)`（`interface.py:214`）→ `_TQ_CLIENT.initialize_storage_manager(manager_type=backend_name, config=conf.backend[backend_name])`（`interface.py:62`）→ `StorageManagerFactory.create(...)`（`client.py:90`）→ `KVStorageManager.__init__` 里**只创建一个**底层客户端（`storage/managers/base.py:428`）：
+
+```python
+self.storage_client = StorageClientFactory.create(client_name, config)
+```
+
+而 `tq.init()` 的行为在 `interface.py` 的 docstring 里就写清了双机语义（`interface.py:137-146`）：
+
+```python
+>>> # In process 0, node A
+>>> import transfer_queue as tq
+>>> tq.init()   # Initialize the TransferQueue
+>>> # In process 1, node B (with Ray connected to node A)
+>>> import transfer_queue as tq
+>>> tq.init()   # This will only initialize a TransferQueueClient and link with existing TQ
+```
+
+第一台机器上的 `tq.init()` 走完整初始化（起 controller + storage + 自己的 client，`interface.py:148-214`）；后续机器上的 `tq.init()` 命中 `_init_from_existing()`（`interface.py:100-116`）→ **只创建一个 client**（模块级全局 `_TQ_CLIENT`，`interface.py:40`）。**每个 client 都会在本机挂一份 4 GiB 段 + 1 GiB buffer**，因此：
+
+$$ \text{集群 Mooncake 数据段总量} = N_{\text{client}} \times \text{global\_segment\_size} $$
+
+`local_hostname: ""` 时用 Ray 节点 IP 自动探测（`mooncake_client.py:69-74`，`get_node_ip_address()`），保证**段挂在自己这台机器上而不是 master 那台**——这是"双机内存怎么分"的物理落点。
+
+**第四步：对象粒度决定"段里能装多少条"。** key 的格式是 `"<global_index>@<field_name>"`（`base.py:445-448`）：
+
+```python
+keys_suffixes = ["@" + f for f in sorted_fields]
+keys_prefixes = [f"{i}" for i in global_indexes]
+return [pfx + sfx for sfx, pfx in itertools.product(keys_suffixes, keys_prefixes)]
+```
+
+value 是**单样本单字段**（嵌套 tensor 用 `unbind()` 拆开，`base.py:466-471`）：
+
+```python
+if isinstance(field_data, Tensor) and field_data.is_nested:
+    results.extend(field_data.unbind())
+```
+
+于是 **KV 对象数 = 样本数 × 字段数**，这直接影响元数据规模与 put/get 的调用次数。
+
+**第五步：释放只有一条路。** 因为 eviction 关闭 + 硬 pin，容量不会被自动回收，只能显式 `clear_data`，或在 `close()` 时 `remove_all()`（`interface.py:249-255`）：
+
+```python
+ret = _TQ_CLIENT.storage_manager.storage_client._store.remove_all()
+```
+
+**第六步：还有第三份"隐藏内存"——CUDA tensor 的 CPU 中转副本。** put 的时候要先把 tensor 搬到 CPU 再注册（`mooncake_client.py:473-484`）：
+
+```python
+# TODO: support gpu direct rdma and use different data paths.
+#       For GPU, it's more reasonable to perform data copy since
+#       The register overhead is much higher than CPU
+if t.device.type == "cuda":
+    t = t.cpu()
+t = t.contiguous()
+```
+
+**GPU-direct RDMA 尚未支持**（源码 TODO），所以每次 put 都会产生一份 CPU 侧的临时拷贝，再加上 `register_buffer` 的开销。
+
+#### （3）双机布局：段随进程走，容量是各 client 之和
+
+以本项目双机（node1 trainer + node2 rollout）为例，假设两台机器各有一个进程调用 `tq.init()`：
+
+| 位置 | 进程 | `global_segment_size` | `local_buffer_size` | 说明 |
+|---|---|---|---|---|
+| node1 | trainer（`tq.init()` 首个进程） | 4 GiB | 1 GiB | 同时起 Controller + storage + **mooncake_master** |
+| node1 | `mooncake_master` + HTTP metadata | 只存元数据（对象目录、lease/pin 表） | — | 比数据段小几个数量级；注意 `auto_init=true` 会 **kill 已存在的 mooncake_master**（`config.yaml:38`、`mooncake_bootstrap.py:43-53`） |
+| node2 | rollout（`tq.init()` 第二个进程） | 4 GiB | 1 GiB | 只建 client，段挂在本机 |
+| **集群合计** | | **8 GiB 可被 RDMA 访问的 KV 容量** | 2 GiB 中转缓冲 | 若每台再起 N 个进程，则各乘 (N+1) |
+
+**要点**：段不是"master 上的一大块内存池"，而是**每个 client 在本机挂一段**，master 只做目录与路由；跨机读 = RDMA 远程读对方段，所以 **node2 写进去的 32 条轨迹物理上躺在 node2 的 4 GiB 段里**，node1 训练时是远程拉取。
+
+#### （4）两种后端对比
+
+| 维度 | SimpleStorage | MooncakeStore |
+|---|---|---|
+| 配额单位 | **样本条数**（`total_storage_size`，默认 100000） | **字节**（`global_segment_size`，默认 4 GiB） |
+| 是否预分配 | 否，懒分配 dict（注释 `not pre-allocated`） | **是**，`setup()` 时 mmap/NUMA 分配 + RDMA pin |
+| 双机怎么分 | 按**条数**均分给 N 个 Ray actor，`SPREAD` 铺到各节点（`bundle={"CPU":1}`，不预留内存） | 每个 client 进程在**本机**挂一份段，容量 = 各 client 之和 |
+| 数据粒度 | `field_data[field][global_index]` | KV 对象，key = `"<idx>@<field>"` |
+| 超限行为 | 直接 `raise ValueError`（无淘汰） | 段满 + eviction 关闭 + hard pin → **写失败** |
+| 释放方式 | `clear()` 立即释放（ZMQ 通知） | 显式 clear / `remove_all()`；lease & pin TTL = 999999 |
+| 跨机传输 | ZMQ（CPU 拷贝，无 RDMA） | RDMA（`protocol: rdma`），无 RDMA 自动降级 TCP |
+| 额外内存 | — | `local_buffer_size` 中转缓冲 + CUDA→CPU 拷贝副本 |
+
+### 3. 具体数值样例
+
+#### 例 A：SimpleStorage 双机的"条数配额"换算成真实内存
+
+```text
+配置：total_storage_size = 100000，num_data_storage_units = 2
+第 1 步：unit_size = ceil(100000 / 2) = 50000 条
+
+第 2 步：SPREAD 铺到双机
+  node1 → TransferQueueStorageUnit#0（配额 50000 条）
+  node2 → TransferQueueStorageUnit#1（配额 50000 条）
+  两台都不会为它预留内存（bundle 只有 CPU=1）
+
+第 3 步：假设单条样本的字段（RL 轨迹常见形态）
+  prompts      int64[512]  → 512 × 8 = 4096 B
+  responses    int64[512]  → 512 × 8 = 4096 B
+  rm_scores    fp32[1]     → 1 × 4   =    4 B
+  num_turns    int64[1]    → 1 × 8   =    8 B
+  单条合计 = 8204 B ≈ 8.01 KiB
+
+第 4 步：真实内存
+  单 unit 装满 50000 条：50000 × 8204 B = 410,200,000 B ≈ 391 MiB
+  双机合计（100000 条）：≈ 782 MiB
+  → 配额"10 万条"听起来很大，实际只占 782 MiB，完全安全
+
+第 5 步：反过来算——给定内存预算求配额
+  若只允许 storage 用 4 GiB：4,294,967,296 / 8204 ≈ 523,500 条
+  → total_storage_size 可以放到 500000（每 unit 250000 条）
+
+第 6 步：超限行为（无淘汰）
+  unit#0 已存 50000 条后再 put 1 条：
+    50000 existing + 1 new > 50000 → ValueError: Storage capacity exceeded
+  只能等下游 mark_consumed / clear() 释放后重试
+
+第 7 步：换成长轨迹（responses 变长是内存爆炸的主因）
+  responses int64[8192] → 65536 B
+  单条 = 4096 + 65536 + 4 + 8 = 69,644 B ≈ 68.0 KiB
+  单 unit 50000 条：50000 × 69,644 ≈ 3.48 GB ≈ 3.24 GiB
+  双机合计 ≈ 6.5 GiB —— 同样是 10 万条配额，内存涨了 8 倍
+  ⇒ 结论：配 total_storage_size 之前必须先估"单条平均字节数"
+```
+
+#### 例 B：MooncakeStore 双机的容量、对象数与"第几步写爆"
+
+```text
+配置（默认）：global_segment_size = 4 GiB（每 client），local_buffer_size = 1 GiB（每 client）
+
+第 1 步：双机各一个 tq.init() 进程
+  node1 段 = 4,294,967,296 B（4 GiB）→ 数据真身存在这里
+  node1 buffer = 1,073,741,824 B（1 GiB）→ RDMA 收发中转
+  node2 段 = 4 GiB，node2 buffer = 1 GiB
+  集群 KV 容量 = 8 GiB；RDMA 注册内存合计 = 10 GiB
+
+第 2 步：一个 batch 的对象数（key = "<idx>@<field>"）
+  batch = 32 样本，字段 4 个（prompts/responses/rm_scores/num_turns）
+  对象数 = 32 × 4 = 128 个 KV 对象，分布在 node2 的段里
+
+第 3 步：一个 batch 的字节数（同例 A 的单条宽度）
+  单样本 8204 B × 32 = 262,528 B ≈ 256.4 KiB
+
+第 4 步：8 GiB 能存多少个这样的 batch
+  8,589,934,592 / 262,528 ≈ 32,720 个 batch
+  → 短轨迹 + 小 batch 时，默认 4 GiB 段绰绰有余
+
+第 5 步：长轨迹 + 大 batch —— 什么时候会爆
+  单样本 69,644 B（68.0 KiB）
+  batch = 1024 → 1024 × 69,644 = 71,315,456 B ≈ 68.0 MiB / step
+  单机 4 GiB 段：4,294,967,296 / 71,315,456 ≈ 60 step 就写满
+  ⇒ 因为 eviction_ratio=0.0 + with_hard_pin=True + lease TTL 999999，
+    第 61 步不会淘汰老对象，而是 put 失败
+  ⇒ 训练端必须保证 mark_consumed → clear 及时释放，或显式调大段
+
+第 6 步：本项目与性能测试的实际取值（都是显式放开的）
+  仓库内验证脚本：global_segment_size = 8,589,934,592（8 GiB）
+                  local_buffer_size  = 2,147,483,648（2 GiB）  ← 默认值的 2 倍
+  perftest 配置：num_data_storage_units = 16
+                global_segment_size = 86,294,967,296 B ≈ 80.4 GiB
+  ⇒ 说明默认 4 GiB 只是"能跑起来"的保守值，高并发 / 长轨迹必须按 batch 显式调大
+```
+
+### 4. 配置建议与演进（对应"新版特性"小节）
+
+**（1）选参与容量规划的三条经验规则。**
+
+- `num_data_storage_units >= 2 × 节点数`：这是源码注释直接给的（`config.yaml:29`）。原因在 `SPREAD` + `bundle_index=rank`：unit 数少于节点数时会有机器分不到 unit，负载不均；unit 数 = 2× 节点数时每台正好 2 个，读写请求可以轮转。
+- `global_segment_size` 不要顶满物理内存：同一进程里还有 `local_buffer_size`（1 GiB 起）、CUDA→CPU 的临时拷贝副本、以及训练本体的 CPU 内存。工程上段大小控制在可用内存的 60% 左右比较稳。
+- **有 RDMA 才用 RDMA**：`protocol: tcp` 是默认（`config.yaml:48`）。上 RDMA 时把 `device_name` 显式指到网卡（如 `mlx5_0`），否则按注释交给 Mooncake 自动选（`config.yaml:53-55`）；RDMA 下 Mooncake 会按有 NIC 的 NUMA 节点切分段（`real_client.cpp:684-700`），这也是多网卡机器要显式指定的原因。
+
+**（2）口径差异是"双机内存分配"这一问的题眼。** 三套后端其实是三种记账口径：SimpleStorage 记"条数"、MooncakeStore 记"字节 × client 数"、Yuanrong 记"共享内存段大小"（`config.yaml:86` 的 `worker_args: "--shared_memory_size_mb 8192"`，且注释提醒 >21 GB 共享内存需要大页 `--enable_huge_tlb` + `sysctl vm.nr_hugepages` + `ulimit -l unlimited`，`config.yaml:81-85`）。回答时先说清"按什么记账、记几份"，再算数字，就不会被绕进去。
+
+**（3）演进方向：从 CPU 段走向 GPU 直连。** 目前 `mooncake_client.py:475-477` 的 TODO 明确写着 `support gpu direct rdma and use different data paths`，理由是"GPU 的 register 开销远高于 CPU"——也就是说当前设计是**刻意**先把 CUDA tensor 拷到 CPU 再注册。一旦支持 GPU-direct RDMA，`global_segment_size` / `local_buffer_size` 的物理落点会从主机内存迁移到显存，容量规划就要和 KV cache、模型权重一起算总账——这也是"分卡 / 共卡"话题会交汇的地方（见 `Colocate-vs-Disaggregate.md`）。
+
+> **面试一句话总结**：TQ 两种后端两套账——SimpleStorage 是按**样本条数**配额（`total_storage_size` 默认 100000，用 `ceil(总数/unit 数)` 切给 N 个 Ray actor，placement group 用 `SPREAD` + `bundle={"CPU":1}` 铺到各机器，且**只做计数校验、不预分配内存**，真实 RAM = 已存样本数 × 单条字段字节数，超限直接 `ValueError` 不淘汰）；MooncakeStore 是按**字节**配额且**per client**（`global_segment_size` 默认 4 GiB + `local_buffer_size` 默认 1 GiB，`setup()` 时 mmap/NUMA 分配并 RDMA pin），**每个 `tq.init()` 进程各挂一份、段挂在本机**，所以双机两个进程 = 8 GiB KV 容量 + 2 GiB 中转缓冲；又因为 master 侧 `--eviction_ratio=0.0 --allow_evict_soft_pinned_objects=false` + 客户端 `with_hard_pin=True` + lease TTL 999999，**eviction 实际关闭、容量是硬约束**，写满只会失败不会淘汰，必须靠显式 clear/`remove_all()` 释放——所以配 `total_storage_size` 前先估单条平均字节数，配 `global_segment_size` 前先算"单 step 字节数 × 最长未清理步数"。
+
+---
+
 ## 附：组件速查表
 
 | 组件 | 代码位置（transfer_queue/） | 角色 | 关键接口 / 类 |
