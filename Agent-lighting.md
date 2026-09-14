@@ -2,7 +2,7 @@
 
 > **Microsoft 的 agent 强化学习训推框架：Algorithm × Runner × TrajStore（LightningStore）三件套 + VERL 集成。**
 
-Agent Lightning（`agentlightning`，简称 agl）是微软研究院开源的"**用强化学习训练任意 agent**"的框架，核心卖点是**对 agent 几乎零代码改动**（任何 agent 框架甚至纯 Python 都能接入）。它的架构围绕三个核心组件组织：**Algorithm（算法，系统的"大脑"）、Runner（执行器，系统的"工人"）、LightningStore（轨迹存储，系统的"数据库+消息队列"）**——三者构成一个持续循环：Algorithm 派发任务 → Runner 执行 agent 并流式回传轨迹（spans）→ Algorithm 从 store 取回轨迹、转成训练样本、更新模型。**我们实际采用三机分离部署：store、algo、agent（runner）分别部署在三台不同的机器，全部通过 store 的 HTTP 地址连接**——本指南全文都以此部署形态为语境（三机分离下，algo 机与 agent 机对 store 的一切访问都是 HTTP；只有 Runner 进程内部的 Agent 调用和算法内部的 Adapter 转换是实例直接调用）。本指南先逐个讲清这三个部分各自的职责与实现，再讲它们如何组成整体架构，最后重点讲与 **verl**（Volcengine 的开源 RL 训练框架）的集成关系；**第三部分（第 6~11 节）专门钻进轨迹本身**——一条轨迹是在哪一行代码被"抓住"的（三条记录通路 + 插桩细节）、`Span` 模型长什么样、怎么变成 HTTP 请求落到 store（OTLP protobuf 批量 vs 逐条 JSON，含 proxy 的子树缓冲专线）、到了 store 之后怎么从一堆扁平 span **重建成一棵树**（`TraceTree.from_spans` + `repair_hierarchy`）、怎么变成训练用的 triplet，以及分布式下的**有序性/幂等/静默失败**语义；**第四部分（第 12~18 节）讲共卡（colocate）下"推理 ↔ 训练"的全流程**——三种 `RolloutMode` 与"为什么共卡是解决空泡的 baseline"、参数到底在哪（`engine.to()` + `BaseEngineCtx._context_switch` + vLLM sleep level 1/2）、wake/sleep 的完整调用链与硬顺序、权重同步的两条路（`naive` 同卡直传 vs `checkpoint_engine` 跨卡 NCCL 多播 + bucket 切块）、项目 TQ 方案（`tqbridge` + `ReplayBuffer` + `KVBatchMeta`）的一次完整 `_train_step`、训练每一步的内部细节（micro-batch → forward → loss → backward → clip → step → lr），以及项目实测的空泡账与修复方案；最后第 19 节把整条流程再收敛成**一张"每一步、每一类张量在哪块内存（HBM / host DRAM / 外部存储）"的驻留矩阵 + 14 步时间线**，并给出 HBM 峰值曲线与 host DRAM 账。
+Agent Lightning（`agentlightning`，简称 agl）是微软研究院开源的"**用强化学习训练任意 agent**"的框架，核心卖点是**对 agent 几乎零代码改动**（任何 agent 框架甚至纯 Python 都能接入）。它的架构围绕三个核心组件组织：**Algorithm（算法，系统的"大脑"）、Runner（执行器，系统的"工人"）、LightningStore（轨迹存储，系统的"数据库+消息队列"）**——三者构成一个持续循环：Algorithm 派发任务 → Runner 执行 agent 并流式回传轨迹（spans）→ Algorithm 从 store 取回轨迹、转成训练样本、更新模型。**我们实际采用三机分离部署：store、algo、agent（runner）分别部署在三台不同的机器，全部通过 store 的 HTTP 地址连接**——本指南全文都以此部署形态为语境（三机分离下，algo 机与 agent 机对 store 的一切访问都是 HTTP；只有 Runner 进程内部的 Agent 调用和算法内部的 Adapter 转换是实例直接调用）。本指南先逐个讲清这三个部分各自的职责与实现，再讲它们如何组成整体架构，最后重点讲与 **verl**（Volcengine 的开源 RL 训练框架）的集成关系；**第三部分（第 6~11 节）专门钻进轨迹本身**——一条轨迹是在哪一行代码被"抓住"的（三条记录通路 + 插桩细节）、`Span` 模型长什么样、怎么变成 HTTP 请求落到 store（OTLP protobuf 批量 vs 逐条 JSON，含 proxy 的子树缓冲专线）、到了 store 之后怎么从一堆扁平 span **重建成一棵树**（`TraceTree.from_spans` + `repair_hierarchy`）、怎么变成训练用的 triplet，以及分布式下的**有序性/幂等/静默失败**语义；**第四部分（第 12~18 节）讲共卡（colocate）下"推理 ↔ 训练"的全流程**——三种 `RolloutMode` 与"为什么共卡是解决空泡的 baseline"、参数到底在哪（`engine.to()` + `BaseEngineCtx._context_switch` + vLLM sleep level 1/2）、wake/sleep 的完整调用链与硬顺序、权重同步的两条路（`naive` 同卡直传 vs `checkpoint_engine` 跨卡 NCCL 多播 + bucket 切块）、项目 TQ 方案（`tqbridge` + `ReplayBuffer` + `KVBatchMeta`）的一次完整 `_train_step`、训练每一步的内部细节（micro-batch → forward → loss → backward → clip → step → lr），以及项目实测的空泡账与修复方案；最后第 19 节把整条流程再收敛成**一张"每一步、每一类张量在哪块内存（HBM / host DRAM / 外部存储）"的驻留矩阵 + 14 步时间线**，并给出 HBM 峰值曲线与 host DRAM 账；第 20 节补齐主干之外的六个环节（数据 collate 与 `fake_ids`、reward 由谁算、多轨迹 GRPO 优势的"只取 final 再广播"、`_balance_batch` 为什么不碰张量、metrics 如何排除 padding、checkpoint 与 TQ 残留恢复）。
 
 > 说明：本文基于官方仓库 `agent-lightning-official` 的 **v0.3.0** 分支（tag `v0.3.0`，commit 3b5d7338）讲解。**我们实际训练使用的是 v1 执行模式**（`AgentModeDaemon` 的 `mode` 参数默认即 `"v1"`）——v1 模式下任务的派发、轨迹的回收、资源的传递全部通过 LightningStore 完成（Runner 与算法完全解耦）；v0 模式（自起 Flask server）仅作为历史兼容保留，本文以 v1 为主线。**部署形态统一为三机分离（见第 4 点详述）**：store 单独一台机器跑 `LightningStoreServer`（`agl store --port 4747`），algo 机器和 agent 机器都作为 `LightningStoreClient` 通过 HTTP 连它。
 
@@ -3755,6 +3755,269 @@ host DRAM 常驻：
 **接口就是第 12 节那条循环**：本文给的是"串行版本的每一步"，异步面经给的是"把哪几步拆开并行、代价是什么"。
 
 > **面试一句话总结**：共卡下"每一步张量在哪"有一条极简主线——**训练态：参数(fp32)、梯度(fp32)、Adam 动量(fp32) 三者在 HBM，激活也在 HBM 且随 micro-batch 变化（`enable_gradient_checkpointing=True` 是默认，`enable_activation_offload=False` 是默认）；推理态：这三者被 offload 到 host DRAM，HBM 让给 vLLM 的 bf16 权重（3 GB）与 KV cache（由 `gpu_memory_utilization` 限额）；切换点：`sleep_replicas` 把 vLLM 权重+KV 释放（level 2 全丢 / level 1 权重进 pinned DRAM），`train_mode()` 进入时把参数/梯度/优化器一起 H2D、退出时一起 D2H**；权重同步时 `get_per_tensor_param` **逐张量物化**，所以 HBM 峰值只是"最大单个张量"（≈0.43 GB），而 NCCL 分卡路径要额外常驻 2×`bucket_size`；**TQ 里的轨迹张量始终在 host DRAM**（SimpleStorage 与 Mooncake 的 segment 都在 DRAM，且被 RDMA 注册 pin 住），driver 全程只持有 keys/tags；四个容易漏的隐性占用是 **FSDP all-gather 峰值（分片大小 ≠ 峰值）、通信 buffer、bucket 双 buffer、pinned 备份不可换出**；NPU 侧要特别记住 **sleep level 只能用 1**、通信走 hccl、`torch.nested` 是慢路径。
+
+---
+
+## 20. 训练流程剩下的细节：数据 / reward / 多轨迹 advantage / balance / metrics / checkpoint
+
+### 1. 现有问题：主干讲完了，但一个"完整训练流程"还有六个环节
+
+第 16~19 节覆盖了一个 step 的**主干**（wake → 入队 → 采样 → sleep → 训练 → 同步）和**每一步张量在哪**。但面试把它当"完整训练流程"追问时，还会问到六个环节，缺一个就会被认为"只会背主干"：① **数据是怎么变成 batch 的**（谁读盘、谁 collate、谁是 `uid`）；② **reward 到底由谁算**（driver？worker？还是 proxy/store）；③ **多轮/多轨迹的 advantage 怎么算**（GRPO 的"组"是什么粒度）；④ **`_balance_batch` 为什么不需要张量**；⑤ **指标是怎么算出来的**（padding 样本怎么排除）；⑥ **checkpoint 与中断恢复**。
+
+### 2. 方法论：六个环节逐一定位
+
+#### （1）数据侧：`StatefulDataLoader` + `create_rl_sampler` + `collate_fn`
+
+`verl-v0.8.0/verl/trainer/main_ppo_sync.py:542-597`：
+
+```python
+def _init_dataloader(self):
+    """Initialize train and validate dataloader."""
+    self.train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data,
+                                           self.tokenizer, self.processor, is_train=True,
+                                           max_samples=self.config.data.get("train_max_samples", -1))
+    self.val_dataset = create_rl_dataset(..., is_train=False, ...)
+
+    self.train_dataloader = StatefulDataLoader(
+        dataset=self.train_dataset,
+        batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+        num_workers=self.config.data["dataloader_num_workers"],
+        drop_last=True,
+        collate_fn=collate_fn,
+        sampler=create_rl_sampler(self.config.data, self.train_dataset),
+    )
+    ...
+    # adjust total_training_steps
+    total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+    if self.config.trainer.total_training_steps is not None:
+        total_training_steps = self.config.trainer.total_training_steps
+    self.total_training_steps = total_training_steps
+```
+
+**四个要点**：① **dataloader 的 batch_size 用 `gen_batch_size` 而不是 `train_batch_size`**（前者是"一次生成多少 prompt"，后者是"一次训练多少样本"）；② `StatefulDataLoader` 让断点续训时 dataloader 的进度也能恢复；③ `drop_last=True` 保证每个 batch 大小一致；④ **`total_training_steps` 是由 dataloader 长度反推出来的**，再写回 `actor.optim.total_training_steps` 给 lr scheduler 用（`:589-597`）。
+
+**AGL 侧的数据集定制**（`agentlightning/verl/dataset.py:18-33`）只有三行关键改动：
+
+```python
+class AgentDataset(RLHFDataset):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.filter_overlong_prompts = False          # ① 交给我们自己的 is_drop 逻辑过滤
+
+    def __getitem__(self, item):
+        row_dict: dict = self.dataframe[item]
+        index = row_dict.get("extra_info", {}).get("index", 0)
+        row_dict["index"] = index                     # ② prompt 的稳定 id，后面做 uid
+        # Workaround for data proto. At least one tensor is needed.
+        row_dict["fake_ids"] = torch.ones(1, dtype=torch.int)   # ③ DataProto 至少要有一个张量
+        return row_dict
+```
+
+**`fake_ids` 是个很典型的"框架约束泄漏"**：`DataProto` 要求 batch 里至少有一个 tensor，但纯 agent 模式下 driver 手上只有非张量数据（prompt 字符串等），于是塞一个 `ones(1)` 占位。**超长 prompt 的过滤被推迟到轨迹回来之后用 `is_drop` tag 做**（第 16 节第 3 段），而不是在数据集阶段丢——因为 agent 场景下"最终长度"要等 rollout 结束才知道。
+
+#### （2）reward 侧：**在 TQ 版里 driver 不算 reward**
+
+这是最容易答错的一环。driver 侧看起来有个 reward 步骤（`agentlightning/verl/trainer.py:351-355`）：
+
+```python
+with _timer("reward", timing_raw):
+    # compute reward model score
+    if self.reward_loop_manager.reward_loop_worker_handles is None:
+        # 这里是todo，目前verl0.8.0中也没做
+        batch = self._compute_reward_colocate(batch)
+```
+
+但 `_compute_reward_colocate` 在 verl 侧**直接抛未实现**（`main_ppo_sync.py:1207-1210`）——**正常路径下这一段不触发**。真正的 reward 来自第 16 节的**双写链**：LLMProxy 以 `reward=0` 写入 → Store 检测 reward span 后覆写 `token_level_scores` / `rm_scores`。
+
+所以 driver 里凡是"用 reward"的地方，都只是**从 TQ 读回已经算好的 rm_scores**，并在本地做一次别名（`main_ppo_sync.py:1414`、`:1557-1559`）：
+
+```python
+data.batch["token_level_scores"] = data.batch["rm_scores"]
+...
+if "token_level_rewards" not in data:
+    data["token_level_rewards"] = data["rm_scores"]
+```
+
+**面试要点**：TQ 版把 reward 的**生产**完全下沉到 rollout 侧（proxy + store），driver 只消费——这也是"driver 不持有张量"的必然结果：driver 既然不掌握轨迹内容，就没法算 reward。
+
+#### （3）advantage 侧：多轨迹 GRPO —— 只让"每组最后一个 turn"参与，再广播回去
+
+这是本项目最有特色的算法改动，`verl-v0.8.0/verl/trainer/main_ppo_sync.py:122-191`：
+
+```python
+def compute_advantage_for_multi_trajectories(data, batch_keys, adv_estimator, ...):
+    """Compute GRPO advantages from each session's final output. ...
+    For GRPO, only the final output in each ``{uid}_{session_id}`` group participates
+    in advantage computation, and the result is broadcast to the other outputs in
+    the same session. ...
+    """
+    if adv_estimator != core_algos.AdvantageEstimator.GRPO:
+        return compute_advantage(data, adv_estimator=adv_estimator, ...)   # 非 GRPO（GAE 等）原样委托
+
+    # final session of each agent loop: {uid}_{session_id} => (index, row_index)
+    final_sessions: dict[str, tuple[int, int]] = {}
+    row_session_keys = []
+    for i, key in enumerate(batch_keys):
+        fields = key.rsplit("_", 2)                    # ← 靠 key 的三段结构反解
+        assert len(fields) == 3, f"Unexpected key format: {key}"
+        uid, session_id, index = fields[0], fields[1], int(fields[2])
+        session_key = f"{uid}_{session_id}"
+        row_session_keys.append(session_key)
+        if session_key not in final_sessions or final_sessions[session_key][0] < index:
+            final_sessions[session_key] = (index, i)   # 只保留 turn_index 最大的那个
+
+    final_indices = [...]                              # 各组 final 的全局下标
+    row_to_local_index = [...]
+
+    # select final sessions from batch data for group relative advantage computation
+    final_data = compute_advantage(data.select_idxs(final_indices), adv_estimator=adv_estimator, ...)
+    first_nnz_indices = final_data.batch["response_mask"].argmax(dim=1)
+    final_scores = final_data.batch["advantages"][torch.arange(len(final_data)), first_nnz_indices]
+
+    # scatter final scores to all rows in batch data
+    scores = final_scores[row_to_local_index]
+    scores = scores.unsqueeze(-1) * data.batch["response_mask"]     # 广播回同 session 的所有 turn
+    data.batch["advantages"] = scores
+    data.batch["returns"] = scores
+    return data
+```
+
+**三个关键设计**：① **key 的三段结构（`uid_sessionId_turnIndex`）在这里被用来重建"轨迹分组"**——这也是第 16 节为什么要强调 key 命名约定；② **只有每条 trajectory 的最后一个 turn 参与 GRPO 组内相对优势**（否则多轮轨迹里中间 turn 的 reward 会污染组统计）；③ 得到 final advantage 后**乘 `response_mask` 广播回同 session 的所有 turn**——即"**轨迹级优势 → 各 turn 共享**"的信用分配。
+
+#### （4）balance 侧：`_balance_batch` **完全不碰张量**
+
+`main_ppo_sync.py:1276-1300`：
+
+```python
+def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+    """Reorder the data on single controller such that each dp rank gets similar total tokens."""
+    ...  # 取 actor 的 dp_size
+    # Upsampling the batch with padding sequences
+    batch_multiple = self._get_required_batch_multiple(dp_size)
+    batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
+    global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
+    workload_lst = calculate_workload(global_seqlen_lst)
+
+    # reorder based on index. The data will be automatically equally partitioned by dispatch function
+    global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
+    batch.reorder([j for partition in global_partition_lst for j in partition])
+    global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst.tolist(),
+                                               partitions=global_partition_lst, prefix=logging_prefix)
+    metrics.update(global_balance_stats)
+    return batch
+```
+
+**注意这里没有一次 `kv_batch_get`**：长度来自 **`tag["seq_len"]`**，重排只是 `batch.reorder(...)`（重排 keys 的顺序），**张量一直在 TQ 里没动**。只有 `upsample_batch_to_divisible_size` 会往 TQ **写**新的 padding 样本（`padding_utils.py:179`，tag 带 `is_padding=True`）。
+
+**对比 baseline**（`RayPPOTrainer` 的 `_balance_batch`）：它必须先在 driver 上把 `attention_mask` 求和得到长度、再对 `DataProto` 做张量级重排——**这正是"元数据驱动"设计省下来的东西**，也是为什么 TQ 版的 `data_prep_total` 只有**毫秒级**（第 16 节的计时器）。
+
+#### （5）metrics 侧：用 `is_padding` tag 排除填充样本
+
+`main_ppo_sync.py:1522-1587`：
+
+```python
+def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
+    # 1. collect necessary fields from TransferQueue for computing metrics
+    non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
+    fields = ["prompts", "responses", "response_mask", "values", "advantages",
+              "returns", "rm_scores", "token_level_rewards", "num_turns"]
+    data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+    num_turns = np.array(data.pop("num_turns").tolist())
+    prompt_length = data["prompts"].offsets().diff()
+    response_length = data["responses"].offsets().diff()
+    global_token_num = (prompt_length + response_length).tolist()
+    ...
+    data = data.to_padded_tensor()
+    ...
+    metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
+
+    # 2. compute metrics
+    metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
+    metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+    metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+    gradient_norm = metrics.get("actor/grad_norm", None)
+    metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
+    ...
+    metrics.update({"training/num_turns/mean": num_turns.mean(),
+                    "training/num_turns/max": num_turns.max(),
+                    "training/num_turns/min": num_turns.min()})
+```
+
+**三个要点**：① **`is_padding` tag 在这里第二次被用到**（第一次是 `_balance_batch`）——**metrics 必须排除 upsample 出来的填充样本**，否则长度/奖励统计会被污染；② `prompt_length` / `response_length` 用 `offsets().diff()` 从 **nested tensor 直接算**（不需要先 pad）；③ `num_turns` 是 agent 场景特有的指标（第 16 节字段表里的 `num_turns`），并支持 speculative decoding 的 `extra_fields`（`:1542-1554`）。
+
+#### （6）checkpoint 与中断恢复
+
+| 环节 | 代码位置 | 关键行为 |
+|---|---|---|
+| 加载 | `main_ppo_sync.py:744+` `_load_checkpoint` → `engine.load_checkpoint`（`fsdp/transformer_impl.py:772-792`） | `find_latest_ckpt_path` 找最新目录 → **参数临时上 HBM 读盘** → barrier → **参数与优化器都 offload 回 CPU** |
+| 保存 | `_save_checkpoint` → `engine.save_checkpoint`（`:749-770`） | **参数临时上 HBM** → 写盘（`max_ckpt_to_keep` 限制保留份数）→ barrier → offload 回 CPU |
+| 首次同步 | `agentlightning/verl/trainer.py:459-460` | `_load_checkpoint()` 之后**立刻** `update_weights()` 把权重灌给 vLLM |
+| ESI（弹性实例过期） | `ray_trainer.py` 的 `should_save_ckpt_esi(...)` | 训练计划临近到期时**强制存一次 ckpt**，避免实例回收丢进度 |
+| **TQ 残留清理** | `agentlightning/verl/trainer.py:493-502` | 训练开始前 `tq.kv_list()` → 逐个 `tq.kv_clear(...)`：**上次崩溃可能留下 `status=running` 的屏障**，不清掉新的一轮会永远等不到 |
+| 线程清理 | `agentlightning/verl/trainer.py:442-445` `_cleanup`（由 `fit` 的 `finally` 触发） | 关掉 `ReplayBuffer` 的轮询线程与 dump 线程池；**TQ 本身不在这里关**（在 `entrypoint.py` 的 `tq.close()`） |
+
+**"TQ 残留清理"值得单独记**：这是"把等待状态放进数据面"这个设计的**代价**——状态有生命周期，崩溃后不会自动过期，必须显式清理。而 `kv_clear` 在正常路径上也是每步必做（`fit:598`），因为 TQ 存储（SimpleStorage 计数配额 / Mooncake 关闭 eviction）**不会自动回收**。
+
+### 3. 具体数值样例
+
+用一个小例子把六个环节串起来（4 个 prompt、`rollout.n=4`、agent 多轮）：
+
+```text
+【数据侧】
+  4 个 prompt × n=4 = 16 条 rollout；uid = prompt 的 index，形如 "0","0","0","0","1",...
+  每条 rollout 的 turn 序列不同（假设：3 条 2 turn、1 条 1 turn …）
+  key = f"{uid}_{session_id}_{turn_index}"，于是 TQ 里的 key 形如：
+    A_s1_0, A_s1_1   （uid=A 的第 1 个 session，2 个 turn）
+    A_s2_0, A_s2_1
+    B_s3_0
+    B_s4_0, B_s4_1, B_s4_2
+  ⇒ 8 个 key（8 个"训练行"），但它们只属于 4 条 trajectory（session）
+
+【reward 侧】
+  LLMProxy 为每个 turn 写字段（reward=0）→ Store 检测到 reward span 后覆写
+  设最终 reward：A_s1=1.0, A_s2=0.0, B_s3=1.0, B_s4=1.0（写在 rm_scores 上）
+
+【advantage（多轨迹 GRPO）】
+  1) 按 {uid}_{session_id} 分组，取 turn_index 最大的作为 final：
+       A_s1_1, A_s2_1, B_s3_0, B_s4_2   ← 只有这 4 行参与组内相对优势
+  2) GRPO 组 = uid（num_repeat=n=4 是"每条 prompt 采几条"，实际组内成员是各 session 的 final）
+       组 A：rewards [1.0, 0.0] → mean 0.5, std 0.5 → adv = [+1.0, -1.0]
+       组 B：rewards [1.0, 1.0] → mean 1.0, std 0  → adv ≈ [0, 0]（靠 eps 保护）
+       final_scores = 每行在第一个有效 response token 处的优势 = [A_s1_1:+1.0, A_s2_1:-1.0, B_s3_0:0, B_s4_2:0]
+  3) 广播回同 session 的所有 turn（×response_mask）：
+       A_s1_0 = +1.0, A_s1_1 = +1.0
+       A_s2_0 = -1.0, A_s2_1 = -1.0
+       B_s3_0 =  0.0
+       B_s4_0/1/2 = 0.0
+  ⇒ 8 个训练行共享 4 个"轨迹级优势"；**同一 session 内所有 turn 的优势完全相同**
+  ⇒ 若不做"只取 final"，A_s1_0 也会拿 reward=0（proxy 写的第一轮 reward 是 0）→ 组统计被污染
+
+【balance 侧】
+  8 行 → dp_size=8 时 batch_multiple 可能是 8（dp_size × micro 倍数），
+  upsample 到 16 → 多出 8 行 padding（写进 TQ，tag 带 is_padding=True, seq_len=2）
+  用 tag["seq_len"] 算 workload → get_seqlen_balanced_partitions(k=8, equal_size=True)
+  → batch.reorder(只重排 keys 顺序)
+  ⇒ 全程 0 次 kv_batch_get；data_prep_total ≈ 毫秒级
+
+【metrics 侧】
+  16 行里按 is_padding 排除掉 8 行 → metrics_batch = 8 行
+  只拉 9 个字段（prompts/responses/response_mask/values/advantages/returns/
+                rm_scores/token_level_rewards/num_turns）
+  prompt_length/response_length 用 offsets().diff() 从 nested 直接算
+  输出：training/num_turns/mean（本例子 = (2+2+1+3)/4 = 2.0）、以及
+        compute_data_metrics / timing / throughout / variance_proxy
+
+【checkpoint 与恢复】
+  每 step：tq.kv_clear(keys=<这 8+8 个 key>)  ← 不清就会累积到写满存储
+  按 save_freq：参数临时上 HBM → 写盘 → 回 CPU
+  崩溃重启：tq.kv_list() 发现残留（比如上一轮 128 条 status=running 的屏障）
+           → 逐条 kv_clear → 训练才能重新对齐 global_steps
+```
+
+**六个环节的一句话记忆**：数据侧"`gen_batch_size` 控生成批次、`fake_ids` 骗过 DataProto、超长过滤推迟到 `is_drop`"；reward 侧"**driver 不算 reward，proxy 写 0、Store 覆写**"；advantage 侧"**只让每条轨迹最后一个 turn 参与 GRPO，再广播回各 turn**"；balance 侧"**只靠 `tag["seq_len"]` 重排 keys，不碰张量**"；metrics 侧"**用 `is_padding` tag 排除填充样本**"；checkpoint 侧"**存档/加载要临时上 HBM，TQ 残留必须显式清理**"。
+
+> **面试一句话总结**：一个完整的 TQ 化训练流程在主干之外还有六个必须能说清的环节——① **数据**：`StatefulDataLoader` 的 batch_size 用 `gen_batch_size`、`drop_last=True`、`total_training_steps` 由 dataloader 长度反推并写回 lr scheduler，AGL 的 `AgentDataset` 只改三处（关掉 `filter_overlong_prompts`、加 `index` 做 uid、塞 `fake_ids=ones(1)` 骗过"DataProto 至少要一个张量"的约束）；② **reward**：**driver 不算 reward**（`_compute_reward_colocate` 在 verl 侧直接 `raise NotImplementedError`），reward 由 LLMProxy 以 0 写入 + Store 覆写，driver 只是把 `rm_scores` 别名成 `token_level_scores`；③ **advantage**：`compute_advantage_for_multi_trajectories` 先按 key 的 `{uid}_{session_id}_{turn_index}` 三段结构分组、**只让每组最后一个 turn 参与 GRPO 组内相对优势**、再把 final advantage **乘 `response_mask` 广播回同 session 的所有 turn**（非 GRPO 委托原 `compute_advantage`）；④ **balance**：`_balance_batch` **完全不 `kv_batch_get`**——`upsample_batch_to_divisible_size`（padding 样本写回 TQ 并打 `is_padding` tag）+ 用 `tag["seq_len"]` 算 workload + `get_seqlen_balanced_partitions(k=dp_size, equal_size=True)` + `batch.reorder`（只重排 keys），所以 `data_prep_total` 只有毫秒级；⑤ **metrics**：用 `is_padding` tag 排除填充样本、`offsets().diff()` 从 nested 直接算长度、额外统计 `num_turns` 与 speculative decoding 的 `extra_fields`；⑥ **checkpoint/恢复**：`save/load_checkpoint` 都要把参数**临时搬上 HBM**（这是"存档时 OOM"的常见原因），训练开始前必须 `tq.kv_list()` → `kv_clear` **清掉上次崩溃遗留的 `status=running` 屏障**，而每步结束的 `tq.kv_clear` 也是必须的（TQ 存储不会自动回收）。
 
 ---
 
