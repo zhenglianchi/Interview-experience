@@ -2,7 +2,7 @@
 
 > **Microsoft 的 agent 强化学习训推框架：Algorithm × Runner × TrajStore（LightningStore）三件套 + VERL 集成。**
 
-Agent Lightning（`agentlightning`，简称 agl）是微软研究院开源的"**用强化学习训练任意 agent**"的框架，核心卖点是**对 agent 几乎零代码改动**（任何 agent 框架甚至纯 Python 都能接入）。它的架构围绕三个核心组件组织：**Algorithm（算法，系统的"大脑"）、Runner（执行器，系统的"工人"）、LightningStore（轨迹存储，系统的"数据库+消息队列"）**——三者构成一个持续循环：Algorithm 派发任务 → Runner 执行 agent 并流式回传轨迹（spans）→ Algorithm 从 store 取回轨迹、转成训练样本、更新模型。**我们实际采用三机分离部署：store、algo、agent（runner）分别部署在三台不同的机器，全部通过 store 的 HTTP 地址连接**——本指南全文都以此部署形态为语境（三机分离下，algo 机与 agent 机对 store 的一切访问都是 HTTP；只有 Runner 进程内部的 Agent 调用和算法内部的 Adapter 转换是实例直接调用）。本指南先逐个讲清这三个部分各自的职责与实现，再讲它们如何组成整体架构，最后重点讲与 **verl**（Volcengine 的开源 RL 训练框架）的集成关系；**第三部分（第 6~11 节）专门钻进轨迹本身**——一条轨迹是在哪一行代码被"抓住"的（三条记录通路 + 插桩细节）、`Span` 模型长什么样、怎么变成 HTTP 请求落到 store（OTLP protobuf 批量 vs 逐条 JSON，含 proxy 的子树缓冲专线）、到了 store 之后怎么从一堆扁平 span **重建成一棵树**（`TraceTree.from_spans` + `repair_hierarchy`）、怎么变成训练用的 triplet，以及分布式下的**有序性/幂等/静默失败**语义。
+Agent Lightning（`agentlightning`，简称 agl）是微软研究院开源的"**用强化学习训练任意 agent**"的框架，核心卖点是**对 agent 几乎零代码改动**（任何 agent 框架甚至纯 Python 都能接入）。它的架构围绕三个核心组件组织：**Algorithm（算法，系统的"大脑"）、Runner（执行器，系统的"工人"）、LightningStore（轨迹存储，系统的"数据库+消息队列"）**——三者构成一个持续循环：Algorithm 派发任务 → Runner 执行 agent 并流式回传轨迹（spans）→ Algorithm 从 store 取回轨迹、转成训练样本、更新模型。**我们实际采用三机分离部署：store、algo、agent（runner）分别部署在三台不同的机器，全部通过 store 的 HTTP 地址连接**——本指南全文都以此部署形态为语境（三机分离下，algo 机与 agent 机对 store 的一切访问都是 HTTP；只有 Runner 进程内部的 Agent 调用和算法内部的 Adapter 转换是实例直接调用）。本指南先逐个讲清这三个部分各自的职责与实现，再讲它们如何组成整体架构，最后重点讲与 **verl**（Volcengine 的开源 RL 训练框架）的集成关系；**第三部分（第 6~11 节）专门钻进轨迹本身**——一条轨迹是在哪一行代码被"抓住"的（三条记录通路 + 插桩细节）、`Span` 模型长什么样、怎么变成 HTTP 请求落到 store（OTLP protobuf 批量 vs 逐条 JSON，含 proxy 的子树缓冲专线）、到了 store 之后怎么从一堆扁平 span **重建成一棵树**（`TraceTree.from_spans` + `repair_hierarchy`）、怎么变成训练用的 triplet，以及分布式下的**有序性/幂等/静默失败**语义；**第四部分（第 12~18 节）讲共卡（colocate）下"推理 ↔ 训练"的全流程**——三种 `RolloutMode` 与"为什么共卡是解决空泡的 baseline"、参数到底在哪（`engine.to()` + `BaseEngineCtx._context_switch` + vLLM sleep level 1/2）、wake/sleep 的完整调用链与硬顺序、权重同步的两条路（`naive` 同卡直传 vs `checkpoint_engine` 跨卡 NCCL 多播 + bucket 切块）、项目 TQ 方案（`tqbridge` + `ReplayBuffer` + `KVBatchMeta`）的一次完整 `_train_step`、训练每一步的内部细节（micro-batch → forward → loss → backward → clip → step → lr），以及项目实测的空泡账与修复方案。
 
 > 说明：本文基于官方仓库 `agent-lightning-official` 的 **v0.3.0** 分支（tag `v0.3.0`，commit 3b5d7338）讲解。**我们实际训练使用的是 v1 执行模式**（`AgentModeDaemon` 的 `mode` 参数默认即 `"v1"`）——v1 模式下任务的派发、轨迹的回收、资源的传递全部通过 LightningStore 完成（Runner 与算法完全解耦）；v0 模式（自起 Flask server）仅作为历史兼容保留，本文以 v1 为主线。**部署形态统一为三机分离（见第 4 点详述）**：store 单独一台机器跑 `LightningStoreServer`（`agl store --port 4747`），algo 机器和 agent 机器都作为 `LightningStoreClient` 通过 HTTP 连它。
 
@@ -1909,6 +1909,1545 @@ async def otlp_logs():
 
 ---
 
+# 四、共卡（colocate）下「推理 ↔ 训练」的全流程：参数在哪、怎么 offload、每一步怎么训
+
+前面三部分讲的是"轨迹怎么存、怎么传、怎么建树"。但真正吃掉 GPU 时间的是另一件事：**推理和训练怎么在同一批卡上轮流用、参数在切换时放在哪里、权重怎么从训练侧搬到推理侧**。这就是"训推解决空泡"的**第一个 baseline——共卡分时复用**：不加机器、不加卡，靠"把推理引擎睡下去、把训练引擎叫起来"来复用同一批显存。这一部分把这条流水线从 `_train_step` 一路拆到 `optimizer.step()`，每一步都给源码位置。
+
+> **版本说明**：本部分基于 `verl-v0.8.0`（**engine 架构**：`workers/engine_workers.py` + `workers/engine/` + `checkpoint_engine/`，**没有** `fsdp_workers.py`，也**没有** `sharding_manager/`）+ 项目自己的 TQ 接入仓 `agent-lightning`（`AgentLightningTrainer(verl.trainer.main_ppo_sync.PPOTrainer)`）。注意与第 1~11 节讲的 `agent-lightning-official` v0.3.0（继承 `RayPPOTrainer`）**不是同一份代码**，两者的 trainer 基类、数据流（DataProto vs KVBatchMeta）完全不同。
+
+## 12. 先定位：共卡是"解决空泡"的 baseline，三种 RolloutMode 决定一切
+
+### 1. 现有问题：为什么"共卡"是绕不开的第一选择
+
+RL 训练里 GPU 上有两类完全不同的负载：**推理（rollout）**要的是"大 KV cache + 高并发小 batch"，**训练**要的是"参数/梯度/优化器状态 + 大 batch 反向"。它们**不可能同时塞进同一张卡的显存**——以 1.5B 模型在 8 卡上为例（$P=1.5\text{B}$，bf16 参数/梯度 + fp32 Adam）：
+
+| 项目 | 总量 | 单卡（8 卡 FSDP 分片） |
+|---|---|---|
+| 模型参数（bf16） | $2P = 3$ GB | 0.375 GB |
+| 梯度（bf16） | $2P = 3$ GB | 0.375 GB |
+| Adam 一阶+二阶动量（fp32） | $8P = 12$ GB | 1.5 GB |
+| fp32 master weights | $4P = 6$ GB | 0.75 GB |
+| **训练侧小计** | | **≈ 3 GB/卡**（还要加激活） |
+| vLLM 权重（bf16，TP=1） | 3 GB | 3 GB/卡 |
+| vLLM KV cache | $2 \times L \times H_{kv} \times d_{head} \times \text{tokens}$ | 由 `gpu_memory_utilization` 决定 |
+
+**两边都是 3 GB 级**，而 24 GB 卡上还要留激活、通信 buffer、CUDA context——所以只有两条路：
+
+1. **共卡（colocate / 时间复用）**：同一批卡上先跑推理、再跑训练，**切换时把一方的显存让出来**。优点：零额外机器、权重搬运在同卡/同机（便宜）、天然 on-policy（权重刚更新就能拿去采样）。缺点：**推理和训练不能重叠**，切换本身有开销；
+2. **分卡（disaggregate）**：推理一组卡、训练一组卡，**真异步重叠**。优点：无切换、可重叠；缺点：多花卡、权重跨机传输贵、必须处理 off-policy（staleness）。
+
+**共卡就是那个"不加机器"的 baseline**——所以面试里被问"你怎么解决空泡"，正确开场是："最基础的做法是共卡分时复用，让推理引擎和训练引擎轮流占用同一批显存，切换点用 sleep/wake + offload 交接；它的极限是推理与训练无法重叠。"
+
+### 2. 方法论：三种 RolloutMode 是三条不同的协作路线
+
+v0.8.0 把"推理和训练怎么共存"抽象成 `RolloutMode` 三态（`verl-v0.8.0/verl/workers/rollout/replica.py:54-68`，注释原样摘录）：
+
+```python
+class RolloutMode(Enum):
+    # Rollout engine and training engine(fsdp/megatron) fused in same process
+    # Rollout and trainer share GPUs, switch context with weight synchronization.
+    # Usage scenarios: on-policy training.
+    HYBRID = "hybrid"
+
+    # Rollout engine colocated with hybrid engine in same ray placement group but in separate process.
+    # Rollout and hybrid processes share GPUs, switch context without weight synchronization.
+    # Usage scenarios: GRM (LLM as a judge).
+    COLOCATED = "colocated"
+
+    # Standalone rollout server with separate GPU resource, disaggregated architecture.
+    # Usage scenarios: off-policy training.
+    STANDALONE = "standalone"
+```
+
+| 模式 | 进程/卡关系 | 切换时要不要同步权重 | 典型场景 |
+|---|---|---|---|
+| **HYBRID** | 推理引擎与训练引擎**同进程**，共享同一批 GPU | **要**（训练更新了权重，推理必须重新加载） | on-policy RL —— **共卡 baseline** |
+| **COLOCATED** | 同 placement group 但**分进程**，共享 GPU | **不要**（推理侧不训练，权重不变） | GRM（LLM as a judge） |
+| **STANDALONE** | 独立 GPU 资源池，**分卡** | 不需要（跨机靠 checkpoint engine 传） | off-policy / 异步 |
+
+**判定代码**在 worker 里——rollout 的 device mesh 直接从**训练侧自身的 `world_size`** 推导，这就是"共用同一批卡"的代码证据（`verl-v0.8.0/verl/workers/engine_workers.py:596-611`）：
+
+```python
+infer_tp = rollout_config.tensor_model_parallel_size * rollout_config.data_parallel_size
+infer_pp = rollout_config.pipeline_model_parallel_size
+infer_world_size = infer_tp * infer_pp
+dp = self.world_size // infer_world_size
+assert self.world_size % infer_world_size == 0, (
+    f"rollout world_size: {self.world_size} is not divisible by infer_world_size: {infer_world_size}"
+)
+rollout_device_mesh = init_device_mesh(
+    get_device_name(), mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
+)
+self.rollout = rollout_cls(config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh)
+```
+
+同一段代码里还有一句很能说明问题的注释（`engine_workers.py:631-632`）——**训练侧要主动把显存还给系统，否则同卡的 vLLM 通过 `cudaMemGetInfo` 看不到**：
+
+```python
+# Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
+aggressive_empty_cache(force_sync=True)
+```
+
+**我们的项目落在哪一态？** 项目仓 `agent-lightning` 的 TQ 方案走的是 **HYBRID 的共卡路线**（同机多卡，训练进程 + rollout server 共处），并且把它推到"**训练侧几乎不持有数据，只持有 keys**"的程度（第 16 节）。而 `Colocate-vs-Disaggregate.md` 里讨论的 `separate_async` 属于 STANDALONE 路线——**两者是同一根轴的两端**。
+
+### 3. 具体数值样例
+
+```text
+场景：单机 8 卡，Qwen2.5-1.5B，rollout.n=4，ppo_mini_batch_size=32
+
+【共卡（HYBRID）时间线】——同一批 8 张卡
+t0 ─ t1  推理阶段：vLLM 占 GPU（权重 3 GB/卡 + KV cache 由 gpu_memory_utilization=0.5 决定）
+         训练侧：参数 offload 在 CPU（param_offload=true），GPU 上几乎为 0
+t1        切换点①：rollout.sleep() → vLLM 把显存交还（权重 + KV cache 全释放）
+t1 ─ t2  训练阶段：FSDP 参数/梯度/优化器状态回 GPU（≈3 GB/卡）+ 激活
+         推理侧：sleep，显存占用 ≈ 0
+t2        切换点②：actor 更新完 → update_weights()（把新权重灌回 vLLM）+ rollout.wake_up()
+t2 ─ t3  回到推理阶段，下一轮 rollout 用新权重（on-policy）
+
+GPU 利用率 =（推理时间 + 训练时间）/ 总时间 → 推理与训练**串行**，切换开销直接计入空泡
+
+【分卡（STANDALONE）时间线】——推理 4 卡 + 训练 4 卡
+推理卡：一直在跑 rollout（利用率可接近 100%）
+训练卡：等 TQ 里的轨迹够了就训；权重要跨机传到推理卡
+GPU 利用率更高，但：① 卡数翻倍；② 权重跨机传输（第 15 节）；③ 轨迹来自旧权重 → off-policy
+```
+
+**一个关键的量化直觉**：共卡下"每步时间 = 推理时间 + 切换开销 + 训练时间"，三项**相加**；分卡下"每步时间 ≈ max(推理时间, 训练时间)"。所以**只有当推理与训练时间接近时，分卡才有接近 2× 的收益**；如果一边远大于另一边，分卡的收益立刻塌掉——这就是为什么"要不要分卡"必须先看 `timing_raw` 里 `gen` 与 `update_actor` 两项谁大。
+
+> **面试一句话总结**：解决空泡的第一层 baseline 是**共卡分时复用**——把推理引擎和训练引擎放在同一批 GPU 上轮流用，切换时用 `sleep/wake` 把显存交还、用 `update_weights` 把新权重灌回推理侧；v0.8.0 用 `RolloutMode` 把这件事抽象成三态：`HYBRID`（同进程共享 GPU，切权重，on-policy）、`COLOCATED`（同 GPU 分进程，不切权重，GRM）、`STANDALONE`（独立卡，分卡异步，off-policy）；共卡下每步时间 = 推理 + 切换 + 训练**串行相加**，分卡下 ≈ `max(推理, 训练)` 但要多花卡、要传权重、要处理 staleness——所以**共卡是 baseline，分卡是"用卡换重叠"**。
+
+---
+
+## 13. 参数在哪里：训练态与推理态的两套内存 + 四个开关
+
+### 1. 现有问题：同一个进程里两套引擎，谁占哪块显存
+
+共卡最反直觉的一点是：**同一个进程里同时存在两个"模型"**——FSDP 训练模型和 vLLM 推理引擎，它们各有一份权重，各自还有一堆附属状态。面试里"参数在哪"的回答必须**分状态、分设备、分时刻**，否则一定被追问穿。要回答四个问题：
+
+1. **训练态**：参数、梯度、优化器状态、激活分别在 GPU 还是 CPU？谁决定？
+2. **推理态**：vLLM 的权重和 KV cache 什么时候释放、释放到什么程度？
+3. **切换时**：谁负责搬运？搬什么、不搬什么？
+4. **有什么坑**：哪些开关实际是"死"的、哪些组合会冲突？
+
+### 2. 方法论：`to()` + 自动 offload + sleep level 三件套
+
+**（1）训练侧的 offload API 只有一个：`engine.to(device, model, optimizer, grad)`**（`verl-v0.8.0/verl/workers/engine/base.py:169-180`）：
+
+```python
+def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+    """
+    Move model parameters, optimizer states, or both to the specified device.
+
+    Args:
+        device: Target device identifier.
+        model: If True, move the model.
+        optimizer: If True, move the optimizer states.
+        grad: If True, move the gradient buffer.
+    """
+    if grad:
+        assert model, "Gradient buffers must be moved to device along with model parameters"
+```
+
+**注意 `grad` 被硬绑到 `model`**——想"只 offload 梯度、不 offload 参数"是不允许的。
+
+**（2）自动 offload：真正干活的是 `BaseEngineCtx._context_switch`**（`base.py:229-264`）：
+
+```python
+class BaseEngineCtx:
+    def __init__(self, engine: BaseEngine, mode, **kwargs):
+        self.mode = mode
+        assert self.mode in ("train", "eval")
+        self.disable_auto_offload = kwargs.pop("disable_auto_offload", False)
+
+    def _context_switch(self, device):
+        if self.disable_auto_offload:
+            return                                                    # ① 显式关掉自动搬运
+        if device != "cpu":
+            if not self.engine.is_param_offload_enabled and not self.engine.is_optimizer_offload_enabled:
+                return                                                # ② 没开 offload → 上卡是 no-op
+        if self.mode == "eval":
+            self.engine.to(device=device, model=self.engine.is_param_offload_enabled,
+                           optimizer=False, grad=False)               # ③ 推理/前向只要参数
+        elif self.mode == "train":
+            self.engine.to(device=device,
+                           model=self.engine.is_param_offload_enabled,
+                           optimizer=self.engine.is_optimizer_offload_enabled,
+                           grad=self.engine.is_param_offload_enabled)  # ④ 训练要参数+优化器+梯度
+
+    def __enter__(self):
+        self._context_switch(get_device_name())                       # 进入：搬上 GPU
+        self.engine.mode = self.mode
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._context_switch("cpu")                                   # 退出：搬回 CPU
+        self.engine.mode = None
+```
+
+**这段代码就是"参数在哪里"的唯一答案**：参数/优化器/梯度的设备位置**不是静态的**，而是被 `with engine.train_mode():` / `with engine.eval_mode():` 这对上下文管理器按"进入/退出"自动搬运的。三个可直接引用的结论：
+
+- **`grad` 的开关被硬绑为 `is_param_offload_enabled`**——FSDP 路径下"梯度 offload"不是独立开关，而是跟着参数走。配置里的 `grad_offload` 只有 **Megatron** 引擎读（`workers/engine/megatron/transformer_impl.py:96`），**FSDP 引擎完全没消费它**；
+- **`disable_auto_offload=True` 是给"内层循环"用的**：`TrainingWorker.train_mini_batch` 在外层开一次 `train_mode`，内层每个 mini-batch 都显式传 `disable_auto_offload=True`，**避免每个 mini-batch 都来回搬一次**（`engine_workers.py:272-302`）：
+
+```python
+with (
+    self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+    Timer(name="train_batch", logger=None),
+):
+    for batch_idx, mini_batch_td in enumerate(dataloader):
+        tu.assign_non_tensor(
+            mini_batch_td,
+            global_token_num=NonTensorData(global_token_num),
+            update_lr_scheduler=batch_idx == total_num_iterations - 1,
+            disable_auto_offload=True,                     # ← 内层不搬，只在外层搬一次
+        )
+        actor_output = self.train_batch(mini_batch_td)
+```
+
+- **初始化完就立刻 offload**（`fsdp/transformer_impl.py:202-207`）——建完模型先搬到 CPU，等第一次 `train_mode()` 再上卡：
+
+```python
+self.to(
+    device="cpu",
+    model=self._is_offload_param,
+    optimizer=self._is_offload_optimizer,
+    grad=self._is_offload_param,
+)
+```
+
+**（3）搬运的底层实现**（`verl-v0.8.0/verl/utils/fsdp_utils.py:166-247`；注意**不在** `workers/engine/fsdp/utils.py`，那个文件只有 3 个 mesh 相关函数）：
+
+```python
+@torch.no_grad()
+def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
+    if fsdp_version(model) == 2 or fsdp_version(model) == 0:
+        offload_fsdp2_model_to_cpu(model, empty_cache)      # FSDP2：model.cpu()
+        return
+    assert isinstance(model, FSDP)
+    _lazy_init(model, model)
+    assert model._is_root, "Only support root model offloading to CPU"
+    for handle in model._all_handles:
+        if handle._offload_params:
+            continue
+        flat_param = handle.flat_param
+        assert (flat_param.data.data_ptr() == flat_param._local_shard.data_ptr()
+                and id(flat_param.data) != id(flat_param._local_shard)
+                and flat_param.data.size() == flat_param._local_shard.size())
+        handle.flat_param_to(torch.device("cpu"), non_blocking=True)   # FSDP1：整个 flat_param 搬走
+        flat_param._local_shard = flat_param.data                       # 修 _local_shard 的身份
+        assert id(flat_param._local_shard) != id(flat_param.data)
+    if empty_cache:
+        get_torch_device().empty_cache()
+
+@torch.no_grad()
+def offload_fsdp_optimizer(optimizer):
+    if not optimizer.state:
+        return
+    for param_group in optimizer.param_groups:
+        for param in param_group["params"]:
+            state = optimizer.state[param]
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to("cpu", non_blocking=True)      # exp_avg / exp_avg_sq / step 全搬
+```
+
+**四个实现细节，每个都能单独出面试题**：
+
+| 细节 | 说明 |
+|---|---|
+| FSDP1 vs FSDP2 | FSDP1 对每个 handle 搬 `flat_param`（分片后的扁平参数）并**修正 `_local_shard` 的身份**（那段 assert 是 FSDP1 的硬约束）；FSDP2 直接 `model.cpu()` / `model.to(device)`，让 DTensor 自己走 |
+| **没有 pinned memory** | FSDP 的 offload 只用 `non_blocking=True`；**pinned 只出现在 FSDP2 的 `CPUOffloadPolicy(pin_memory=True)`**（`fsdp/transformer_impl.py:405-418`）、NIXL 收发 buffer、activation offload、Megatron 路径。所以"用了 `non_blocking` 就一定异步重叠"是**错的**——H2D/D2H 要真异步，目标内存必须 pinned |
+| 优化器 state 全搬 | 不枚举 key，只判 `isinstance(value, torch.Tensor)`——Adam 的 `exp_avg` / `exp_avg_sq` / `step` 都会搬到 CPU |
+| `offload_policy` 会"接管" | 一旦用 FSDP2 的 `CPUOffloadPolicy(pin_memory=True)`，引擎会主动把 `_is_offload_param/_is_offload_optimizer` 置 False，把设备管理权交还给 PyTorch |
+
+**（4）推理侧的睡眠等级：level 1 vs level 2，语义由 vLLM 的 `CuMemAllocator` 定义。** vLLM 的 `sleep(level)` 最终落到 `allocator.sleep(offload_tags=...)`（`vllm/device_allocator/sleep_mode_backend.py:120-125`）：
+
+```python
+def suspend(self, level: int = 1) -> None:
+    self._state = "SUSPENDED"
+    allocator = get_mem_allocator_instance()
+    allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())   # level 1 只备份 weights
+```
+
+而 `CuMemAllocator.sleep` 的语义是"**命中 tag 的备份到 pinned CPU，其余直接 unmap 释放**"（`vllm/device_allocator/cumem.py:229-294`）：
+
+```python
+def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:
+    """
+    Put the allocator in sleep mode.
+    All data in the memory allocation with the specified tag will be
+    offloaded to CPU memory, and others will be discarded.
+    """
+    ...
+    for ptr, data in self.pointer_to_data.items():
+        ...
+        if data.tag in offload_tags:
+            backup_bytes += handle[1]
+            cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8,
+                                            device="cpu", pin_memory=PIN_MEMORY)     # ← pinned CPU
+            cpu_ptr = cpu_backup_tensor.data_ptr()
+            libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
+            data.cpu_backup_tensor = cpu_backup_tensor
+        try:
+            unmap_and_release(handle)                                               # 其余物理显存直接还
+        finally:
+            data.is_asleep = True
+    logger.info(
+        "CuMemAllocator: sleep freed %.2f GiB memory in total, of which "
+        "%.2f GiB is backed up in CPU and the rest %.2f GiB is discarded directly.",
+        total_bytes / 1024**3, backup_bytes / 1024**3, (total_bytes - backup_bytes) / 1024**3,
+    )
+```
+
+**配合 vLLM 给两类分配打的 tag**（`vllm/v1/worker/gpu_worker.py:489` 是 `tag="weights"`，`:733` 是 `tag="kv_cache"`），就得到一张完全确定的表：
+
+| level | `offload_tags` | 权重 | KV cache | 醒来（`wake_up`）要做什么 |
+|---|---|---|---|---|
+| **1** | `("weights",)` | **备份到 pinned CPU**（不丢） | **直接丢弃**（物理显存还回去） | 从 pinned CPU 拷回权重 + 重建 KV cache |
+| **2** | `()`（空） | **也丢弃** | 丢弃 | 权重必须**重新灌**（靠 `update_weights`），代价更大但显存更干净 |
+
+verl v0.8.0 里两种模式的等级选择不同（`vllm_async_server.py:625-634`、`:932-949`）：
+
+```python
+async def sleep(self):
+    if self.node_rank != 0 or not self.config.free_cache_engine:
+        return                                        # ← free_cache_engine=False 时 sleep 完全是 no-op
+    if self.rollout_mode == RolloutMode.HYBRID:
+        await self._sleep_hybrid()                    # level = 1 若 lora_as_adapter 或 NPU，否则 2
+    elif self.rollout_mode == RolloutMode.COLOCATED:
+        await self.engine.sleep(level=1)              # COLOCATED 硬编码 level=1
+    elif self.rollout_mode == RolloutMode.STANDALONE:
+        logger.info("skip sleep in standalone mode")
+```
+
+`_sleep_hybrid` 的 docstring 解释了两件重要的事（`vllm_async_server.py:932-949`）：
+
+```python
+async def _sleep_hybrid(self):
+    """HYBRID sleep: lora adapters only need level=1; full weights need level=2.
+
+    Uses engine.sleep() instead of engine.collective_rpc("sleep") to ensure
+    that sleep is properly propagated to all data-parallel worker processes.
+    collective_rpc only reaches the TP workers within a single DP shard,
+    leaving other DP shards' weights unreleased, which causes OOM during
+    FSDP training backward when DP > 1.
+    """
+    if self.lora_as_adapter or is_torch_npu_available(check_device=False):
+        sleep_level = 1
+    else:
+        sleep_level = 2
+```
+
+**三个可直接背的结论**：① **HYBRID + 全量微调 → level 2**（权重直接丢，必须靠 `update_weights` 重新灌）；② **LoRA adapter 或 NPU → level 1**（权重保留在 pinned CPU，醒来快；NPU 是因为 vllm-ascend 还不支持 level 2）；③ **`free_cache_engine=False` 时 sleep/wake 全是 no-op**，共卡直接变"显存死锁"，只能靠 `param_offload` 让训练侧腾挪。
+
+**（5）还有一个中间档：只放 KV cache、保留权重。** NCCL 权重同步需要"写进已有的权重 buffer"，所以专门有 `release_kv_cache_replicas` / `resume_kv_cache_replicas`（`verl-v0.8.0/verl/checkpoint_engine/base.py:452-467`）：
+
+```python
+@auto_await
+async def release_kv_cache_replicas(self):
+    """Release kv_cache of all rollout replicas before NCCL weight sync.
+
+    Unlike sleep_replicas(), this only frees the kv_cache and leaves model
+    weights untouched, so the NCCL transfer can write directly into the
+    existing weight buffers.  Call resume_kv_cache_replicas() after sync.
+    """
+```
+
+**（6）四个开关的完整组合表**（默认值来自 `workers/config/engine.py:89-96`、`workers/config/rollout.py:192,196`）：
+
+| 开关 | 默认 | 作用域 | 打开后的效果 |
+|---|---|---|---|
+| `param_offload` | **False** | 训练引擎 | 每次进 `train_mode`/`eval_mode` 把 FSDP 参数（及梯度）GPU↔CPU 搬 |
+| `optimizer_offload` | **False** | 训练引擎 | 同上，额外搬优化器 state（Adam 两个动量） |
+| `grad_offload` | **False** | **仅 Megatron** | FSDP 路径**不消费**；FSDP 的梯度 offload 实际由 `param_offload` 决定 |
+| `free_cache_engine` | **True** | 推理引擎 | 允许 `sleep/wake`；False → 变成 no-op，共卡下会 OOM |
+
+而全局的 `gpu_memory_utilization` 默认 **0.5**（`workers/config/rollout.py:192`）——**这就是 vLLM 在共卡场景下的"自我限额"**：只敢占一半显存，剩下的留给 FSDP 训练。
+
+### 3. 具体数值样例
+
+```text
+场景：单机 8 卡，1.5B 模型，bf16 训练，Adam(fp32)，rollout.n=4
+
+【配置 A：全 offload（共卡标配，显存最省）】
+  param_offload=true, optimizer_offload=true, free_cache_engine=true, gpu_memory_utilization=0.5
+  推理阶段：vLLM 权重 3 GB/卡 + KV cache（限额 0.5×24 = 12 GB/卡）
+           训练侧：参数/梯度/优化器 ≈ 0（全在 CPU）
+  切换：sleep(level=2) → 释放权重 + KV cache → 显存回到 ~0
+  训练阶段：FSDP 参数 0.375 + 梯度 0.375 + Adam 1.5 + master 0.75 ≈ 3 GB/卡（+激活）
+  退出：train_mode 退出 → 全部搬回 CPU（D2H 拷贝 3 GB/卡）
+  代价：每步多 2 次 H2D + 2 次 D2H 的 3 GB 级拷贝（无 pinned → 不重叠，纯串行）
+
+【配置 B：不 offload（分卡/显存够用）】
+  param_offload=false, optimizer_offload=false, free_cache_engine=false
+  推理阶段：vLLM 权重 3 GB + KV cache 占着不放
+  训练阶段：FSDP 3 GB + 激活，且 vLLM 显存**没还**
+  ⇒ 两套模型同时常驻：3(训练) + 3(vLLM) + KV cache + 激活 → 24 GB 卡极易 OOM
+  ⇒ 这就是"共卡必须 offload 或必须 sleep"的算术证明
+
+【一个容易被忽略的开销】
+  没有 pinned memory 时，cudaMemcpy 是同步的：
+    3 GB / PCIe 4.0 x16 有效带宽 ~12 GB/s ≈ 0.25 s（单卡，单程）
+    每步 2 程（上卡+回卡）→ ~0.5 s/步，且是**每卡各自串行**
+  换成 pinned + non_blocking 后可与别的 compute 重叠
+  → 这正是 FSDP2 用 CPUOffloadPolicy(pin_memory=True)、vLLM sleep 用 pin_memory=PIN_MEMORY 的原因
+```
+
+**一句话理解这张账**：offload 的本质是"**用 PCIe/NVLink 带宽换显存**"，共卡的本质是"**用串行换卡数**"；两者的代价都必须记在空泡账上（第 18 节）。
+
+> **面试一句话总结**："参数在哪"由 `engine.to(device, model, optimizer, grad)` 一个 API 决定，而**调用它的是 `BaseEngineCtx._context_switch`**——`with engine.train_mode()` 进入即把参数（+优化器+梯度）搬上 GPU，退出即搬回 CPU，内层 mini-batch 用 `disable_auto_offload=True` 避免反复搬运；FSDP 路径下梯度 offload 被硬绑在 `param_offload` 上（`grad_offload` 只有 Megatron 读），底层是 FSDP1 的 `flat_param_to(non_blocking=True)` / FSDP2 的 `model.cpu()`，优化器 state 不枚举 key 全搬，**FSDP offload 路径没有 pinned memory**（pinned 只在 FSDP2 `CPUOffloadPolicy` 里）；推理侧由 `free_cache_engine` 控制是否允许 sleep，sleep level 1 = 权重备份到 pinned CPU + KV cache 丢弃、level 2 = 连权重一起丢（HYBRID 全量微调用 2、LoRA/NPU 用 1、COLOCATED 硬编码 1），`free_cache_engine=False` 时 sleep/wake 全是 no-op——**共卡下这四个开关的组合就是"显存够不够"的全部答案**。
+
+---
+
+## 14. 推理 → 训练的切换：wake/sleep 的完整代码路径与硬顺序
+
+### 1. 现有问题：切换点到底是几个函数、谁调谁
+
+"共卡要切换"这句话在代码里对应**一长串调用链**：训练脚本调一个方法 → 管理器 → 每个 rollout 副本 → HTTP server → vLLM 引擎 → 显存分配器。面试里如果只能说"调 sleep 让它睡"，深度不够；要把这条链走完，并说清**每一步做什么、为什么必须按这个顺序**。
+
+### 2. 方法论：一条链 + 两个方向 + 严格顺序
+
+**（1）入口：`CheckpointEngineManager` 提供四个"整体状态"操作**（`verl-v0.8.0/verl/checkpoint_engine/base.py:345-467`）。docstring 先用一张图讲清"谁跟谁连"（`base.py:346-366`）：
+
+```python
+class CheckpointEngineManager:
+    """Checkpoint engine manager to coordinate weight synchronization between trainer and rollout replicas.
+
+    - ME: model engine, FSDP, MCore, VeOmni, export full tensor generator `get_per_tensor_param`
+    - CE: checkpoint engine, NCCL, NIXL, etc
+
+    In trainer, model engine and checkpoint engine are in same process.
+    In rollout, checkpoint engine and rollout worker are in separate process, update weights via cuda ipc.
+    """
+```
+
+四个操作（都用 `asyncio.gather` 并发到所有副本）：
+
+```python
+@auto_await
+async def sleep_replicas(self):
+    """Sleep all rollout replicas: free weight and kv_cache device memory."""
+    await asyncio.gather(*[r.sleep() for r in self.replicas])
+
+@auto_await
+async def wake_up_replicas(self):
+    """Resume all rollout replicas: recover kv_cache and weights device memory."""
+    await asyncio.gather(*[r.wake_up() for r in self.replicas])
+
+@auto_await
+async def release_kv_cache_replicas(self): ...   # 只放 KV，保留权重（NCCL 要写进原 buffer）
+@auto_await
+async def resume_kv_cache_replicas(self): ...    # 同步完恢复 KV
+```
+
+**注意 `@auto_await` 这个装饰器**：它让**同步调用方也能直接调这些协程方法**——训练主循环是同步的（`fit()` 里直接 `self.checkpoint_manager.sleep_replicas()`），底层却是异步的。这是共卡方案里"同步 trainer 驱动异步 rollout server"的粘合点。
+
+**（2）中层：`RolloutReplica` 扇出到每个 server**（`verl-v0.8.0/verl/workers/rollout/replica.py:265-291`）：
+
+```python
+async def wake_up(self):
+    """Wake up each rollout server."""
+    await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
+
+async def sleep(self):
+    """Sleep each rollout server."""
+    await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+
+async def release_kv_cache(self):
+    """Release only the kv_cache GPU memory, keeping model weights in place."""
+    await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
+```
+
+**（3）底层：vLLM server 的 `wake_up` / `sleep`**（`verl-v0.8.0/verl/workers/rollout/vllm_rollout/vllm_async_server.py:604-634`）：
+
+```python
+async def wake_up(self, tags: list[str] | None = None):
+    if self.node_rank != 0:
+        return
+    if self.rollout_mode == RolloutMode.HYBRID:
+        # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
+        # processes across all DP shards (unlike collective_rpc which only reaches
+        # TP workers within a single shard).
+        await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
+        await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
+    elif self.rollout_mode == RolloutMode.COLOCATED:
+        await self.engine.wake_up(tags=self._get_wake_up_tags())
+        await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
+    elif self.rollout_mode == RolloutMode.STANDALONE:
+        logger.info("skip wake_up in standalone mode")
+```
+
+`wake_up` 里 **`reset_prefix_cache` 不能省**——注释说明它会 `reset_connector=True`，把挂在 vLLM 上的外部 KV store（例如 **MooncakeStoreConnector**）里"用旧权重算出来的"条目丢掉。**这条注释直接连到本项目**：共卡 + Mooncake 做 KV 存储时，权重一换，prefix cache 必须失效，否则复用旧 KV 会算错。
+
+另外 `_get_wake_up_tags()` 默认返回 **`["kv_cache", "weights"]`**（`vllm_async_server.py:928-930`）——即"全都要醒"。
+
+**（4）两个方向的完整周期，顺序是硬约束。** 顺序来自 `engine_workers.py:666-746` 的 `update_weights` docstring + `base.py:470-514` 的 Manager 实现：
+
+```text
+【阶段 1：推理】训练循环开始前/每轮 rollout 前 → wake_up_replicas()（权重 + KV cache 上 GPU）
+【阶段 2：训练前】sleep_replicas()  → vLLM 释放权重/KV cache（level 2 时权重直接丢）
+                 训练侧 train_mode() → 参数/优化器搬上 GPU（第 13 节）
+【阶段 3：训练】forward_backward_batch → optimizer_step（第 17 节）
+【阶段 4：训练后】update_weights() → 把新权重灌回 vLLM
+【阶段 5：回推理】rollout 继续，用新权重（on-policy）
+```
+
+**`update_weights` 内部对顺序有明确要求**（`engine_workers.py:666-700` 的 docstring + 分流代码）：
+
+```python
+async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+    """Update weights from trainer to rollout.
+
+    1. For sync training with colocated trainer and rollout, update rollout directly from model engine.
+       - before update_weights: rollout should be in sleep mode.
+       - after update_weights: rollout should be in wake_up mode.
+    2. For async training with disaggregated trainer and rollout, send_weights only by checkpoint engine.
+    """
+    effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+
+    # 0. send_weights only for async training with disaggregated trainer and rollout
+    if effective_mode != "naive":
+        per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+        await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+        return
+    ...
+```
+
+**这段 if 是整节的题眼**：`update_weights(mode)` 用**一个 if 分叉**把"共卡"和"分卡"分开了——`mode="naive"` 是共卡（同进程直接内存交接），其它（`nccl` / `nixl` / `hccl` / `mooncake` / `kimi_ckpt_engine`）是分卡（走 checkpoint engine）。而 `checkpoint_engine.backend` 的**默认值就是 `"naive"`**（`workers/config/rollout.py:149`）——**默认就是共卡**。
+
+### 3. 具体数值样例
+
+```text
+环境：8 卡共卡，1.5B，HYBRID（全量微调 → sleep level 2），param_offload=true
+
+【显存时间线（单卡，粗算）】
+t0  推理态：vLLM weights 3.0 GB + KV cache 10.0 GB（gpu_memory_utilization=0.5×24）
+           训练侧 0.0 GB（offload 在 CPU）                        GPU 占用 ≈ 13.0 GB
+t1  sleep_replicas()（level 2：offload_tags=()）
+           → CuMemAllocator 日志：
+             "sleep freed 13.00 GiB memory in total,
+              of which 0.00 GiB is backed up in CPU and the rest 13.00 GiB is discarded directly."
+           训练侧仍 0.0 GB                                          GPU 占用 ≈ 0.0 GB
+t2  train_mode() → load_fsdp_model_to_gpu + load_fsdp_optimizer
+           参数 0.375 + 梯度 0.375 + Adam 1.5 + master 0.75 ≈ 3.0 GB
+           + 激活（remove-padding 后按 token 数）                    GPU 占用 ≈ 3.0+ GB
+t3  optimizer_step() 后 train_mode 退出 → 全部搬回 CPU             GPU 占用 ≈ 0.0 GB
+t4  update_weights()（naive）
+           rollout.resume(tags=["weights"])     ← 先把权重 buffer 要回来
+           get_per_tensor_param() 流式产出 (name, tensor)
+           rollout.update_weights(per_tensor_param)  ← 同卡直灌（CUDA IPC）
+           engine.to("cpu", model=True, optimizer=False, grad=False)
+           aggressive_empty_cache(force_sync=True)
+           rollout.resume(tags=["kv_cache"])    ← 再把 KV cache 要回来
+                                                                    GPU 占用 ≈ 13.0 GB
+t5  回到推理态，on-policy 采样
+
+【如果 free_cache_engine=False（对照）】
+t1  sleep_replicas() → **no-op**（第一行 `not self.config.free_cache_engine: return`）
+    13 GB 仍然占着 → t2 训练要 3 GB + 激活 → 24 GB 卡几乎必然 OOM
+  ⇒ 共卡场景下 free_cache_engine 与 param_offload 至少要开一个，通常两个都开
+```
+
+**三个顺序性的坑**（都是代码里显式写了的约束）：
+
+1. **`update_weights` 必须在 rollout sleep 之后、wake 之前**（docstring 原文："before update_weights: rollout should be in sleep mode / after update_weights: rollout should be in wake_up mode"）——否则要么把权重写进已释放的 buffer，要么和推理抢显存；
+2. **`set_expandable_segments(False)` 必须在 vLLM 醒来之前**（naive 路径 `engine_workers.py:702`）——`PYTORCH_CUDA_ALLOC_CONF=expandable_segments` 与 vLLM 的 `CuMemAllocator` 冲突；这也是 NCCL 的 `prepare()` 里要用 `cupy` 而不是 `torch` 分配 buffer 的原因（`nccl_checkpoint_engine.py:134-137` 有注释）；
+3. **`release_kv_cache_replicas` 必须在权重同步之前**（`base.py:492-493` 注释："weights stay in place, so the NCCL transfer can write directly into the existing weight buffers"）——只放 KV、留着权重 buffer，避免重新分配。
+
+> **面试一句话总结**：共卡的切换链是 `CheckpointEngineManager`（`sleep_replicas`/`wake_up_replicas`/`release_kv_cache_replicas`/`resume_kv_cache_replicas`，用 `@auto_await` 让同步 trainer 能直接调）→ `RolloutReplica`（`asyncio.gather` 扇出到每个 server）→ `vllm_async_server.wake_up/sleep`（HYBRID 必须用 `engine.wake_up/sleep` 广播到所有 DP shard，**不能用 `collective_rpc`**，否则 DP>1 时其他 shard 不释放权重、训练反向会 OOM）→ vLLM `CuMemAllocator.sleep`（按 tag 备份到 pinned CPU 或直接 unmap 释放）；**顺序是硬约束**：`sleep_replicas` → `train_mode` → 训练 → `update_weights`（`mode="naive"` 走同卡直灌，`backend` 默认就是 `naive`）→ `wake_up_replicas`；`wake_up` 里必须 `reset_prefix_cache(reset_connector=True)` 把用旧权重算的 KV（含 MooncakeStoreConnector）作废；`free_cache_engine=False` 会让 sleep/wake 全变 no-op，共卡下必须靠 `param_offload` 兜底。
+
+---
+
+## 15. 权重同步：naive（同卡直传）与 checkpoint_engine（跨卡多播）两条路
+
+### 1. 现有问题：FSDP 的分片参数怎么变成 vLLM 能吃的权重
+
+训练侧参数是 **FSDP 分片 + 扁平化**的（每个 handle 一个 `flat_param`），推理侧 vLLM 要的是**按名字组织的完整张量**。中间要做四件事：① 把分片**还原**成完整张量（`full_tensor()`）；② 按 vLLM 的命名约定**改名**；③ 决定**怎么运**（同卡直接写内存？跨机 NCCL？走 Mooncake？）；④ 控制**显存开销**（不能为了传输再复制一整份模型）。
+
+### 2. 方法论：先有"流式生成器"，再分两条路
+
+**（1）统一的源头：`get_per_tensor_param()` 返回的是生成器，不是字典。** `verl-v0.8.0/verl/workers/engine/fsdp/transformer_impl.py:794-871`：
+
+```python
+def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+    log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
+
+    # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
+    # leaves the module half-moved and crashes state_dict() below (#5995). The
+    # per-DTensor .to(device).full_tensor() below still produces GPU tensors.
+    if not self._uses_fsdp2_cpu_offload_policy:
+        load_fsdp_model_to_gpu(self.module)
+    ...
+    else:
+        params = self.module.state_dict()
+
+    params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+
+    if self._is_offload_param:
+        offload_fsdp_model_to_cpu(self.module)          # ← 取完 state_dict 就立刻把模型搬回 CPU
+
+    if peft_config is not None and base_sync_done:
+        per_tensor_param = params.items()
+    else:
+        device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+        # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
+        per_tensor_param = (
+            (
+                name,
+                param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
+                if isinstance(param, DTensor)
+                else param,
+            )
+            for name, param in params.items()
+        )
+    ...
+    return per_tensor_param, peft_config_dict
+```
+
+**这段代码是"显存友好"的关键**：返回值是**惰性生成器**——每 yield 一个 `(name, tensor)` 才把那一个张量 `.to(device).full_tensor()` 物化出来，**全程只额外持有"一个张量"而不是整份模型**。这就是为什么"权重同步"不需要 2× 模型显存（除了 NCCL 自己的双 buffer，见下）。
+
+**（2）路 A：naive（共卡，同进程直传）——8 个有序步骤**（`verl-v0.8.0/verl/workers/engine_workers.py:702-746`）：
+
+```python
+set_expandable_segments(False)                                      # ① 先关 expandable_segments
+if self.config.rollout.free_cache_engine:
+    await self.rollout.resume(tags=["weights"])                      # ② 把 vLLM 的权重 buffer 要回来
+per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
+    layered_summon=self.layered_summon, base_sync_done=True)         # ③ 取流式权重
+do_lora_base_sync = False
+if not self.peft_merge and peft_config is not None:
+    self.rollout.sleep_level = 1
+    do_lora_base_sync = not self.base_sync_done
+if do_lora_base_sync:
+    await self.rollout.update_weights(per_tensor_param_base, peft_config=peft_config,
+                                      base_sync_done=False, global_steps=global_steps)   # ④ LoRA 先灌基座
+await self.rollout.update_weights(per_tensor_param, peft_config=peft_config,
+                                 base_sync_done=True, global_steps=global_steps)          # ⑤ 再灌 adapter/全量
+if self.actor.engine.is_param_offload_enabled:
+    self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)                 # ⑥ 训练侧回 CPU
+aggressive_empty_cache(force_sync=True)                                                   # ⑦ 收显存
+if self.config.rollout.free_cache_engine:
+    await self.rollout.resume(tags=["kv_cache"])                                          # ⑧ 恢复 KV cache
+self.base_sync_done = True
+set_expandable_segments(True)
+```
+
+**注意 ⑥ 只搬 `model`、不搬 `optimizer`**——因为在 `update_weights` 时优化器状态本来就已经在 CPU（第 13 节的 `train_mode` 退出时搬走了），这里只是把刚为同步而临时上卡的参数再搬回去。
+
+**（3）路 B：checkpoint_engine（分卡，跨进程/跨机）——抽象接口 + 6 个后端。** 接口定义（`verl-v0.8.0/verl/checkpoint_engine/base.py:96-110`，docstring 本身就是用法说明）：
+
+```python
+class CheckpointEngine(ABC):
+    """CheckpointEngine is an abstraction to transfer weights from trainer to rollout.
+
+    In trainer process:
+    >>> trainer = EngineRegistry.new(...) # FSDP, Megatron, VeOmini, TorchTitan, ...
+    >>> engine = CheckpointEngine.new(...) # NCCLCheckpointEngine, NIXLCheckpointEngine, ...
+    >>> await engine.send_weights(trainer.get_per_tensor_param())
+
+    In rollout process:
+    >>> engine = CheckpointEngine.new(...)
+    >>> server_adapter = ServerAdapter()
+    >>> await server_adapter.update_weights(engine.get_weights()) # update weights via cuda ipc
+    """
+```
+
+生命周期固定为 **`prepare` → `build_topology`(classmethod) → `init_process_group` → `send_weights`/`receive_weights` → `finalize`**，注册名与后端对应关系：
+
+| backend | 文件 | 用途 |
+|---|---|---|
+| `naive` | `base.py:220` `ColocatedCheckpointEngine` | **共卡**：`send_weights` 只是把生成器存起来（`self.weights = weights`），`receive_weights` 再 `yield from` —— 零拷贝的内存交接 |
+| `nccl` | `nccl_checkpoint_engine.py:102` | CUDA 多卡广播 |
+| `hccl` | `hccl_checkpoint_engine.py:96` | 昇腾 NPU（**注意注册字符串写的是 `"nccl"`**，与 CUDA 版同名，疑似 bug） |
+| `nixl` | `nixl_checkpoint_engine.py:238` | NVIDIA 的 NIXL 传输库 |
+| `mooncake` | `mooncake_checkpoint_engine.py:34` | **Mooncake 传输**（和 TQ 的存储后端同源） |
+| `kimi_ckpt_engine` | `kimi_checkpoint_engine.py:222` | Kimi 的传输实现 |
+
+**Manager 侧的 8 步编排**（`base.py:470-514`，非 naive 路径）：
+
+```python
+# 1. abort and save all unfinished requests for partial rollout
+await self.abort_replicas()
+
+# 2. create a temporay worker group for all replicas
+workers = []
+for replica in self.replicas:
+    workers.extend(replica.workers)
+rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
+
+# 3. release kv_cache before weight sync (weights stay in place)
+await self.release_kv_cache_replicas()
+
+# 4. build process group
+self.build_process_group(rollout)
+
+# 5. update weights of all workers
+ray.get(
+    trainer.update_weights(global_steps=global_steps, mode=self.backend)
+    + rollout.update_weights(global_steps=global_steps)
+)
+
+# 6. finalize all workers
+ray.get(trainer.execute_checkpoint_engine(["finalize"] * trainer.world_size)
+        + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size))
+
+# 7. restore kv_cache after weight sync
+await self.resume_kv_cache_replicas()
+
+# 8. resume all unfinished requests for partial rollout
+await self.resume_generation_replicas()
+```
+
+**第 1 步和第 8 步是"partial rollout"的落点**：同步权重前先把在飞的请求 abort 掉（但**保存**进度），传完权重再恢复生成——这样"正在跑的 rollout 不会读到半新半旧的权重"。这是分卡异步方案里最容易漏掉的一致性细节。
+
+**（4）切块与重组：bucket 让显存可控。** `base.py:517-585` 提供一对生成器变换：
+
+```python
+async def split_weight_chunks(
+    weights: Generator[tuple[str, torch.Tensor], None, None], bucket_size: int
+) -> AsyncGenerator[tuple[TensorMeta, torch.Tensor], None]:
+    """Split the weight into chunks."""
+    async for name, weight in ensure_async_iterator(weights):
+        buffer = weight.view(-1).view(torch.uint8)              # 摊平成 uint8 字节流
+        chunk_offset = 0
+        while chunk_offset < weight.nbytes:
+            chunk_size = min(bucket_size, weight.nbytes - chunk_offset)
+            tensor_meta = TensorMeta(name=name, shape=weight.shape, dtype=weight.dtype,
+                                     chunk_offset=chunk_offset, chunk_size=chunk_size, offset=None)
+            yield (tensor_meta, buffer[chunk_offset : chunk_offset + chunk_size])
+            chunk_offset += chunk_size
+```
+
+接收侧 `merge_weight_chunks` 按 `TensorMeta` 把块拼回原张量（**小张量直接过、大张量才开 buffer 累积**，`base.py:563-568` 有一段 `nbytes <= bucket_size` 的快路径）。bucket 大小的配置项是 **`update_weights_bucket_megabytes`，默认 2048（即 2 GB）**（`workers/config/rollout.py:151`，代码里 `<< 20` 转字节）。
+
+**（5）NCCL 后端的两个硬事实**：**元数据走 ZMQ、数据走 broadcast**（`nccl_checkpoint_engine.py:80-90`）：
+
+```python
+def _run(self):
+    # broadcast tensor meta via zeromq PUB/SUB
+    if self.rank == 0:
+        self.socket.send_string(self.topic, flags=zmq.SNDMORE)
+        self.socket.send_pyobj(self.metadata)
+    else:
+        self.socket.recv_string()
+        self.metadata = self.socket.recv_pyobj()
+
+    # broadcast tensor via NCCL
+    collective.broadcast(self.bucket, src_rank=0, group_name=self.group_name)
+```
+
+拓扑是 **1:N 广播**而不是 all_gather（`nccl_checkpoint_engine.py:159-171`）：trainer 只有 rank0 参与发送（其余 rank 记 `-1`），rollout 从 rank1 开始；trainer 的非 0 rank 在 `send_weights` 里**只消费不发送**（`:240-246`，注释 `"Trainer workers other than rank 0 should not send weights."`）。**注意 README 表格里写的是 `all_gather+broadcast`，但代码里只有 broadcast**——这是文档与实现的偏差，面试时可以作为一个"我读过源码"的细节提。
+
+而**显存开销是显式写死的 2×bucket**（`nccl_checkpoint_engine.py:104-108` docstring）：
+
+```python
+"""NCCL checkpoint engine with collective communication.
+
+Args:
+    bucket_size (int): Bucket size in bytes to transfer multiple weights at one time. Note that we use
+        two buffer to send and recv weights at same time, so the device memory overhead is 2 * bucket_size.
+"""
+```
+
+对应 `prepare()` 里真的分配两个 buffer（`:134-144`），而且 master 侧**用 `cupy` 而不是 `torch`**，原因写在注释里：
+
+```python
+def prepare(self) -> MasterMetadata:
+    # For master process, use cupy instead of torch to avoid memory register error
+    # when `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+    if self.is_master:
+        self.send_buf = cp.zeros(self.bucket_size, dtype=cp.uint8)
+        self.recv_buf = cp.zeros(self.bucket_size, dtype=cp.uint8)
+    else:
+        self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="cuda")
+        self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="cuda")
+```
+
+**（6）落地：rollout 侧最后一段走 CUDA IPC / 共享内存**（`verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py:172-178`）：
+
+```python
+def _init_buffer(self):
+    """build communication buffer"""
+    buffer, shm = None, None
+    if not self.use_shm:
+        buffer = torch.empty(self.bucket_size, dtype=torch.uint8, device=f"{get_device_name()}:{get_device_id()}")
+        handle = reduce_tensor(buffer)
+```
+
+**（7）演进：带本地缓存的 engine（partial rollout 的进阶）。** `base.py:203-217`：
+
+```python
+class CheckpointEngineWithCache(CheckpointEngine):
+    """Checkpoint engine with local cache: shm, disk, etc. This allow to synchronize weights without interrupting
+    rollout ongoing requests (partial rollout). After requests exhausted, rollout can get weights from local cache.
+
+    Laminar: https://arxiv.org/abs/2510.12633
+    """
+    @abstractmethod
+    async def get_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
+```
+
+**"abort 请求 → 传权重 → 恢复请求"（v0.8 的做法）会被"权重先落到本地 cache，等旧请求自己跑完再切换"（Laminar 的做法）取代**——这是共卡/分卡方案从"打断式同步"走向"无打断同步"的方向。
+
+### 3. 具体数值样例
+
+```text
+场景：1.5B 模型，bucket_size = 2048 MB（默认），NCCL backend，trainer 8 rank + rollout 8 rank
+
+【权重张量数与切块数】
+  1.5B 参数，按 HF 命名大约 300~500 个张量（q/k/v/o/gate/up/down × 层数）
+  最大的张量：embed_tokens [151936, 1536] bf16 ≈ 0.43 GB，lm_head 同量级
+  其余多为 [1536, 1536] bf16 = 4.5 MB 级
+  bucket_size = 2 GB → 只有 embed/lm_head 这类会被切成 1 块（0.43 GB < 2 GB，不切）
+  实际上 2 GB 的 bucket 远大于任何单个张量 ⇒ split_weight_chunks 基本"一桶一张量"
+  若把 bucket 调成 32 MB：4.5 MB 的小张量仍不切；只有 >32 MB 的才切 2 段
+
+【显存开销】
+  NCCL 双 buffer：2 × 2 GB = 4 GB（每 rank，常驻）
+  这在共卡场景下很贵 —— 所以共卡用 naive（零额外 buffer），
+  分卡才用 NCCL（4 GB/rank 相对独立卡的显存可以接受）
+
+【传输量（bf16）】
+  全量：3 GB（= 1.5B × 2 B）
+  若每次只传"变化的部分"？—— v0.8 **没有** delta/changed-ratio 机制（B 调研确认：
+  checkpoint_engine/ 内无任何增量同步实现，send_weights 的 global_steps 形参在 NCCL
+  实现体内未被使用）。所以每步都是**全量 3 GB**。
+  时间估算：8 卡 NVLink/NVSwitch 有效带宽 ~200 GB/s 共享
+    3 GB / 200 GB/s ≈ 15 ms（理想）
+    实际含 ZMQ 元数据往返、chunk 切分、rank 同步、CUDA IPC 落地 → 常见 0.1~1 s 级
+  ⇒ 对比：共卡 naive 走同卡内存/cuda ipc，量级更小（但省不掉"同步"这件事本身）
+
+【一个可验证的顺序账】
+  release_kv_cache_replicas()（放过 10 GB KV）
+    → build_process_group（prepare 分配 2×2 GB buffer）
+    → send/receive（3 GB 全量）
+    → finalize（释放 buffer）
+    → resume_kv_cache_replicas()（KV 重建 10 GB）
+  峰值额外显存 = 2×bucket（4 GB）+ KV 重建过程中的临时占用
+```
+
+**三个结论**：① **每步都是全量 3 GB**（v0.8 无增量同步）——这是分卡方案的主要固定成本；② **bucket 越大吞吐越好但显存越贵**（2×bucket 常驻），共卡下根本不该用 NCCL（`naive` 零 buffer）；③ **共卡的 `naive` 路径本质上也是"全量 + 逐张量"**，靠的是"同卡内存直写"省掉网络——所以**共卡省的是带宽，不是拷贝**。
+
+> **面试一句话总结**：权重同步的源头是 `engine.get_per_tensor_param()` 返回的**惰性生成器**（每个张量现取现 `.to(device).full_tensor()`，只额外持有一个张量的显存，不会复制整份模型）；共卡走 `mode="naive"`（`ColocatedCheckpointEngine` 只把生成器存下来、被消费时 `yield from`，零额外 buffer，`checkpoint_engine.backend` 默认就是 `naive`）；分卡走 `CheckpointEngineManager.update_weights()` 的 8 步——**abort 在飞请求 → 建临时 worker group → `release_kv_cache_replicas`（只放 KV 保留权重让传输直接写进原 buffer）→ `build_process_group` → trainer/rollout 并发 `update_weights` → `finalize` → 恢复 KV → 恢复生成**；传输本身是"命名张量 → `split_weight_chunks` 按 `bucket_size`（默认 2048 MB）切块 → uint8 字节流 → NCCL `broadcast(src_rank=0)` 一写多读（元数据走 ZMQ PUB/SUB）→ rollout 侧 CUDA IPC 落地"，**显存开销是 2×bucket_size**（docstring 明写），**且没有任何 delta/增量同步**，每步都是全量权重。
+
+---
+
+## 16. 项目 TQ 方案的一次完整 `_train_step`：从推理切到训练再切回来
+
+### 1. 现有问题：TQ 化之后，训练循环长什么样
+
+项目在 `verl-v0.8.0` 里加了一套 **TQ 原生训练循环**（`verl/trainer/main_ppo_sync.py`，1866 行，含 `ReplayBuffer` / `KVBatchMeta` / `AgentLoopWorkerTQ` / `AgentLoopManagerTQ`），然后 `agent-lightning` 仓的 `AgentLightningTrainer` **继承它并重写 `_train_step` / `fit`** 以插入 agent 模式。它和前面 1~11 节讲的 `RayPPOTrainer`（v0.3.0）**数据流完全不同**：
+
+| 维度 | v0.3.0（`RayPPOTrainer`） | 项目 TQ 方案（`main_ppo_sync.PPOTrainer`） |
+|---|---|---|
+| 训练数据载体 | `DataProto`（张量全在 driver/worker 内存里） | **`KVBatchMeta`（只有 keys + tags，张量在 TQ）** |
+| driver 持有的东西 | 完整 batch 的张量 | **只有 keys、tags、extra_info** |
+| 中间结果（log_probs/entropy/advantage） | 留在 DataProto | **写回 TQ，driver 需要时再拉** |
+| 等待 agent 完成 | `run_until_all_finished()` 轮询 store | **`ReplayBuffer` 轮询 `tq.kv_list()` + running barrier** |
+
+`main_ppo_sync.py` 开头的 docstring 自己点明了这一点（文件中第 19 行附近）：`2. Use ReplayBuffer to sample data from TransferQueue.`
+
+### 2. 方法论：`tqbridge`（元数据/数据分离）+ ReplayBuffer（屏障轮询）+ `_train_step`（九段式）
+
+**（1）核机制：`tqbridge` 让 worker 方法"进 meta、出 meta"，真实张量走 TQ。** 装饰器在调用前后各做一次搬运（`verl-v0.8.0/verl/utils/transferqueue_utils.py:322-370`）：
+
+```python
+def decorator(func):
+    pid = os.getpid()
+
+    @wraps(func)
+    def inner(*args, **kwargs):
+        batch_meta = _find_meta(*args, **kwargs)          # ① 找到参数里的 BatchMeta/KVBatchMeta
+        if batch_meta is None:
+            return func(*args, **kwargs)                  # 没有 meta → 原样调用（不影响普通方法）
+        else:
+            global TQ_INITIALIZED
+            if not TQ_INITIALIZED:
+                tq.init()                                 # ② worker 进程里首次使用时初始化 TQ 客户端
+                TQ_INITIALIZED = True
+
+            is_kv_batch_meta = isinstance(batch_meta, KVBatchMeta)
+            if is_kv_batch_meta:
+                tags = batch_meta.tags
+                batch_meta = kv_batch_meta2batch_meta(batch_meta)
+            t1 = time.time()
+            args = [_meta_to_realdata(arg) if isinstance(arg, BatchMeta | KVBatchMeta) else arg for arg in args]
+            kwargs = {k: _meta_to_realdata(v) if isinstance(v, BatchMeta | KVBatchMeta) else v for k, v in kwargs.items()}
+            t2 = time.time()
+            logger.info(f"Task {func.__name__} (pid={pid}) is getting len_samples={batch_meta.size}, cost time: {t2 - t1}")
+
+            output = func(*args, **kwargs)                # ③ 真正执行（此时拿到的是张量）
+
+            put_data = False
+            if isinstance(output, TensorDict):
+                if output.batch_size:
+                    assert output.batch_size[0] == batch_meta.size, (
+                        f"output batch size {output.batch_size} != meta size {batch_meta.size}")
+                    put_data = True
+            need_collect = _compute_need_collect(dispatch_mode, args) if dispatch_mode is not None else True
+            if put_data and need_collect:
+                updated_meta = _update_meta_with_output(output, batch_meta, func.__name__)   # ④ 输出写回 TQ
+                if is_kv_batch_meta:
+                    updated_meta = batch_meta2kv_batch_meta(updated_meta)
+                    updated_meta.tags = tags
+                return updated_meta
+            return _postprocess_common(output, put_data, need_collect)
+```
+
+配合两个搬运函数（`transferqueue_utils.py:111-158`）：
+
+```python
+async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
+    if isinstance(meta, KVBatchMeta):
+        meta = await async_kv_batch_meta2batch_meta(meta)
+    meta_info = copy.deepcopy(meta.extra_info)
+    tq_client = tq.get_client()
+    tensordict = await tq_client.async_get_data(meta)         # ← 真正从 TQ 取张量
+    for key, val in meta_info.items():
+        if isinstance(val, (NonTensorData | NonTensorStack)):
+            tensordict[key] = val
+        else:
+            tu.assign_non_tensor_data(tensor_dict=tensordict, key=key, val=val)
+    return tensordict
+
+async def _async_update_meta_with_output(output: TensorDict, meta: BatchMeta, func_name=None) -> BatchMeta:
+    fields, meta_data = [], {}
+    for k, v in output.items():
+        if isinstance(v, torch.Tensor | NonTensorStack):
+            fields.append(k)                                   # 张量 → 进 TQ
+        elif isinstance(v, NonTensorData):
+            meta_data[k] = v.data                              # 非张量 → 留在 meta.extra_info 里传回
+        ...
+    meta = await tq_client.async_put(data=output.select(*fields), metadata=meta)
+    meta.extra_info = meta_data
+    return meta
+```
+
+**这就是"跨进程只传 keys、张量走 TQ"的实现**：`extra_info`（张量以外的配置，如 `mini_batch_size` / `epochs` / `seed` / `temperature` / `global_token_num`）随 meta 走控制面，**张量走数据面**。回忆第 4 节讲过的"控制流与数据流分离"——这里是它在**训练循环内部**的又一次应用。
+
+**（2）下行：daemon 把 prompt 入队 + 写 `running` 屏障。** `agentlightning/verl/daemon.py:599-622`：
+
+```python
+if self.mode == "v1":
+    # Enqueue all the tasks in a single batch
+    rollouts = await self.store.enqueue_many_rollouts(enqueue_rollout_requests)     # ① 任务进 LightningStore
+    self._task_id_to_original_sample.update({...})
+    self._total_tasks_queued += len(rollouts)
+
+if global_steps is not None and is_train:
+    import transfer_queue as tq
+    for rollout_id in self._task_id_to_original_sample:
+        tq.kv_put(
+            key=rollout_id,
+            partition_id="train",
+            tag={"global_steps": global_steps, "status": "running"},                # ② TQ 里写"占位屏障"
+        )
+```
+
+**"running 屏障"是很漂亮的设计**：trainer 不需要知道 agent 什么时候完成，只需要知道"TQ 里这批 rollout_id 的 status 什么时候不再是 running"。**等待状态本身也放进了数据面**，于是等待可以变成"带超时的轮询"而不是"一次阻塞"。
+
+**（3）上行：daemon 把轨迹字段与 tags 批量写入 TQ。** `daemon.py:1108-1126`：
+
+```python
+tags.append({"seq_len": prompt_len + response_len, "is_drop": is_drop_list[i]})
+tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=tags)      # 轨迹 + tag 一起进 TQ
+...
+batch_meta = KVBatchMeta(
+    keys=...,
+    tags=...,
+    partition_id=partition_id,
+    ...
+)
+```
+
+**tag 里塞了 `is_drop` 和 `seq_len`**——于是后面 `_train_step` 里"过滤超长 prompt"和"按长度做负载均衡"**都不用把张量拉回来**，只看 tags 就够了（`trainer.py:361-372`）：
+
+```python
+non_drop_mask = [not tag.get("is_drop", False) for tag in batch.tags]
+if not all(non_drop_mask):
+    valid_indices = [i for i, m in enumerate(non_drop_mask) if m]
+    metrics["training/n_triplets_prompt_too_long"] = len(batch.keys) - len(valid_indices)
+    batch = KVBatchMeta(
+        keys=[batch.keys[i] for i in valid_indices],
+        tags=[batch.tags[i] for i in valid_indices],
+        partition_id=batch.partition_id,
+        fields=batch.fields,
+        extra_info=batch.extra_info,
+    )
+```
+
+**（4）`ReplayBuffer`：后台线程轮询 `tq.kv_list()` + `sample()` 忙等屏障。** `verl-v0.8.0/verl/trainer/main_ppo_sync.py:194-294`：
+
+```python
+class ReplayBuffer:
+    """Replay buffer periodically polls metadata from transfer queue."""
+
+    def __init__(self, poll_interval: float = 1.0):
+        # partition_id => {key: tags}
+        self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
+        self.poll_interval = poll_interval
+        self.lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.poll_thread = threading.Thread(target=self._poll_from_transfer_queue, daemon=True)
+        self.poll_thread.start()
+
+    def _poll_from_transfer_queue(self):
+        """Periodically poll metadata from transfer queue."""
+        try:
+            while not self._stop_event.is_set():
+                data = tq.kv_list()                       # ← 只拉 key+tag，不拉张量
+                if data is not None:
+                    for partition_id, items in data.items():
+                        self.add(partition_id, items)
+                self._stop_event.wait(self.poll_interval)
+        except Exception as e:
+            if not self._stop_event.is_set():
+                logger.error(f"Error in _poll_from_transfer_queue: {e}")
+                os._exit(1)                               # ← 轮询线程崩了直接退出进程（否则静默卡死）
+
+    def sample(self, partition_id: str, global_steps: int = None, batch_size: int = None) -> KVBatchMeta:
+        ...
+        while True:
+            time.sleep(self.poll_interval)
+            with self.lock:
+                keys, tags = [], []
+                should_wait = False
+                partition = self.partitions[partition_id]
+                for key, tag in partition.items():
+                    if tag["global_steps"] == global_steps:
+                        if tag["status"] == "running":
+                            should_wait = True            # ← 还有没跑完的 → 继续等
+                            break
+                        elif tag["status"] == "success":
+                            keys.append(key)
+                            tags.append(tag)
+                        else:
+                            logger.debug(f"Unknown status {tag['status']} for key {key}")
+                if not should_wait:
+                    return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
+```
+
+**这段 `sample()` 就是空泡的量尺**：`while True: time.sleep(poll_interval)` —— **训练进程在这里纯等**。项目把 `poll_interval` 设成 **3.0 秒**（`agentlightning/verl/trainer.py:490`：`self.replay_buffer = ReplayBuffer(poll_interval=3.0)`），意味着**平均要多等 1.5 s 才察觉"这批跑完了"**，这是最直接的空泡。
+
+**（5）项目的 `_train_step` 九段式**（`agentlightning/verl/trainer.py:280-440`，逐行对应）：
+
+```text
+第 1 段 [gen]：① checkpoint_manager.wake_up_replicas()        ← 推理醒来（权重+KV 上 GPU）
+              ② agent_mode_daemon.set_up_data_and_server(...)   ← prompt 入 store + 写 TQ running 屏障
+              ③ replay_buffer.sample(partition_id="train", global_steps=...)  ← ★ 忙等，空泡在这里
+              ④ agent_mode_daemon.clear_data_and_server()
+              ⑤ checkpoint_manager.sleep_replicas()             ← 推理睡下，把显存让给训练
+              （项目为这 5 步各打了一个计时器：gen_wake_replicas / gen_set_up /
+                gen_replay_sample / gen_clear / gen_sleep_replicas）
+
+第 2 段 [reward]：_compute_reward_colocate(batch)（colocate reward worker）
+
+第 3 段：按 tags 过滤 is_drop（不拉张量）+ _balance_batch（upsample 复制样本做负载均衡，
+         padding 样本打 is_padding tag）—— 替代了老版本的 pad → compute → unpad → floor_pad
+
+第 4 段 [old_log_prob]：_compute_old_log_prob(batch, metrics)
+第 5 段 [ref]：_compute_ref_log_prob(batch, metrics)（若 use_reference_policy）
+第 6 段 [values]：_compute_values(batch, metrics)（若 use_critic）
+第 7 段 [adv]：_compute_advantage(batch, metrics)
+第 8 段 [update_critic] / 第 9 段 [update_actor]：_update_critic / _update_actor
+```
+
+**（6）第 4 段 `_compute_old_log_prob` 展示了 TQ 往返的"三段式"**（`verl-v0.8.0/verl/trainer/main_ppo_sync.py:1302-1361`）：
+
+```python
+# 1. compute log probs —— 把 meta 交给 worker，worker 通过 tqbridge 自己从 TQ 取数
+batch.extra_info.update({"calculate_entropy": True, "compute_loss": False,
+                         "temperature": self.config.actor_rollout_ref.rollout.temperature})
+output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
+assert len(output) == len(batch)
+
+# driver 端再把需要的字段拉回来（只拉 3~5 个字段，不是整个 batch）
+fields = ["entropy", "log_probs", "response_mask"]
+if self.config.actor_rollout_ref.rollout.calculate_log_probs:
+    fields.extend(["responses", "rollout_log_probs"])
+data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+
+# 2. write old_log_probs and entropy back to TransferQueue
+data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
+data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id,
+                        fields=data.select("old_log_probs", "entropy"))
+
+# 3. driver 端只为算指标把张量转成 padded
+data = DataProto(batch=data.to_padded_tensor())
+entropy_agg = agg_loss(loss_mat=data.batch["entropy"], loss_mask=data.batch["response_mask"], ...)
+metrics.update({"actor/entropy": entropy_agg.detach().item()})
+```
+
+`response_from_nested` / `response_to_nested` 定义在 `verl-v0.8.0/verl/workers/utils/padding.py:196,215`——它们是"变长 nested 张量 ↔ padded 张量"的转换器。**注意这里埋了第 18 节那个 15 秒的坑**。
+
+**（7）第 7 段 `_compute_advantage` 是"取—算—写"的完整闭环**（`main_ppo_sync.py:1405-1466`）：
+
+```python
+fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+response_mask = data["response_mask"]
+data = DataProto(batch=data.to_padded_tensor())
+data.batch["token_level_scores"] = data.batch["rm_scores"]
+data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+# 1. KL penalty / 2. rollout correction（IS 权重、拒绝采样）/ 3. advantage
+data = compute_advantage_for_multi_trajectories(data, batch_keys=batch.keys, adv_estimator=..., ...)
+# 4. write nested advantages and returns back to TransferQueue
+output = {}
+for field in fields:                       # ["advantages", "returns", (+token_level_rewards/response_mask/...)]
+    output[field] = response_to_nested(data.batch[field], response_mask)
+batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
+return batch
+```
+
+**注意 advantage 用的是项目自研的 `compute_advantage_for_multi_trajectories`（`main_ppo_sync.py:122`）而不是 verl 原生的 `compute_advantage`**——因为它要按 `batch_keys` 对多条轨迹（triplet）分组。
+
+**（8）第 9 段 `_update_actor` 只往 `extra_info` 里塞超参、把 batch 原样交给 worker**（`main_ppo_sync.py:1490-1520`）：
+
+```python
+ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+extra_info = {
+    "calculate_entropy": calculate_entropy,
+    "global_batch_size": ppo_mini_batch_size,
+    "mini_batch_size": ppo_mini_batch_size,
+    "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
+    "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
+    "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
+    "temperature": self.config.actor_rollout_ref.rollout.temperature,
+}
+batch.extra_info.update(extra_info)
+output: TensorDict = self.actor_rollout_wg.update_actor(batch)      # ← worker 侧 tqbridge 自己取数
+```
+
+**（9）外层 `fit` 的完整顺序**（`agentlightning/verl/trainer.py:447-612`）：
+
+```text
+_load_checkpoint()
+  → checkpoint_manager.update_weights()                  # ① 训练前把初始权重同步给推理侧
+  → 创建 agent_mode_daemon（v1 模式，注入 store/llm_proxy/adapter）
+  → self.replay_buffer = ReplayBuffer(poll_interval=3.0) # ② 启动后台轮询线程
+  → tq.kv_list() → tq.kv_clear(...)                      # ③ 清理上次崩溃遗留的 TQ 残留数据
+  → val_before_train（_validate 里也会 sleep/update_weights）
+  → for epoch / for batch_dict:
+        batch = self._train_step(batch_dict, metrics, timing_raw)   # ④ 上面那九段
+        → bench_log(...)                                            # ⑤ 打印 20+ 个分阶段耗时
+        → save_checkpoint（按 save_freq）
+        → with _timer("update_weights"): checkpoint_manager.update_weights()   # ⑥ 同步新权重
+        → _validate（按 test_freq）
+        → _compute_metrics
+        → tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)        # ⑦ 释放 TQ 里这一步的数据
+        → global_steps += 1
+```
+
+**第 ⑦ 步的 `tq.kv_clear` 是最容易被忽略但最要命的一步**：TQ 用来存轨迹的对象**不会自己过期**（回忆 `TQ.md`：Mooncake 侧 eviction 被关掉、SimpleStorage 是计数配额），所以每步必须显式 `kv_clear`，否则**几十步内就会把存储写满**。
+
+### 3. 具体数值样例
+
+用项目自己打的计时器名，演算一个 step 的时间线（数字取自 `TQ_PERF_COMPARE_AND_FIX.md` 的量级与本次阅读到的代码结构，标注为**示意**）：
+
+```text
+环境：单机 16 卡（昇腾 NPU），ppo_mini_batch_size=32，rollout.n=4，
+      batch ≈ 245 个 triplet（pad 后为 128 的倍数），micro_batch_size_per_gpu=4
+
+t0.0  gen_wake_replicas      ≈ 1~3 s     vLLM 醒来（权重 + KV cache 上显存）
+t0.1  gen_set_up             ≈ 1~2 s     32×4=128 个 rollout 入 store + 128 条 running 屏障写 TQ
+t0.2  gen_replay_sample      = ？        ★ 忙等：agent 真正跑完 rollout 的时间
+                                         （poll_interval=3.0 s，所以至少有 ~1.5 s 的探测延迟）
+                                         这一步包含：agent 多轮 LLM 调用 + 工具调用 + 轨迹写 TQ
+t0.3  gen_clear              < 0.5 s     clear_data_and_server
+t0.4  gen_sleep_replicas     ≈ 1~2 s     vLLM 睡下（level 2 全丢 or level 1 备份权重）
+      ⇒ gen（合计）= 上面 5 项相加 —— **其中 gen_replay_sample 是空泡主体**
+
+t1    data_prep_total        ≈ 0.01 s    按 tags 过滤 is_drop + _balance_batch（**不碰张量**）
+      reward                 ≈ 0.1~1 s   colocate reward
+t2    old_log_prob           ≈ ?         worker 从 TQ 取数（~0.5 s）+ 前向 + 写回 old_log_probs/entropy
+t3    ref                    ≈ ?         （项目实测比 baseline **快约 2 s**）
+t4    values                 ≈ ?         若 use_critic
+t5    adv                     小          取 7 个字段 → 算 advantage → 写回 advantages/returns
+t6    update_critic          ≈ ?
+t7    update_actor           ≈ ?         ★ 项目实测比 baseline **慢约 15 s**（见第 18 节根因）
+t8    update_weights         ≈ ?         项目实测比 baseline **慢约 5 s**
+
+【TQ 读写次数（一个 step，粗算）】
+  下行：1 次 kv_put × 128（running 屏障）
+  worker 侧取数：old_log_prob / ref / values / update_actor 各 1 次 kv_batch_get（每个 worker rank）
+  中间结果写回：old_log_probs+entropy、advantages+returns、（可选）values → 3~5 次 kv_batch_put
+  结束清理：1 次 kv_clear（128 个 key）
+  ⇒ **一个 step 有 10 次以上的 TQ 批量往返**，每次都要跨进程/可能跨机
+
+【每阶段的 GPU 归属】
+  gen 段：GPU 归 vLLM（训练侧 offload 在 CPU）
+  训练段：GPU 归 FSDP（vLLM 已 sleep）
+  update_weights 段：两边都在动（vLLM 醒着收权重、训练侧还要取 state_dict）
+  ⇒ 这就是共卡的"接力棒"模型，任何一段拖长都直接变成空泡
+```
+
+> **面试一句话总结**：项目 TQ 化训练循环的核心是 **`tqbridge`（元数据/数据分离）+ `ReplayBuffer`（屏障轮询）+ `KVBatchMeta`（只有 keys/tags）**——`tqbridge` 在 worker 方法调用前后用 `_meta_to_realdata` / `_update_meta_with_output` 把张量从 TQ 取来再写回，**跨进程只传 keys 和 `extra_info`**；下行时 daemon 用 `tq.kv_put(tag={"global_steps","status":"running"})` 写"running 屏障"，agent 完成后 `tq.kv_batch_put(keys, fields, tags)` 把轨迹和 `is_drop`/`seq_len` tag 一起写进 TQ；`ReplayBuffer` 用后台线程轮询 `tq.kv_list()`（只拉 key+tag），`sample()` 忙等到该 `global_steps` 的所有记录不再是 running——**这段 `while True: time.sleep(3.0)` 就是共卡方案里最直接的空泡**；`_train_step` 是九段式（wake → set_up → **sample 忙等** → clear → sleep → reward → 过滤/balance → old_log_prob/ref/values → adv → critic/actor），外层 `fit` 每步还会 `update_weights` 同步权重并 `tq.kv_clear` 显式释放 TQ 数据（**不 clear 会把存储写满**）。
+
+---
+
+## 17. 训练侧每一步的内部细节：micro-batch → forward → loss → backward → clip → step
+
+### 1. 现有问题：`update_actor` 里面到底发生了什么
+
+`_update_actor` 在 driver 上只是"塞超参 + 交给 worker"，真正的训练全在 worker 的 `TrainingWorker` 里。面试问"每一步训练细节"时，要能按顺序说出：**mini-batch 怎么分、micro-batch 怎么分、梯度累积靠什么、loss 怎么组合、clip 和 step 在哪、lr 什么时候走**。
+
+### 2. 方法论：五层调用栈，逐层落实到行号
+
+**第 1 层：`TrainingWorker.train_mini_batch` —— 按 mini-batch 循环，`epochs` 个 epoch**（`verl-v0.8.0/verl/workers/engine_workers.py:234-321`）：
+
+```python
+def train_mini_batch(self, data: TensorDict) -> TensorDict:
+    maybe_fix_3d_position_ids(data)
+    batch_size_per_dp = data.shape[0]
+    disable_auto_offload = tu.pop(data, key="disable_auto_offload", default=False)
+    mini_batch_size = tu.pop(data, key="mini_batch_size", default=None)
+    num_mini_batch = tu.pop(data, key="num_mini_batch", default=None)
+    epochs = tu.pop(data, key="epochs", default=1)
+    seed = tu.pop(data, key="seed", default=42)
+    ...
+    if mini_batch_size is None:
+        assert batch_size_per_dp % num_mini_batch == 0
+        mini_batch_size_per_gpu = batch_size_per_dp // num_mini_batch
+    else:
+        assert mini_batch_size % self.engine.get_data_parallel_size() == 0
+        mini_batch_size_per_gpu = mini_batch_size // self.engine.get_data_parallel_size()
+
+    dataloader = tu.make_iterator(data, mini_batch_size=mini_batch_size_per_gpu,
+                                  epochs=epochs, seed=seed + self.engine.get_data_parallel_rank(), ...)
+    with (self.engine.train_mode(disable_auto_offload=disable_auto_offload), Timer(name="train_batch", logger=None)):
+        output_lst = []
+        total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+        for batch_idx, mini_batch_td in enumerate(dataloader):
+            ...
+            tu.assign_non_tensor(mini_batch_td, global_token_num=NonTensorData(global_token_num),
+                                 update_lr_scheduler=batch_idx == total_num_iterations - 1,
+                                 disable_auto_offload=True)
+            actor_output = self.train_batch(mini_batch_td)
+            output_lst.append(actor_output)
+```
+
+**三个要点**：① **`mini_batch_size` 是全局值，要除以 `data_parallel_size` 才是每卡值**（`mini_batch_size_per_gpu`）；② **`train_mode` 在这一层进出**——所以 onload/offload 每个 `train_mini_batch` 只发生一次（内部都 `disable_auto_offload=True`）；③ **`update_lr_scheduler` 只在最后一个 iteration 为 True**——lr scheduler 每个 `update_actor` 只走一步，而不是每个 mini-batch 走一步。
+
+**第 2 层：`TrainingWorker.train_batch` —— 一次 mini-batch 的训练 + 记录 lr 和耗时**（`engine_workers.py:325-377`）：
+
+```python
+with (self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+      Timer(name="train_batch", logger=None) as timer):
+    output = self.engine.train_batch(data, loss_function=self.loss_fn)
+delta_time = timer.last
+
+update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
+if update_lr_scheduler:
+    lr = self.engine.lr_scheduler_step()          # ← lr_scheduler.step() 在这里发生
+...
+output["metrics"]["lr"] = lr
+final_output = self._postprocess_output(output, global_token_num=global_token_num,
+                                       delta_time=delta_time, forward_only=False, ...).cpu()
+```
+
+**第 3 层：`BaseEngine.train_batch` —— 四步骨架**（`workers/engine/base.py:112-131`）：
+
+```python
+def train_batch(self, data: TensorDict, loss_function: Callable) -> Any:
+    maybe_fix_3d_position_ids(data)
+
+    self.optimizer_zero_grad()                                          # ① 清梯度
+    outputs = self.forward_backward_batch(data, loss_function, forward_only=False)   # ② 前向+反向
+    grad_norm = self.optimizer_step()                                   # ③ clip + step
+    if self.is_mp_src_rank_with_outputs():
+        assert "grad_norm" not in outputs["metrics"]
+        outputs["metrics"]["grad_norm"] = grad_norm
+    return outputs
+```
+
+**第 4 层：`forward_backward_batch` —— micro-batch 切分 + 逐块前向反向（梯度累积在这里）**（`workers/engine/fsdp/transformer_impl.py:617-654`）：
+
+```python
+def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
+    tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
+
+    # compute num_tokens in global batch for loss normalization
+    batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+    torch.distributed.all_reduce(batch_num_tokens, op=torch.distributed.ReduceOp.SUM,
+                                 group=self.get_data_parallel_group())        # ① 全局 token 数（跨 DP）
+    tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+    tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+
+    micro_batches, indices = prepare_micro_batches(
+        data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True)   # ② 切 micro-batch
+
+    output_lst = []
+    ctx = torch.no_grad() if forward_only else nullcontext()
+    scaler = getattr(self, "scaler", None)
+    for micro_batch in micro_batches:
+        with ctx:
+            loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function,
+                                                forward_only=forward_only)     # ③ forward + loss
+            if not forward_only:
+                if scaler is not None:
+                    scaler.scale(loss).backward()                              # ④ AMP 路径
+                else:
+                    loss.backward()                                            # ④ 普通路径
+        output_lst.append(meta_info)
+    return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+```
+
+**四个必须能说出口的细节**：
+
+| 细节 | 说明 |
+|---|---|
+| **梯度累积靠什么** | **没有 `no_sync()`**——FSDP 路径里**不存在** `no_sync` 包裹（`no_sync` 只在 Megatron 路径出现），累积语义完全由"**micro-batch 之间不 `zero_grad`、只在 `train_batch` 开头清一次**"保证；每个 micro-batch 的反向都会触发 FSDP 自己的 reduce-scatter |
+| **`batch_num_tokens` 为什么 all_reduce** | loss 归一化要用**全局**有效 token 数（跨所有 DP rank），否则各 rank 的 loss 尺度不一致，梯度会被错误加权 |
+| **`sp_size` 为什么要 assign** | Ulysses 序列并行下，micro-batch 切分要按 SP 组对齐 |
+| **`forward_only` 走 `torch.no_grad()`** | ref log prob / log prob 计算复用同一个 `forward_backward_batch`，靠 `ctx` 切换 |
+
+**第 5 层：`optimizer_step` —— unscale → clip → step（含"梯度非有限就跳过更新"）**（`fsdp/transformer_impl.py:665-711`）：
+
+```python
+def optimizer_step(self):
+    assert self.optimizer_config.clip_grad is not None
+    scaler = getattr(self, "scaler", None)
+
+    # Unscale gradients before clip so the clip threshold is applied to true gradient
+    # magnitudes, not scaled ones. scaler.step() will skip the update if any grad is inf/nan.
+    if scaler is not None:
+        scaler.unscale_(self.optimizer)
+
+    if isinstance(self.module, FSDP):
+        grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)          # FSDP1
+    elif isinstance(self.module, FSDPModule):
+        grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=self.optimizer_config.clip_grad)  # FSDP2
+    else:
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.module.parameters(), max_norm=self.optimizer_config.clip_grad)
+
+    if isinstance(grad_norm, DTensor):
+        grad_norm = grad_norm.full_tensor()
+
+    if scaler is not None:
+        scaler.step(self.optimizer)                   # scaler 内部检查 inf/nan 并可能跳过
+        scaler.update()
+    else:
+        if not torch.isfinite(grad_norm):
+            print(f"WARN: grad_norm is not finite: {grad_norm}")
+            self.optimizer.zero_grad()                # ← 非有限就**跳过这一步更新**
+        else:
+            self.optimizer.step()
+    ...
+    return grad_norm.item()
+```
+
+**lr scheduler 单独一步**（`fsdp/transformer_impl.py:713-719`）：
+
+```python
+def lr_scheduler_step(self):
+    """Advance FSDP scheduler and return updated learning rate."""
+    self.lr_scheduler.step()
+    lr = self.lr_scheduler.get_last_lr()[0]  # only return the first group
+    return lr
+```
+
+**loss 的组合在 `verl-v0.8.0/verl/workers/utils/losses.py:103-142` 的 `ppo_loss` 里**（由 `engine_workers.py:580-584` 用 `partial(ppo_loss, config=actor_config)` 绑成 `self.loss_fn`）：
+
+```python
+pg_loss, pg_metrics = policy_loss_fn(old_log_prob=old_log_prob, log_prob=log_prob,
+                                     advantages=advantages, response_mask=response_mask,
+                                     loss_agg_mode=loss_agg_mode, config=config,
+                                     rollout_is_weights=rollout_is_weights)
+policy_loss = pg_loss
+
+# add entropy loss
+if entropy is not None:
+    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
+                            **config.global_batch_info)
+    policy_loss -= entropy_coeff * entropy_loss
+
+# add kl loss
+if config.use_kl_loss:
+    ref_log_prob = data["ref_log_prob"]
+    kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
+    kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode,
+                       **config.global_batch_info)
+    policy_loss += kl_loss * config.kl_loss_coef
+```
+
+以及那句 **`to_padded_tensor`**（`losses.py:85-91`）——它就是第 18 节 15 秒坑的现场：
+
+```python
+# select fields and convert to padded tensor
+fields = ["response_mask", "old_log_probs", "advantages"]
+if "rollout_is_weights" in data:
+    fields.append("rollout_is_weights")
+if "ref_log_prob" in data:
+    fields.append("ref_log_prob")
+data = data.select(*fields).to_padded_tensor()
+```
+
+### 3. 具体数值样例
+
+```text
+场景：ppo_mini_batch_size=32（全局），rollout.n=4，8 卡 DP，
+      micro_batch_size_per_gpu=4，ppo_epochs=1，grad_clip=1.0，entropy_coeff=0
+
+【一次 update_actor 的完整数字账】
+mini_batch_size_per_gpu = 32 / 8 = 4 个样本/卡/次？
+  注意：项目里传进来的 mini_batch_size 已经乘过 rollout.n：
+    _update_actor: ppo_mini_batch_size = 32 * 4 = 128（全局）
+    ⇒ mini_batch_size_per_gpu = 128 / 8 = 16（每卡每次 16 个 triplet）
+micro_batch_size_per_gpu = 4
+⇒ 每个 mini-batch 有 16 / 4 = 4 个 micro-batch（4 次前向 + 4 次反向）
+epochs = 1（PPO 通常 1；若 epochs=2 则整个 mini-batch 序列跑两遍）
+
+【执行序列（每个 mini-batch）】
+1. engine.train_mode 已在最外层进入（onload 一次）
+2. optimizer_zero_grad()                       ← 清一次
+3. for micro_batch in 4 个:
+     micro_batch → device
+     forward_step:
+       prepare_model_inputs（remove-padding 路径）
+       module(**inputs, use_cache=False)       ← 明确禁用 KV cache
+       prepare_model_outputs（算 logits → log_prob / entropy）
+       loss_function = ppo_loss:
+         to_padded_tensor(response_mask/old_log_probs/advantages/ref_log_prob)
+         pg_loss = policy_loss_fn(...)          ← clip 在 policy_loss_fn 内
+         （entropy_coeff=0 → 不算 entropy loss）
+     loss.backward()                            ← 累加梯度，不清零（= 梯度累积）
+4. optimizer_step():
+     scaler.unscale_（有 scaler 时）
+     FSDP1: module.clip_grad_norm_(1.0) / FSDP2: fsdp2_clip_grad_norm_(1.0)
+     grad_norm 非有限 → zero_grad 跳过；否则 optimizer.step()
+5. 最后一个 mini-batch 后：engine.lr_scheduler_step()   ← lr 走一步
+6. 退出 train_mini_batch → train_mode.__exit__ → zero_grad + offload 到 CPU
+
+【显存峰值估算（每卡）】
+  参数 0.375 + 梯度 0.375 + Adam 1.5 + master 0.75 ≈ 3 GB
+  + 激活（micro_batch=4，remove-padding 后按 token 数；设 4×2048 token）
+  ⇒ 这就是 micro_batch_size_per_gpu 存在的意义：**用更小的 micro-batch 换激活显存**
+
+【一个常见误解】
+  "梯度累积 = 一次大 batch" —— 数值上近似，但：
+  ① 每个 micro-batch 的 backward 都会触发 FSDP reduce-scatter（通信量不省）
+  ② 没有 no_sync，所以 4 个 micro-batch = 4 轮 all-reduce 级通信
+  ③ 真正省的是激活显存，不是通信
+```
+
+> **面试一句话总结**：训练侧是五层调用栈——`TrainingWorker.train_mini_batch`（按 mini-batch × epochs 循环，`mini_batch_size` 是全局值需除以 DP size，`train_mode` 在最外层进出一次、内层 `disable_auto_offload=True`，`update_lr_scheduler` 只在最后一次 iteration 为真）→ `TrainingWorker.train_batch`（计时 + 调 `engine.lr_scheduler_step()`）→ `BaseEngine.train_batch`（`optimizer_zero_grad` → `forward_backward_batch` → `optimizer_step`）→ `forward_backward_batch`（先 `all_reduce` 出全局 `batch_num_tokens` 供 loss 归一化，再切 micro-batch，逐块 `forward_step` + `loss.backward()`，**梯度累积靠"micro-batch 间不清零"，FSDP 路径没有 `no_sync`**）→ `optimizer_step`（`scaler.unscale_` → `clip_grad_norm_(grad_clip)` → **`grad_norm` 非有限就 `zero_grad` 跳过更新** → `optimizer.step()`）；loss 组合在 `workers/utils/losses.py` 的 `ppo_loss` 里（`pg_loss - entropy_coeff*entropy_loss + kl_loss*kl_loss_coef`），其中 `to_padded_tensor()` 那一行是下一节性能坑的现场。
+
+---
+
+## 18. 时间账：空泡在哪、TQ 方案的实测代价与修复
+
+### 1. 现有问题：共卡方案的每一分代价都要落到具体阶段上
+
+前面 12~17 节把机制讲完了，但**"到底哪里慢"必须用数字回答**。项目自己写了一份对比文档 `agent-lightning/TQ_PERF_COMPARE_AND_FIX.md`（181 行），把 TQ 化之后的训练循环与 **无 TQ 的 baseline**（`upgrade/verl-0.8.0` 分支，继承 `RayPPOTrainer`）逐阶段对比——这是本节全部数字的来源。
+
+### 2. 方法论：先定位到阶段，再定位到行
+
+**（1）对比设置**（`TQ_PERF_COMPARE_AND_FIX.md:5`）：分支 `master`（TQ 接入，`AgentLightningTrainer(PPOTrainer)`）vs 基线 `upgrade/verl-0.8.0`（无 TQ，`AgentLightningTrainer(RayPPOTrainer)`）；环境单机 16 卡（昇腾 NPU），TQ `0.1.6`，verl `release/v0.8.0`。
+
+**（2）逐阶段实测差异**（`TQ_PERF_COMPARE_AND_FIX.md:9-16`）：
+
+| 阶段 | 观测 |
+|---|---|
+| 生成 rollout | 基本相当 |
+| ref + old_log_prob | master **快约 2s** |
+| **update_actor** | master **慢约 15s** |
+| update_weights | master **慢约 5s** |
+
+**（3）先排除的四件事**（`TQ_PERF_COMPARE_AND_FIX.md:18-25`，这部分方法论很值得学）：
+
+1. **trainer 基类不同**（`PPOTrainer` vs `RayPPOTrainer`）——但两边 worker 类（`ActorRolloutRefWorker`）、FSDP engine、`ppo_mini_batch_size=32`、`rollout.n=4`、`ppo_epochs` **完全一致**；
+2. **batch 规模一致**——三元组数量两边相同（**245 左右**，pad 后都是 128 的倍数）；
+3. **TQ 读取不是瓶颈**——`update_actor` 内 worker 侧 TQ 读取**仅约 0.5s**；
+4. 于是**剩余最大差异 = 训练数据的字段布局**。
+
+**（4）根因（已定位到具体行）**：`ppo_loss` 里的 `data.select(*fields).to_padded_tensor()`（`verl/workers/utils/losses.py:85-91`）：
+
+- **baseline**：`left_right_2_no_padding` 只把 `input_ids / position_ids / loss_mask` 转成 nested，`response_mask / old_log_probs / ref_log_prob / advantages / returns / token_level_scores / rm_scores` 都是**普通 padded 张量** → `to_padded_tensor()` 是 **no-op，零成本**；
+- **master**：从 TQ 读出的数据**几乎全部是 nested**（TQ 以变长 NestedTensor 存储，`_compute_*` 阶段用 `response_from_nested / response_to_nested` 写回）→ **每个 micro-batch 都要对多个 nested 字段真转换**，加上 `index_select_tensor_dict`、`micro_batch.to(device)`、nested 求和等操作都作用在 10+ 个 nested 字段上。
+
+**原文的量化解释**（`TQ_PERF_COMPARE_AND_FIX.md:40`）：
+
+> 在昇腾 NPU 上 `torch.nested` 算子多为慢速/回退路径，4 个 micro-batch（16 样本/卡，`micro_batch_size_per_gpu=4`）的累计开销就是 ~15s。
+
+**并且它顺带解释了"为什么 infer 反而快 2s"**（`:42`）：
+
+> old_log_prob/ref 是纯前向，不吃 `ppo_loss` 的 nested→padded 路径，master 的原始变长数据还省掉了 baseline 的 pad/unpad 与 `left_right_2_no_padding` 的 GPU unpad 开销。
+
+**"update_weights 慢 5s"是另一个独立因素**（`:44`）：TQ 栈（controller + 8 个 storage unit actor + store server + llm proxy + replay buffer 轮询线程 + 每步上百次临时线程/事件循环）与 FSDP `param_offload=true / optimizer_offload=true` 的 **host 侧传输/汇聚抢 CPU 和内存带宽**。
+
+**（5）修复方案（三条，A 是主方案）**。
+
+**方案 A（推荐，最小改动）：把 loss 字段一次性转 padded**——在 `TrainingWorker.train_mini_batch` 入口（`maybe_fix_3d_position_ids` 之后）加一段，**每个 `update_actor` 只转一次**，而不是每个 micro-batch 在 `ppo_loss` 里转 4 次（`TQ_PERF_COMPARE_AND_FIX.md:118-143`）：
+
+```python
+def train_mini_batch(self, data: TensorDict) -> TensorDict:
+    """Split a batch into N mini-batches run for multiple epochs"""
+    maybe_fix_3d_position_ids(data)
+    # ---- TQ perf fix: 一次性把 loss 相关 nested 字段转 padded ----
+    # 保留 input_ids/position_ids 为 nested（引擎 remove-padding 前向路径需要），
+    # 其余按行字段转成普通 padded 张量，避免 ppo_loss/value_loss 每 micro-batch 重复转换。
+    for _key in (
+        "response_mask", "loss_mask", "old_log_probs", "ref_log_prob", "advantages",
+        "returns", "token_level_rewards", "token_level_scores", "rm_scores", "entropy",
+    ):
+        _val = data.get(_key, None)
+        if isinstance(_val, torch.Tensor) and _val.is_nested:
+            data[_key] = torch.nested.to_padded_tensor(_val, padding=0.0)
+    # ----------------------------------------------------------------
+    batch_size_per_dp = data.shape[0]
+    ...
+```
+
+要点（`:145-150`）：① `input_ids / position_ids` **保持 nested**（`prepare_model_inputs` 的 `use_remove_padding` 前向路径需要）；② `loss_mask` 转 padded 后 `batch_num_tokens = data["loss_mask"].sum()` **结果不变**（padding 补 0）；③ `ppo_loss` 的 `to_padded_tensor()` 变成 no-op，且 `index_select_tensor_dict` / `micro_batch.to(device)` 都改为作用在普通张量上；④ 该函数**被 actor 和 critic 共用**，一处改动两边受益。
+
+**方案 B（可选）：`update_actor` 只读训练必需字段**——借 `KVBatchMeta.fields` + `tqbridge` 的 `select_fields` 限定字段（`verl/utils/transferqueue_utils.py:270` 的 `kv_batch_meta2batch_meta` 已支持），减少每 worker 物化的 nested 字段数量。
+
+**方案 C（update_weights 慢 5s 的缓解）**（`:161-166`）：
+- TQ controller / storage unit 限定独立 CPU（placement group / `num_cpus`）；
+- `SimpleStorage.num_data_storage_units` 从 8 降到 1~2（减少 ZMQ 序列化与 host 线程）；
+- `TQ_NUM_THREADS` 调低（默认 8）；
+- 对照实验：临时关掉 store 的 `_update_tq_reward_async` 与 `ReplayBuffer.poll_interval`，看 `update_weights` 是否恢复 baseline，确认是否 CPU 竞争。
+
+**（6）预期收益与验证闭环**（`:168-181`）：`update_actor` 从 ~17s 回到 ~2-5s；`update_weights` 目标 -5s；同时保住 ref/old_log_prob 的 -2s 与 TQ 零拷贝传输优势。验证要用**同一套插桩**再跑 3~5 步，并确认 `[BENCH-LOSS] to_padded_tensor` 降到 ~0.000s、训练指标（`actor/loss`、`actor/grad_norm`、`global_seqlen/*`）与修复前一致——**防止转换引入数值偏差**。
+
+### 3. 具体数值样例
+
+```text
+【TQ 方案的净账（16 卡，单 step）】
+  推理 rollout：            ≈ 相当（没有明显变化）
+  ref + old_log_prob：      -2 s   （变长数据省掉 pad/unpad，纯前向不吃 nested→padded）
+  update_actor：           +15 s   （4 个 micro-batch × nested→padded 真转换，NPU 上 nested 走慢路径）
+  update_weights：          +5 s   （TQ 栈的 host 线程 + FSDP offload 的 host 带宽竞争）
+  ─────────────────────────────────
+  合计：                   +18 s/step（TQ 化带来的净代价）
+
+【修复后的目标】
+  update_actor：17 s → 2~5 s（方案 A：一次性转 padded，省掉 4× 的重复转换）
+  update_weights：-5 s（方案 C：把 TQ 栈的 CPU 占用与 offload 隔开）
+  净值：约 -2 s（即 TQ 化后**比 baseline 还快 2s**，且保留零拷贝传输）
+
+【空泡分类（共卡视角，对回 Colocate-vs-Disaggregate.md）】
+  ① 长尾空泡：gen_replay_sample 里等"最慢的那个 rollout"
+     → 项目用 poll_interval=3.0 s 轮询，平均多等 1.5 s；TQ 方案靠 _balance_batch
+       的 upsample + is_padding tag 把长尾样本"复制补齐"，但**等待本身没消除**
+  ② 切换空泡：gen_wake_replicas + gen_sleep_replicas（vLLM 醒/睡各 1~3 s）
+     → 这就是共卡 baseline 的**固有成本**，只能靠减少切换次数（one-step-off / 部分 rollout）缓解
+  ③ 同步空泡：update_weights（全量 3 GB，v0.8 **无增量同步**）+ 屏障轮询的探测延迟
+     → 修复方向：delta 同步（checkpoint_engine 目前没有）、把 poll_interval 改成事件通知
+
+【结论：共卡 baseline 的天花板在哪】
+  共卡 = 推理 + 切换 + 训练 串行 ⇒ GPU 利用率上限 ≈ 1/(1 + 切换/计算)
+  若切换开销占比 10% → 利用率上限 ~90%；占比 30% → ~77%
+  要突破这个上限，就必须让"推理与训练重叠"⇒ 回到分卡/异步路线
+  （这正是 Colocate-vs-Disaggregate.md 里 7 种方法要解决的问题）
+```
+
+**三个结论**：① **共卡是 baseline，不是终点**——它的固有成本是"推理与训练串行 + 每次切换的显存交接"；② **TQ 化的代价是可定位、可修复的**：`update_actor +15s` 的根因被精确到了 `losses.py:85-91` 的 `to_padded_tensor()` 与"TQ 存的是 nested 而 baseline 存的是 padded"这一字段布局差异，修复只需在 `train_mini_batch` 入口转一次；③ **排查方法论比结论更值钱**：先排除"基类/规模/TQ 读取"三个变量，再把差异收敛到"同一行代码在不同数据布局下的行为"，最后给出最小改动的修复与验证闭环（含数值一致性检查）。
+
+> **面试一句话总结**：项目用 `TQ_PERF_COMPARE_AND_FIX.md` 做了一次教科书式的性能归因——先排除 trainer 基类、batch 规模（两边约 245 个 triplet）、TQ 读取（仅 0.5s）三个变量，把差异收敛到"**TQ 以 nested 存储而 baseline 以 padded 存储**"这一字段布局差异上，根因精确到 `verl/workers/utils/losses.py:85-91` 的 `to_padded_tensor()`：baseline 是 no-op、TQ 版每个 micro-batch 都要真转换 10+ 个 nested 字段，在 NPU 上 4 个 micro-batch 累计 **~15s**；`update_weights +5s` 则是 TQ 栈的 host 线程/带宽与 FSDP `param_offload` 的竞争；修复方案 A 是在 `train_mini_batch` 入口**一次性**把 loss 相关字段转 padded（保留 `input_ids/position_ids` 为 nested），预期 `update_actor` 回到 2~5s、整体比 baseline 还快 ~2s——**共卡的空泡分三类：长尾（等最慢 rollout，`poll_interval=3.0s` 的轮询延迟）、切换（wake/sleep 各 1~3s）、同步（全量 3 GB 权重无增量）**，而共卡的利用率上限就是 $1/(1+\text{切换}/\text{计算})$，想突破就必须回到分卡/异步路线。
+
+---
+
 ## 附：组件速查表
 
 | 组件 | 代码位置（v0.3.0） | 角色 | 关键接口 / 类 |
@@ -1930,6 +3469,17 @@ async def otlp_logs():
 | Trainer | `trainer/` | 总装：接线所有组件 | `Trainer.fit()` |
 | ExecutionStrategy | `execution/` | 部署形态：线程 or 进程/机器 | `SharedMemoryExecutionStrategy` / `ClientServerExecutionStrategy` |
 | verl 集成 | `verl/` + `algorithm/verl/` | RL 训练后端 | `AgentLightningTrainer(RayPPOTrainer)`、`AgentModeDaemon`、`VERL(Algorithm)` |
+
+> 下面 5 行属于**第四部分（共卡 / verl 0.8.0 engine 架构 + 项目 TQ 接入仓）**，与上表的 v0.3.0 组件不属于同一份代码：
+
+| 组件（v0.8.0 / TQ 仓） | 代码位置 | 角色 | 关键接口 / 类 |
+|---|---|---|---|
+| RolloutMode | `verl/workers/rollout/replica.py:54` | 推理与训练的三种共存方式 | `HYBRID`（同进程共卡，切权重）/ `COLOCATED`（同卡分进程，不切权重）/ `STANDALONE`（分卡） |
+| Training engine | `verl/workers/engine/base.py:112` + `verl/workers/engine/fsdp/transformer_impl.py` | 训练引擎：onload/offload + 前向反向 | `BaseEngine.train_batch`、`engine.to(device, model, optimizer, grad)`、`BaseEngineCtx._context_switch`、`FSDPEngine.optimizer_step` / `get_per_tensor_param` |
+| CheckpointEngine | `verl/checkpoint_engine/base.py:96` | 训练→推理的权重同步抽象（6 个后端） | `CheckpointEngineManager`、`sleep_replicas` / `wake_up_replicas` / `release_kv_cache_replicas` / `update_weights`、`split_weight_chunks` |
+| vLLM sleep/wake | `verl/workers/rollout/vllm_rollout/vllm_async_server.py:604` | 推理侧显存交接 | `wake_up(tags)` / `sleep()` / `_sleep_hybrid()`；vLLM 侧落到 `CuMemAllocator.sleep(offload_tags)` |
+| TQ bridge / ReplayBuffer | `verl/utils/transferqueue_utils.py:298` + `verl/trainer/main_ppo_sync.py:194` | TQ 原生训练循环（元数据/数据分离） | `tqbridge`、`_meta_to_realdata` / `_update_meta_with_output`、`ReplayBuffer.sample`、`KVBatchMeta` |
+| TQ 版 AGL Trainer | `agent-lightning/agentlightning/verl/trainer.py:165` | 继承 `main_ppo_sync.PPOTrainer` 并重写训练循环 | `AgentLightningTrainer._train_step`（九段式 + 分阶段计时）/ `fit` |
 
 ### 通信方式速查（哪些是 HTTP、哪些是实例直接调用）
 
