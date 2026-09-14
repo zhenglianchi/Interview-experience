@@ -2845,19 +2845,87 @@ if global_steps is not None and is_train:
 
 **"running 屏障"是很漂亮的设计**：trainer 不需要知道 agent 什么时候完成，只需要知道"TQ 里这批 rollout_id 的 status 什么时候不再是 running"。**等待状态本身也放进了数据面**，于是等待可以变成"带超时的轮询"而不是"一次阻塞"。
 
-**（3）上行：daemon 把轨迹字段与 tags 批量写入 TQ。** `daemon.py:1108-1126`：
+**（3）上行：轨迹其实是"双写"——LLMProxy 先以 `reward=0` 写入，Store 再覆写 reward。** 这里有一个**极易搞错**的地方：daemon 里确实有个 `get_train_data_batch()` 会构造完整 nested fields 并 `tq.kv_batch_put`（`agentlightning/verl/daemon.py:849-1163`，写入点 `:1111`），但**在 TQ 版训练路径里它已经没有调用者**（只剩 `contrib/` 的 legacy `DataProto` 路径在调），属于改造后遗留的代码——**别把它当成轨迹的来源**。真正的写入者是 **LLMProxy**（`agentlightning/llm_proxy.py:529-569` → `_write_tq_data_zero_reward`）：
 
 ```python
-tags.append({"seq_len": prompt_len + response_len, "is_drop": is_drop_list[i]})
-tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=tags)      # 轨迹 + tag 一起进 TQ
+# ===== 方案6b：直接 adapt 子树 spans，写入 TQ (reward=0) =====
+triplets = proxy._adapter.adapt(source_normalized)
 ...
-batch_meta = KVBatchMeta(
-    keys=...,
-    tags=...,
-    partition_id=partition_id,
-    ...
+fut = asyncio.run_coroutine_threadsafe(
+    _write_tq_data_zero_reward(rollout_id, triplets, proxy._max_prompt_length,
+                               proxy._max_response_length, data_id, global_steps, turn_offset=turn_offset),
+    loop,
 )
 ```
+
+函数 docstring 把"双写"的职责划分写得非常明确（`llm_proxy.py:68-77`；真正写入点 `:142`）：
+
+```python
+async def _write_tq_data_zero_reward(...) -> None:
+    """Write triplet data to TQ with reward=0 (Scheme 6b).
+
+    The Store will later update the reward when it detects a reward span.
+    """
+```
+
+```python
+await tq.async_kv_batch_put(keys=keys, partition_id="train", fields=fields, tags=tags)
+```
+
+字段集合由 proxy 侧定义（`llm_proxy.py:112-124`，**11 个字段**）：
+
+```python
+field = {
+    "prompts": torch.tensor(prompt_ids, dtype=torch.long),
+    "responses": torch.tensor(response_ids, dtype=torch.long),
+    "input_ids": torch.tensor(seq_ids, dtype=torch.long),
+    "attention_mask": torch.ones(seq_len, dtype=torch.long),
+    "position_ids": torch.arange(seq_len, dtype=torch.long),
+    "token_level_scores": token_level_scores_tensor,
+    "rm_scores": token_level_scores_tensor,
+    "response_mask": torch.ones(response_len, dtype=torch.long),
+    "loss_mask": torch.ones(response_len, dtype=torch.long),
+    "uid": data_id,
+    "num_turns": 1,
+}
+```
+
+**第二写：Store 检测到 reward span 后覆写张量 + 写 `finished` 屏障**（`agentlightning/store/collection_based.py:1271` 覆写 `token_level_scores/rm_scores`、`:1280` 写屏障；异常兜底在 `:1133`）：
+
+```python
+await tq.async_kv_batch_put(keys=keys_to_update, partition_id="train", fields=fields,)   # 覆写 reward
+...
+await tq.async_kv_put(key=rollout_id, partition_id="train", tag=barrier_tag,)           # status="finished"
+```
+
+于是 `ReplayBuffer.sample()` 的屏障判定有了完整的触发链：
+
+```text
+daemon 写 running 屏障（daemon.py:617）
+  → LLMProxy 在 _maybe_flush 里 adapt 出 triplet，以 reward=0 写入轨迹字段（llm_proxy.py:142）
+  → Store 发现 reward span，覆写 token_level_scores/rm_scores 并写 finished 屏障（collection_based.py:1271/1280）
+  → ReplayBuffer 看到该 global_steps 已无 running → sample() 返回 KVBatchMeta
+```
+
+**tag 由 proxy 侧一并写入**（`llm_proxy.py:128-133`）：`{"global_steps", "status": "success", "seq_len", "is_drop"}`。
+
+**顺带把 `KVBatchMeta` 的结构钉死**（定义在 **TQ 仓**：`transferqueue/transfer_queue/metadata.py:880`，本仓只 import）——**五个字段 + 一个只读属性**：
+
+```python
+@dataclass
+class KVBatchMeta:
+    """Records the metadata for KV interface."""
+
+    keys: list[str] = dataclasses.field(default_factory=list)          # 每个样本的 key
+    tags: list[dict] = dataclasses.field(default_factory=list)         # 样本级 tag
+    partition_id: str | None = None                                    # 可选分区（本仓恒为 "train"）
+    fields: list[str] | None = None                                    # 可选字段名列表
+    extra_info: dict[str, Any] | None = dataclasses.field(default_factory=dict)  # 批次级附加信息
+```
+
+`__post_init__` 会校验 **keys 与 tags 等长、key 不重复、fields 不重复**（`metadata.py:898-912`），并有 `size` 属性（`len(keys)`）。**注意 `extra_info` 承担的是"张量以外的超参"**——第 17 节会看到 `mini_batch_size` / `epochs` / `seed` / `temperature` 全走这里。
+
+**key 的命名约定**是 `f"{data_id}_{rollout_id}_{turn_index}"`（`llm_proxy.py:126`），padding 样本是 `f"{pad_uid}_{local_idx}_0"`（`verl/trainer/ppo/padding_utils.py:173`）——所以下游能用 `key.rsplit("_", 2)` 反解出三段（`main_ppo_sync.py:1119-1124` 就是这么做的）。
 
 **tag 里塞了 `is_drop` 和 `seq_len`**——于是后面 `_train_step` 里"过滤超长 prompt"和"按长度做负载均衡"**都不用把张量拉回来**，只看 tags 就够了（`trainer.py:361-372`）：
 
@@ -2940,9 +3008,15 @@ class ReplayBuffer:
                 gen_replay_sample / gen_clear / gen_sleep_replicas）
 
 第 2 段 [reward]：_compute_reward_colocate(batch)（colocate reward worker）
+         ★ 注：只有 reward_loop_manager.reward_loop_worker_handles is None 时才会走到；
+           verl 侧该函数目前直接 raise NotImplementedError（main_ppo_sync.py:1207-1210），
+           所以**正常路径下这一段实际不触发**（reward 已由 Store 写进 TQ）
 
 第 3 段：按 tags 过滤 is_drop（不拉张量）+ _balance_batch（upsample 复制样本做负载均衡，
          padding 样本打 is_padding tag）—— 替代了老版本的 pad → compute → unpad → floor_pad
+         ★ 注意这一步**自己也会往 TQ 写**：upsample 出来的 padding 样本要通过
+           tq.kv_batch_put 写进 TQ（verl/trainer/ppo/padding_utils.py:179，
+           tag 里带 is_padding=True，见 :123），否则后续 worker 按 key 取不到这些样本
 
 第 4 段 [old_log_prob]：_compute_old_log_prob(batch, metrics)
 第 5 段 [ref]：_compute_ref_log_prob(batch, metrics)（若 use_reference_policy）
@@ -3040,6 +3114,38 @@ _load_checkpoint()
 
 **第 ⑦ 步的 `tq.kv_clear` 是最容易被忽略但最要命的一步**：TQ 用来存轨迹的对象**不会自己过期**（回忆 `TQ.md`：Mooncake 侧 eviction 被关掉、SimpleStorage 是计数配额），所以每步必须显式 `kv_clear`，否则**几十步内就会把存储写满**。
 
+**（10）TQ 的生命周期与配置从哪来**（`agentlightning/verl/entrypoint.py`）：
+
+```python
+# Always re-init to ensure correct namespace for TQ sharing
+if ray.is_initialized():
+    ray.shutdown()
+...
+ray.init(
+    address=os.environ.get("RAY_ADDRESS", "auto"),
+    namespace=os.environ.get("RAY_NAMESPACE", "transfer_queue"),      # ← 强制同名 namespace，才能共享 TQ
+    runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",
+                             "VLLM_LOGGING_LEVEL": "WARN"}},
+    num_cpus=num_cpus,
+)
+```
+
+```python
+import transfer_queue as tq
+pprint(OmegaConf.to_container(config, resolve=True))
+OmegaConf.resolve(config)
+tq.init(config.transfer_queue)          # ← TQ 的唯一初始化点（配置来自 config.transfer_queue）
+...
+trainer.init_workers()
+trainer.fit()
+finally:
+    tq.close()
+```
+
+**两个值得记的工程点**：① **Ray 必须重 init 并把 namespace 固定成 `transfer_queue`**——因为 TQ 的 controller/storage 是**按 namespace 找的**，训练进程、rollout server、proxy 三方必须落在同一个 namespace 才能共享同一套 TQ；② **TQ 的配置不在 `config.yaml` 里**，而由 `start_script/config_mapping.json:125-149` 注入（`transfer_queue.enable=true`、`metrics.enabled=true`、`backend.storage_backend=SimpleStorage`、`total_storage_size=100000`、**`num_data_storage_units=8`**）——第 18 节方案 C 里"把 storage unit 从 8 降到 1~2"改的就是这个值，它和 `TQ.md` 第 6 节讲的 SimpleStorage 内存分配是同一组参数。
+
+**一个必须说明的版本差异**：本仓 `trainer.py:40` 从 `verl.single_controller.ray.base` import 了 `reset_data_transit_timings / get_data_transit_timings`（`_train_step` 里用来把 dispatch/execute/ray_get/collect 四段耗时打出来），**但本地 `verl-v0.8.0` 快照里没有这两个函数**（grep `transit` 无命中）——说明**本地快照与实机训练用的 verl 不是完全同一版**，因此本节的跨仓行号（`verl-v0.8.0/...`）是"结构一致、行号可能微偏"的参考，`agent-lightning/...` 的行号则直接来自本仓、可信。
+
 ### 3. 具体数值样例
 
 用项目自己打的计时器名，演算一个 step 的时间线（数字取自 `TQ_PERF_COMPARE_AND_FIX.md` 的量级与本次阅读到的代码结构，标注为**示意**）：
@@ -3081,7 +3187,7 @@ t8    update_weights         ≈ ?         项目实测比 baseline **慢约 5 s
   ⇒ 这就是共卡的"接力棒"模型，任何一段拖长都直接变成空泡
 ```
 
-> **面试一句话总结**：项目 TQ 化训练循环的核心是 **`tqbridge`（元数据/数据分离）+ `ReplayBuffer`（屏障轮询）+ `KVBatchMeta`（只有 keys/tags）**——`tqbridge` 在 worker 方法调用前后用 `_meta_to_realdata` / `_update_meta_with_output` 把张量从 TQ 取来再写回，**跨进程只传 keys 和 `extra_info`**；下行时 daemon 用 `tq.kv_put(tag={"global_steps","status":"running"})` 写"running 屏障"，agent 完成后 `tq.kv_batch_put(keys, fields, tags)` 把轨迹和 `is_drop`/`seq_len` tag 一起写进 TQ；`ReplayBuffer` 用后台线程轮询 `tq.kv_list()`（只拉 key+tag），`sample()` 忙等到该 `global_steps` 的所有记录不再是 running——**这段 `while True: time.sleep(3.0)` 就是共卡方案里最直接的空泡**；`_train_step` 是九段式（wake → set_up → **sample 忙等** → clear → sleep → reward → 过滤/balance → old_log_prob/ref/values → adv → critic/actor），外层 `fit` 每步还会 `update_weights` 同步权重并 `tq.kv_clear` 显式释放 TQ 数据（**不 clear 会把存储写满**）。
+> **面试一句话总结**：项目 TQ 化训练循环的核心是 **`tqbridge`（元数据/数据分离）+ `ReplayBuffer`（屏障轮询）+ `KVBatchMeta`（只有 keys/tags/partition_id/fields/extra_info）**——`tqbridge` 在 worker 方法调用前后用 `_meta_to_realdata` / `_update_meta_with_output` 把张量从 TQ 取来再写回，**跨进程只传 keys 和 `extra_info`**；下行时 daemon 只做两件事（`store.enqueue_many_rollouts` 入队 + `tq.kv_put(tag={"global_steps","status":"running"})` 写 **running 屏障**），**真正的轨迹写入者是 LLMProxy 的"双写"**——`_maybe_flush` 里 `adapter.adapt(triplets)` 后 `_write_tq_data_zero_reward` 以 **reward=0** 写入 11 个字段（`llm_proxy.py:142`），**Store 再检测 reward span 覆写 `token_level_scores/rm_scores` 并写 `finished` 屏障**（`collection_based.py:1271/1280`）；注意 daemon 的 `get_train_data_batch()` 虽然也 `tq.kv_batch_put`，但**在 TQ 路径里已无调用者（死代码），别当成轨迹来源**；`_balance_batch` 的 upsample padding 样本也要写回 TQ（`padding_utils.py:179`）；`ReplayBuffer` 用后台线程轮询 `tq.kv_list()`（只拉 key+tag），`sample()` 忙等到该 `global_steps` 的所有记录不再是 running——**这段 `while True: time.sleep(3.0)` 就是共卡方案里最直接的空泡**；`_train_step` 是九段式（wake → set_up → **sample 忙等** → clear → sleep → reward → 过滤/balance → old_log_prob/ref/values → adv → critic/actor），外层 `fit` 每步还会 `update_weights` 同步权重并 `tq.kv_clear` 显式释放 TQ 数据（**不 clear 会把存储写满**）。
 
 ---
 
