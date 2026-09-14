@@ -2,13 +2,15 @@
 
 > **一句话定位**：GPU 是 AI Infra 的物理底座——本文回答"一块 GPU 由什么组成、哪些组件负责计算、数据怎么在芯片里流动、性能天花板卡在哪"，以及"面试官问硬件时到底在考什么"。
 
-AI Infra 面试里硬件部分的特点是：**门槛不高但极易露怯**——说得出"SM/Tensor Core/HBM"这三个词的人很多，但能把"SM 里面到底有什么、哪些是计算单元、为什么 Tensor Core 快、显存带宽怎么算、MFU 为什么只有 30%"讲成一条链的人很少。本文按"从芯片到算子"的顺序拆成 10 个技术点，再用一节串讲把一次 GEMM 的完整数据通路走一遍，最后给一份高频题检查清单。
+AI Infra 面试里硬件部分的特点是：**门槛不高但极易露怯**——说得出"SM/Tensor Core/HBM"这三个词的人很多，但能把"SM 里面到底有什么、哪些是计算单元、为什么 Tensor Core 快、显存带宽怎么算、MFU 为什么只有 30%"讲成一条链的人很少。本文按"从芯片到算子"的顺序拆成 **12 个技术点**（含 CUDA 并发与 GPUDirect），再用一节串讲把一次 GEMM 的完整数据通路走一遍，最后给一份高频题检查清单。
 
 **范围与分工**（避免与仓库内其他文档重复）：
 
 | 主题 | 本文 | 去哪看 |
 |---|---|---|
-| GPU 芯片内部结构、计算单元、存储层次、性能模型 | **✅ 主体** | — |
+| GPU 芯片内部结构、计算单元、存储层次、性能模型 | **✅ 主体（§1–§10）** | — |
+| **CUDA Stream / 并发重叠 / Hyper-Q / CUDA Graphs** | **✅ §11** | — |
+| **GPUDirect（P2P / RDMA / GDS）、门铃机制、pinned / zero-copy / UVA / UM** | **✅ §12（GPU 侧机制）** | 网络侧结论（GDR/GDS 的收益、`NCCL_NET_GDR_LEVEL`、`cuFile`）见 `Communication.md` 第 7 节 |
 | NVLink / PCIe / CXL / InfiniBand / RoCE / HCCL 等**互联技术** | 只给带宽量级与"五个量"中的一项 | `Communication.md` |
 | DP/TP/PP/EP/FSDP 等**并行切分** | 只讲硬件为什么支持 | `Parallel.md` |
 | Kernel 级算子实现（PagedAttention / FlashAttention） | 只讲它们在硬件上做了什么 | `VLLM.md` / `Speculative-Decoding.md` |
@@ -891,13 +893,278 @@ GB200(NVL72)  Blackwell 186 GB HBM3E  8.0 TB/s   ~2500 (5000)         1.8 TB/s  
 
 ---
 
-# 二、串讲：把一块 GPU 的十个点串成一条数据通路
+## 11. CUDA Stream、并发与重叠：让拷贝和计算同时跑
 
-## 11. 一次 GEMM 的完整硬件旅程（10 个技术点如何协同）
+### 1. 现有问题：单 stream 下 GPU 有一半时间在"等"
 
-### 1. 现有问题：十个点都懂了，但讲不成一条线
+看 `nvidia-smi` 会发现一个奇怪现象：kernel 在跑的时候**拷贝引擎（Copy Engine）闲着**，而做 H2D 拷贝的时候**SM 全闲着**。更糟的是多进程共享一张卡时，两个进程的任务会莫名其妙**串行**。这两个问题的根源都是"并发没有被用起来"：
 
-面试的最后一问往往是开放式的："**从你写完一个 GEMM 到它跑在硬件上，数据经过了哪些地方？**"或者"**给你一台 8 卡机器，怎么榨干性能？**"。这两问考的不是某个知识点，而是**把硬件串成数据通路的能力**。这一节就是把第 1~10 节穿起来。
+1. **同一 stream 内的命令严格有序**——上一个 kernel 跑完才启动下一个，拷贝也排队；
+2. **CPU 侧发起太慢**——每个 kernel launch 要几微秒，几百个小 kernel 就把 GPU 喂不饱；
+3. **假串行（false serialization）**——Fermi 时代主机到 GPU 只有**一条硬件工作队列**，即使你开了多个 stream，硬件层面也只能一个个来。
+
+### 2. 方法论：三种引擎、两个"并发门槛"、一套同步原语
+
+**（1）Stream 的本质是"主机侧的命令队列"。** `cudaStream_t` 就是一条 FIFO 队列，**同一队列内的 kernel/拷贝按提交顺序执行**，**不同队列之间默认没有任何顺序约束**——所以"能不能并发"取决于硬件资源与工作队列。
+
+**（2）并发的物理基础是"芯片上有多个独立的执行引擎"**：
+
+| 引擎 | 干什么 | 与 SM 的关系 |
+|---|---|---|
+| **Compute（SM 阵列）** | 跑 kernel | 主体 |
+| **Copy Engine（DMA）** | H2D / D2H / D2D 拷贝 | **独立硬件，与 SM 并行** |
+| NVJPEG / NVDEC / NVENC | 图像编解码 | 独立硬件 |
+| **TMA / LD-ST** | 片内搬运（第 3、5 节） | 在 SM 内，但异步 |
+
+**这就是"重叠"能成立的硬件前提**：拷贝引擎和 SM 是两块硬件，只要队列允许，它们可以同时工作。经典流水线是把大搬运切成 N 块，用 N 条 stream 交替发射，让"块 i 的计算"和"块 i+1 的搬运"重叠。
+
+**（3）并发有两个门槛，缺一不可**：
+
+- **门槛一：硬件工作队列数量。** Fermi 只有 1 条 → 多 stream 也会**假串行**；**Kepler（CC 3.5）起引入 Hyper-Q，提供 32 条硬件管理的工作队列**，允许来自**多个 stream、多个 MPI 进程、多个线程**的 work 同时在 GPU 上排队，NVIDIA 官方描述它消除的正是 "false serialization across tasks"；
+- **门槛二：资源够不够。** 即使队列够，如果前一个 kernel 把 SM/寄存器/SMEM 占满了，后一个 kernel 也只能等——这就是"**并发 kernel 的收益取决于每个 kernel 的资源占用**"，小 kernel（资源占用低）叠加效果好，大 kernel 基本没法并存。
+
+**（4）两个必须知道的"隐形串行"**：
+
+- **Legacy default stream（NULL stream）的隐式同步**：在不使用 per-thread default stream 时，default stream 与所有 **blocking stream** 之间会互相等待——你以为在用多 stream，实际被 default stream 串起来了。解法：编译时加 `--default-stream per-thread`，或创建 stream 时带 `cudaStreamNonBlocking`；
+- **pageable 内存的"假异步"**：H2D 从普通（pageable）内存发出时，驱动会**分块经内部 pinned 缓冲中转**，只有在数据量小到能一次放进内部缓冲时才真正异步；**D2H 更严格，必须等 kernel 结束**。所以**"重叠的前提是有 pinned memory"**（与第 5、6 节的 pinned 是同一条知识）。`cudaMemcpyAsync` 在没有 pinned 的情况下并不能兑现异步语义。
+
+**（5）同步与计时原语（面试常混，需要分清）**：
+
+| API | 语义 | 是否阻塞 host |
+|---|---|---|
+| `cudaDeviceSynchronize()` | 等设备上**所有**工作完成 | ✅ |
+| `cudaStreamSynchronize(s)` | 等**某条 stream** 完成 | ✅ |
+| `cudaStreamWaitEvent(s, e)` | 让 s **等事件 e**（跨 stream 建依赖） | ❌ 不阻塞 |
+| `cudaEventRecord(e, s)` | 在 s 中打点 | ❌ |
+| `cudaEventSynchronize(e)` | 等事件完成 | ✅ |
+| `cudaEventElapsedTime()` | 两个事件间耗时（**测 GPU 时间**，比 wall clock 准） | — |
+
+**关键用法**：跨 stream 的依赖必须用 `cudaStreamWaitEvent`（**非阻塞**），不要用 `cudaDeviceSynchronize()` 把整条流水线打断——这是"看起来用了多 stream、实际没重叠"的最常见原因。
+
+**（6）两把"减小开销"的钥匙**：
+
+- **CUDA Graphs**：把一串 kernel 启动**录制**成图，之后一次提交、重复执行，把每次 launch 的 ~几微秒开销摊薄。适合"很多小 kernel"的 launch-bound 场景（如 MoE 的小 expert GEMM、逐层小算子）；现代框架（vLLM/TensorRT/Inductor）都在用；
+- **MPS（Multi-Process Service）**：让多个进程共享一张卡的 SM 资源，配合 Hyper-Q 让多进程的 work 真正并发（没有 MPS 时多进程不能同时在 SM 上跑）。HPC 上常用它提高小任务的"GPU farming"吞吐。
+
+**（7）PyTorch 里的对应关系**（面试落到工程时有用）：`torch.cuda.Stream` / `torch.cuda.current_stream()` 对应上面的 stream；`torch.cuda.synchronize()` 对应 `cudaDeviceSynchronize`；`tensor.record_stream(s)` 告诉分配器"这块显存还要被 s 用"，**防止显存被提前复用**（多 stream 下的经典正确性坑）；`torch.cuda.graphs` / `torch.cuda.make_graphed_callables` 对应 CUDA Graphs；`torch.cuda.Stream` + `wait_stream` 用来手写流水线（通信与计算重叠就是这么做出来的）。
+
+### 3. 具体数值样例
+
+```text
+【样例 A：拷贝与计算重叠的收益（H2D 100 MB + kernel + D2H 100 MB）】
+  设定：有效 H2D/D2H 带宽 25 GB/s（PCIe Gen4 x16 实测量级）
+        H2D = 100 MB / 25 GB/s = 4 ms；D2H 同理 4 ms；kernel = 10 ms
+
+  串行（单 stream）：
+    总时间 = 4 + 10 + 4 = 18 ms
+    GPU 有效利用率：只有 10/18 = 56% 的时间 SM 在工作
+
+  切成 4 块，2~4 条 stream 流水：
+    每块：H2D 1 ms、kernel 2.5 ms、D2H 1 ms
+    流水线总时间 ≈ 第一块 H2D(1) + 全部 kernel(4 × 2.5 = 10) + 最后一块 D2H(1)
+                = 12 ms
+    加速比 18/12 = 1.5×
+  ⇒ 结论：**收益上界 = 拷贝时间能被计算完全吸收**；
+    若 kernel 时间 ≫ 拷贝时间，重叠收益接近拷贝那部分的全部
+    （本例拷贝共 8 ms，最多省到 8 ms；实际省 6 ms）
+
+【样例 B：Hyper-Q 消除假串行】
+  Fermi（1 条工作队列）：
+    4 条 stream 各提交 1 个"只用 25% SM"的小 kernel
+    硬件只能串行 → 总时间 = 4 × t
+  Kepler+（32 条队列，Hyper-Q）：
+    4 个小 kernel 可以同时在 SM 上共存（资源允许）
+    总时间 ≈ t（理想）或介于 t 与 4t 之间（取决于资源）
+  ⇒ 这就是 NVIDIA 说的 "false serialization across tasks" 被消除
+  ⇒ 注意前提是"**每个 kernel 资源占用低**"；若每个 kernel 都要占满 SM，
+    Hyper-Q 也救不了（第 7 节的 occupancy 与第 3 节的 SM 资源）
+
+【样例 C：launch overhead 与 CUDA Graphs】
+  一个 kernel launch 的开销约 5~10 µs（CPU 侧）
+  1000 个小 kernel（每个算 2 µs）：
+    纯计算 = 2 ms，但 launch 开销 = 5~10 ms → 总 7~12 ms，**launch-bound**
+  改用 CUDA Graph 一次提交：
+    launch 开销摊到 ~1~2 µs/kernel 甚至更低 → 总时间回到 ~3 ms
+  ⇒ 判据：**单 kernel 时间 < launch 开销时，就该考虑 Graph**
+    （MoE 的专家 GEMM、逐层 norm/激活都属于这一类）
+
+【样例 D：为什么"用了多 stream 却没变快"】
+  三个典型原因，按出现频率排：
+    ① 跨 stream 用了 cudaDeviceSynchronize（把流水线打断）
+       → 改用 cudaStreamWaitEvent
+    ② H2D 的源内存不是 pinned（走了内部 staging + 同步路径）
+       → 改用 cudaMallocHost / cudaHostAlloc
+    ③ kernel 资源占用太高，硬件无法同时驻留两个 kernel
+       → 减小 block/寄存器占用，或干脆别指望并发
+```
+
+### 4. 演进：从"排队"到"图"再到"程序化依赖"
+
+- **Kepler：Hyper-Q（32 条硬件工作队列）+ Dynamic Parallelism** —— 解决假串行；
+- **CUDA 10：CUDA Graphs** —— 解决 launch-bound，把"启动开销"从 O(n) 降到 O(1)；
+- **CUDA 12：Programmatic Dependent Launch / 图条件节点** —— 允许后继 kernel 在**前驱还没完全结束**时就启动（用 `cudaGridDependencySynchronize` 精确控制依赖点），进一步压掉 kernel 之间的"边界气泡"；
+- **与硬件异步化的合流**：`cp.async`（Ampere）、**TMA + mbarrier + warp specialization**（Hopper）把"异步"做进了 SM 内部，所以现代 kernel 的性能模型已经是"**多条流水线 + 显式依赖**"，而不再是"一条 stream 顺序跑"。
+
+> **面试一句话总结**：CUDA 并发的物理基础是"**芯片上有多个独立引擎**"（SM 阵列跑计算、**Copy Engine** 跑拷贝、TMA/LDST 片内异步），而 stream 只是**主机侧的命令队列**——同 stream 有序、跨 stream 无序；要真正并发必须跨过两个门槛：**硬件工作队列数量**（Fermi 只有 1 条会"假串行"，**Kepler 起 Hyper-Q 提供 32 条硬件队列**，允许来自多 stream/多 MPI 进程/多线程的 work 同时排队）和**资源是否够**（小 kernel 才叠得起来，大 kernel 占满 SM 就无解）；还有两个隐形串行必须知道——**legacy default stream 会与所有 blocking stream 互相等待**（用 `--default-stream per-thread` 或 `cudaStreamNonBlocking` 解除）、**pageable 内存的 H2D/D2H 并非真异步**（尤其 D2H 必须等 kernel 结束，所以**重叠的前提是 pinned memory**）；跨 stream 依赖用**非阻塞的 `cudaStreamWaitEvent`** 而不是 `cudaDeviceSynchronize`，测时间用 `cudaEventElapsedTime`；当"单 kernel 时间 < launch 开销（5~10 µs）"时用 **CUDA Graphs** 摊薄（1000 个小 kernel 可从 7~12 ms 压到 ~3 ms），多进程共享卡用 **MPS + Hyper-Q**。
+
+---
+
+## 12. GPUDirect 与门铃机制：网卡/存储怎么直接读写显存
+
+### 1. 现有问题：为什么"网卡直接读写显存"不是插上就行
+
+跨机通信的传统路径是"网卡 → CPU 内存（pinned buffer）→ 显存"，多一次拷贝、多一次 CPU 参与、多占一份内存带宽。直觉上"让网卡直接 DMA 到显存"应该很简单，但实际会遇到一连串问题：
+
+1. **网卡凭什么能访问显存？** GPU 显存不是 CPU 地址空间的一部分，PCIe 设备之间默认**不能互相访问**；
+2. **为什么 `ibv_reg_mr` 注册显存会失败（EFAULT）？** RDMA 要求内存先被"注册/pin 住"，而显存的 pin 走的是一套**独立于 host 内存的机制**；
+3. **GPU 怎么反过来去访问网卡的寄存器/队列？** 要发起通信，GPU 得能写网卡的硬件队列；
+4. **"门铃（doorbell）"到底是什么、为什么必须有？**
+
+> 本节只讲 **GPU 侧机制**；网络侧的协议与配置结论（GDR/GDS 能省什么、`NCCL_NET_GDR_LEVEL`、`cuFile`）见 `Communication.md` 第 7 节。
+
+### 2. 方法论：四步打通 + 一个门铃 + 四类内存对照
+
+**（1）GPUDirect 的三种形态**（面试先把这个分类说清）：
+
+| 形态 | 谁 ↔ 谁 | 载体 | 典型用途 |
+|---|---|---|---|
+| **GPUDirect P2P** | GPU ↔ GPU（同机） | PCIe peer-to-peer DMA / NVLink | 机内 TP/EP、NVLink 之外的兜底路径 |
+| **GPUDirect RDMA（GDR）** | RDMA NIC ↔ GPU | PCIe | 跨机集合通信（NCCL 机间打满带宽的前提） |
+| **GPUDirect Storage（GDS）** | NVMe/文件系统 ↔ GPU | PCIe | 数据加载、checkpoint（`cuFile` API） |
+
+**（2）"网卡怎么直接读写显存"——四步机制**（这是本题的核心答案）：
+
+```text
+① GPU 显存被映射到 PCIe 地址空间：BAR1 aperture
+   GPU 把自己的显存通过一个 PCIe BAR（Base Address Register，叫 BAR1 或 peer aperture）
+   暴露出去，使外部 PCIe 设备能把这段地址当作"对端内存"来访问。
+   ⇒ BAR1 窗口大小限制了"一次能被 P2P 映射多少显存"，
+     所以数据中心卡用 Resizable BAR / large BAR 让整块显存可映射。
+
+② 内核模块 nvidia-peermem 把 GPU 页 pin 住并交给 RDMA 子系统
+   RDMA 的规矩是"内存必须先注册成 MR（Memory Region）才能被网卡 DMA"。
+   host 内存靠 ibv_reg_mr 直接 pin；GPU 显存需要 nvidia-peermem 这个
+   内核模块出面，把 GPU 物理页交给 RDMA 栈。
+
+③ 用户态创建 ThirdPartyP2P 对象（这一步是"为什么 GeForce 用不了 GDR"的答案）
+   用户态用 CUDA VMM API（cuMemCreate / cuMemMap）分配显存，
+   再通过 RM（Resource Manager）ioctl 创建 ThirdPartyP2P（NV503C）对象。
+   ⇒ NVIDIA 通过"**软件分段**"把 GDR 限制在数据中心卡：
+     GeForce 上 CUDA runtime 不会创建这个 NV503C 对象，
+     nvidia-peermem 就找不到要 pin 的 BAR 页，ibv_reg_mr 直接 EFAULT。
+     （已有开源补丁通过强制 BAR1 P2P + persistent P2P API + 用户态手工创建
+       NV503C 来打通，属实验性质）
+
+④ ibv_reg_mr 成功 → 网卡用 PCIe peer-to-peer DMA 直接读写 VRAM
+   数据路径：NIC →（PCIe P2P DMA）→ GPU HBM，**完全绕开 host DRAM**
+```
+
+**（3）反向：GPU 怎么访问网卡的资源（寄存器、队列）？** 关键动作是**把 NIC 的 BAR（寄存器空间）mmap 到用户态**：
+
+- 网卡的队列（SQ/RQ/CQ）、寄存器都是 **MMIO**（memory-mapped IO）；
+- 用户态驱动把这部分物理地址 `mmap` 进自己的地址空间后，这些地址就是**普通的可读写内存地址**；
+- 于是**GPU kernel 也能 load/store 它们**（对 GPU 而言就是一次 PCIe 写）——这一步打通之后，GPU 就能自己写网卡的**门铃寄存器**，从而"自己发起通信"。
+
+**（4）门铃（doorbell）机制：为什么"写了队列"还要再敲一下门？**
+
+发送一个消息的完整动作是"**填 WQE → 敲门铃**"：
+
+```text
+生产者（CPU 或 GPU）                     硬件（NIC）
+  ① 把工作请求 WQE 写进发送队列 SQ  ──────────►（队列在内存里，硬件此时不知道）
+  ② 写一个 doorbell 寄存器（MMIO 写） ────────► 硬件被"敲门"唤醒
+                                              ③ 硬件去 SQ 取 WQE
+                                              ④ 执行 DMA / 组包 / 发送
+```
+
+**为什么不能只写内存？** 因为硬件**不会持续扫描内存里的队列**（扫描要占用内部带宽和逻辑，代价高）。所以约定是：**内存写负责放数据，一次 MMIO 写（doorbell）负责通知**。这也是为什么：
+
+- **门铃是"提交延迟"的关键路径**——小消息场景下总延迟 ≈ 构造 WQE + doorbell MMIO 写 + NIC 处理；
+- 反过来，**接收侧可以不用门铃而用轮询（polling）**：消费方主动查 CQ（完成队列）而不是等中断，用 CPU/GPU 空转换低延迟（DPU/低延时交易场景常见）；`ibv_poll_cq` vs `ibv_get_cq_event` 就是这两种风格。
+
+**（5）GPU-initiated communication：把"发起通信"也搬进 GPU。** 传统路径里 GPU 算完要**通知 CPU**、由 CPU post send——多一次 device→host 往返：
+
+```text
+传统（CPU 中介）：
+  GPU kernel 算完 → (device→host 事件/中断 ~5~10 µs) → CPU 构造 WQE + 敲门铃 → NIC 发送
+
+GPU-initiated（GPUDirect Async / NVSHMEM）：
+  GPU kernel 内直接构造 WQE、直接写 NIC 的 doorbell → NIC 发送
+  ⇒ 省掉 device→host→device 的一次往返，通信延迟与"每层都要通信"的开销显著下降
+  ⇒ 这是 MoE all-to-all / TP all-reduce 能"藏在计算里"的机制基础
+```
+
+**（6）四类内存的适用场景与坑**（面试高频，务必分清）：
+
+| 类型 | 怎么分配 | GPU 能直接访问 | 是异步拷贝前提吗 | 适合 / 坑 |
+|---|---|---|---|---|
+| **pinned（页锁定）** | `cudaMallocHost` / `cudaHostAlloc` | ❌（除非额外 mapped） | ✅ **是** | 高频 H2D/D2H、RDMA 的 MR；**分配过多会锁死物理内存**（`ulimit -l`） |
+| **zero-copy（mapped pinned）** | `cudaHostAllocMapped` + `cudaHostGetDevicePointer` | ✅ 直接走 PCIe 读 | — | 只读一次、小数据、稀疏访问；**每次访问都过 PCIe，比 HBM 慢 1~2 个数量级** |
+| **UVA（统一虚拟地址）** | 64-bit 系统自动 | ✅ | — | 简化指针管理（不用手动区分 host/device 指针），pinned 内存在 UVA 下可被 kernel 直接用 |
+| **UM（managed / UVM）** | `cudaMallocManaged` | ✅（页错误驱动迁移） | — | 数据大于显存、访问模式不规则；**在纯 PCIe 机器上可能因页错误抖动而极慢**（详见 `Communication.md` 第 4 节） |
+
+**一句话记忆**：**pinned 解决"能不能异步"，zero-copy 解决"能不能不拷贝"，UVA 解决"指针要不要分开写"，UM 解决"放不下怎么办"**。
+
+### 3. 具体数值样例
+
+```text
+【样例 A：GDR 省掉了什么（100 MB 消息，400 Gb/s ≈ 50 GB/s 单向）】
+  无 GDR（三次搬运 + CPU 参与）：
+    NIC → host pinned buffer：50 GB/s → 2 ms（CPU 参与、占内存带宽）
+    cudaMemcpy H2D：PCIe Gen4 x16 有效 25 GB/s → 4 ms
+    合计 ≈ 6 ms，且 HBM 与 host DRAM 各被写一遍
+  有 GDR（一跳直达）：
+    NIC →（PCIe P2P DMA）→ GPU HBM：≈ 2~4 ms（受 PCIe 带宽约束，但省掉一跳与 CPU）
+  ⇒ 收益：省一次拷贝、省一次 host 内存带宽占用、CPU 只做控制
+  ⇒ 这也是 NCCL 机间打满带宽的前提（配置位 NCCL_NET_GDR_LEVEL）
+  实测锚点（25GbE + ConnectX-4 Lx + RTX 3090，开源实验）：
+    大消息带宽 ~2922 MiB/s ≈ 24.5 Gbps，**打满 25GbE 链路**，
+    与"CPU 内存 RDMA"持平 → 说明 GDR 本身不是瓶颈
+
+【样例 B：BAR1 窗口决定"能 P2P 多少显存"】
+  查看：nvidia-smi -q | grep -i BAR1
+  BAR1 太小 → 只能映射一部分显存做 P2P（大模型训练里表现为
+    "某些 buffer 能用 GDR、某些不能"，或 reg_mr 失败）
+  Resizable BAR / large BAR → 让整块显存落进 BAR1 窗口，P2P 覆盖更完整
+  ⇒ 这是"同一张卡，换主板/BIOS 设置后 GDR 行为不同"的常见原因
+
+【样例 C：门铃与"小消息延迟"的账】
+  小消息（8 B payload）的端到端延迟大致由三段决定：
+    ① 构造 WQE（写内存，~百 ns 级）
+    ② **doorbell MMIO 写**（跨 PCIe，~几百 ns）
+    ③ NIC 处理 + 线缆 + 对端处理
+  host 内存 RDMA 的小消息延迟通常在 ~1~2 µs 量级
+  ⇒ 结论：小消息场景**瓶颈不是带宽而是"提交/通知"路径**，
+    所以优化手段是"批量 post（一次 doorbell 提交多个 WQE）""inline 小数据"
+    "少发信号（减少 CQ 事件）"——这些和 RDMA verbs 层的调优一一对应
+
+【样例 D：GPU-initiated 省下的往返（每层都要通信的场景）】
+  传统路径每层多一次 device→host 通知（~5~10 µs）
+  80 层 × 每层多次通信 → 光"通知 CPU"就可能累积到毫秒级
+  GPU-initiated（kernel 内写 WQE + doorbell）省掉这段往返
+  ⇒ 对 MoE all-to-all、TP all-reduce 这类"每层都通信"的负载，
+    这项优化直接决定通信能否被计算掩盖（回到第 8 节的"通信墙"）
+```
+
+### 4. 演进：从"设备间能互相看见"到"GPU 主动通信"
+
+- **GPUDirect P2P（CUDA 4 时代）**：让同机 GPU 之间通过 PCIe peer DMA 直接互访（NVLink 普及后机内主要走 NVLink，P2P 成为兜底）；
+- **GPUDirect RDMA（CUDA 5.0 起，Tesla 卡）**：NIC 直连显存，成为 NCCL 跨机打满带宽的前提；
+- **GPUDirect Storage（GDS，`cuFile`）**：NVMe/文件系统直通显存，数据加载与 checkpoint 免 bounce buffer；
+- **GPUDirect Async / NVSHMEM（GPU-initiated communication）**：把"发起通信"从 CPU 搬到 GPU，配合 IBGDA（InfiniBand GPUDirect Async）让 kernel 内直接投递 WQE；
+- **一个现实约束要记住**：NVIDIA 通过**软件分段**（是否创建 ThirdPartyP2P 对象）而非硬件能力来区分数据中心卡与消费卡——这就是"GeForce 也能 GDR，但要打补丁"的原因；面试里说"消费卡硬件不支持 GDR"是不准确的，准确说法是"**驱动/软件层面未开放**"。
+
+> **面试一句话总结**：GPUDirect 分三种形态——**P2P（GPU↔GPU，PCIe peer DMA/NVLink）、RDMA（NIC↔显存，即 GDR，NCCL 跨机打满带宽的前提）、Storage（NVMe↔显存，`cuFile`）**；"网卡怎么直接读写显存"的四步是 **①显存经 BAR1 aperture 暴露到 PCIe 地址空间 → ②内核模块 `nvidia-peermem` 把 GPU 页 pin 住交给 RDMA 栈 → ③用户态用 CUDA VMM API 分配显存并经 RM ioctl 创建 ThirdPartyP2P（NV503C）对象（这一步就是 GeForce 上 `ibv_reg_mr` 报 EFAULT 的原因——NVIDIA 用软件分段限制，不是硬件不支持）→ ④NIC 通过 PCIe P2P DMA 直写 HBM、完全绕开 host DRAM**；反向让 **GPU 访问网卡**的办法是把 NIC 的 BAR（队列/寄存器）**mmap 到用户态**，于是 kernel 也能 load/store；**门铃（doorbell）机制**是"**填 WQE 写内存 + 一次 doorbell MMIO 写通知硬件**"——因为硬件不会持续扫描内存里的队列，所以必须"敲门"，它也是小消息延迟的关键路径（小消息瓶颈是提交/通知而非带宽，对应"批量 post、inline、少发信号"等 verbs 调优）；把门铃也交给 GPU 就是 **GPU-initiated communication（GPUDirect Async/NVSHMEM）**，省掉每层 device→host→device 的往返，是 MoE/TP 通信能被计算掩盖的基础；最后务必分清 **pinned（异步的前提）/ zero-copy（不拷贝）/ UVA（指针统一）/ UM（放不下怎么办）** 四类内存的适用场景与坑。
+
+---
+
+# 二、串讲：把一块 GPU 的十二个技术点串成一条数据通路
+
+## 13. 一次 GEMM 的完整硬件旅程（十二个技术点如何协同）
+
+### 1. 现有问题：十二个点都懂了，但讲不成一条线
+
+面试的最后一问往往是开放式的："**从你写完一个 GEMM 到它跑在硬件上，数据经过了哪些地方？**"或者"**给你一台 8 卡机器，怎么榨干性能？**"。这两问考的不是某个知识点，而是**把硬件串成数据通路的能力**。这一节就是把第 1~12 节穿起来。
 
 ### 2. 方法论：六跳数据通路 + 三堵墙 + 一个 checklist
 
@@ -997,7 +1264,7 @@ GB200(NVL72)  Blackwell 186 GB HBM3E  8.0 TB/s   ~2500 (5000)         1.8 TB/s  
 
 ---
 
-## 12. 硬件面试高频题检查清单（含答题框架）
+## 14. 硬件面试高频题检查清单（含答题框架）
 
 ### 1. 现有问题：怎么自测硬件部分准备到位了
 
@@ -1027,6 +1294,10 @@ GB200(NVL72)  Blackwell 186 GB HBM3E  8.0 TB/s   ~2500 (5000)         1.8 TB/s  
 | 合并访问（coalesced）是什么？不合并会怎样？ | warp 32 线程访问连续地址时合并成 128B 级事务；跨步/随机访问会退化成每线程一个事务，带宽掉到几十分之一 |
 | 慢 kernel 的排查顺序？ | 先判 bound 类型（roofline）→ 看访存模式（coalescing/bank conflict）→ 看 occupancy → 看停顿原因（stall reasons） |
 | Nsight/ncu 通常看什么指标？ | SM occupancy、访存吞吐 % peak、Tensor Core 利用率、L2 命中率、warp stall 原因 |
+| **CUDA Stream 是干嘛用的？怎么把计算和拷贝叠起来？** | 见 §11：stream 是**主机侧有序命令队列**；并发靠"**多引擎（SM 阵列 + Copy Engine）+ 多 stream 分块流水**"，且**前提是 pinned memory**（pageable 的 D2H 必须等 kernel 结束） |
+| **Hyper-Q 解决什么问题？** | 见 §11：Fermi 只有 **1 条**硬件工作队列 → 多 stream 也会**假串行（false serialization）**；**Kepler（CC 3.5）起 Hyper-Q 提供 32 条硬件工作队列**，允许来自多 stream/多 MPI 进程/多线程的 work 同时排队（**前提是每个 kernel 资源占用别太高**） |
+| **CUDA Graphs 什么时候有用？** | 见 §11：当"**单 kernel 时间 < launch 开销（5~10 µs）**"时（大量小 kernel，如 MoE 专家 GEMM），把启动开销从 O(n) 摊成 O(1)（1000 个小 kernel 可从 7~12 ms 压到 ~3 ms） |
+| **多进程共享一张卡怎么办？** | 见 §11：用 **MPS（Multi-Process Service）** 配合 Hyper-Q，让多进程的 work 真正并发在 SM 上 |
 
 **主题 3：存储与带宽（对应 §5、§6）**
 
@@ -1081,15 +1352,23 @@ GB200(NVL72)  Blackwell 186 GB HBM3E  8.0 TB/s   ~2500 (5000)         1.8 TB/s  
 | NVSwitch 是什么？ | 把点对点 NVLink 收成全连接 fabric，任意两卡带宽对等（HGX 8 卡域） |
 | 什么时候必须上 RDMA？ | 跨节点通信；且要注意 400 Gb/s ≈ 50 GB/s 单向，别和 NVLink 的双向数字直接比 |
 | 为什么"掉出 NVLink 域"很贵？ | NVLink 单向 450 GB/s vs RDMA 单向 50 GB/s ≈ 9×（H800 上是 200 vs 50 = 4×） |
+| **GPUDirect 有哪几种形态？** | 见 §12：**P2P**（GPU↔GPU，PCIe peer DMA/NVLink）、**RDMA / GDR**（NIC↔显存，NCCL 跨机打满带宽的前提）、**Storage / GDS**（NVMe↔显存，`cuFile`） |
+| **网卡是怎么直接读写显存的？（高频）** | 见 §12 四步：**① 显存经 BAR1 aperture 暴露到 PCIe 地址空间 → ② 内核模块 `nvidia-peermem` 把 GPU 页 pin 住交给 RDMA 栈 → ③ 用户态用 CUDA VMM API 分配并经 RM ioctl 创建 ThirdPartyP2P（NV503C）对象 → ④ NIC 用 PCIe P2P DMA 直写 HBM、绕开 host DRAM**；GeForce 上 `ibv_reg_mr` 报 EFAULT 是 NVIDIA **软件分段**限制，不是硬件不支持 |
+| **GPU 怎么访问网卡资源？门铃（doorbell）是什么？** | 见 §12：把 NIC 的 BAR（队列/寄存器）**mmap 到用户态**，于是 kernel 也能 load/store；发送动作 = "**填 WQE 写内存 + 一次 doorbell MMIO 写通知硬件**"——**硬件不会持续扫描内存里的队列**，所以必须"敲门"；小消息延迟瓶颈在提交/通知路径（对应"批量 post / inline / 少发信号"的 verbs 调优） |
+| **GPU-initiated communication 省了什么？** | 见 §12：省掉每层 **device→host→device** 的往返（~5~10 µs/次），把"发起通信"也搬进 kernel（GPUDirect Async / NVSHMEM）——MoE all-to-all、TP all-reduce 能被计算掩盖的基础 |
+| **pinned / zero-copy / UVA / UM 怎么选？** | 见 §12：**pinned 解决"能不能异步"**（分配过多会锁死物理内存）、**zero-copy 解决"能不能不拷贝"**（每次访问走 PCIe，比 HBM 慢 1~2 个数量级）、**UVA 解决"指针要不要分开写"**、**UM 解决"放不下怎么办"**（纯 PCIe 机器上可能因页错误抖动而极慢） |
 
 **三档难度自测法**：
 
 ```text
 L1（必须会）：说出五个量、SM 里有什么、roofline 两道天花板、TF32/BF16/FP8 关系
 L2（区分度）：能当场推 H100 的 67 TFLOPS FP32 / 2.048 TB/s 带宽 / 拐点 295；
-            能算 KV cache 与 decode 带宽上限；能说清 MMA 的 layout 约束
+            能算 KV cache 与 decode 带宽上限；能说清 MMA 的 layout 约束；
+            能说清 stream/Hyper-Q/CUDA Graphs 的适用场景与前提（pinned、32 队列、launch-bound）
 L3（加分）：能解释"为什么升级 H100 只快 1.6×"（拐点右移）；
             能说 Blackwell 双 die 与 NVL72 对软件切分的影响；
+            能讲清 GDR 打通显存的四步机制（BAR1 → peermem → ThirdPartyP2P → PCIe P2P DMA）
+            与门铃为什么必需，以及它和 pinned/zero-copy/UVA/UM 的取舍；
             能对比达芬奇的静态拆分与 SIMT 的取舍
 ```
 
@@ -1191,11 +1470,39 @@ L3（加分）：能解释"为什么升级 H100 只快 1.6×"（拐点右移）�
 | $\text{事务数} = \lceil \text{地址跨度}/128\text{B} \rceil$ | coalescing 代价 |
 | $\text{SMEM bank} = \text{地址} \bmod 32$ | bank conflict 判定 |
 
+## CUDA 并发与 GPUDirect 速查（§11–§12）
+
+| 项 | 要点 |
+|---|---|
+| **Stream 本质** | 主机侧**有序命令队列**；同 stream 内有序、**跨 stream 默认无序** |
+| **并发门槛（两个，缺一不可）** | ① 硬件工作队列数：Fermi **1 条** → 假串行；**Kepler(CC3.5)+ 32 条**（Hyper-Q）② 资源是否够：**小 kernel 才叠得起来**，大 kernel 占满 SM 就无解 |
+| **两个隐形串行** | legacy **default stream** 与所有 blocking stream 互相等待（用 `--default-stream per-thread` / `cudaStreamNonBlocking` 解除）；**pageable 内存并非真异步**（H2D 走内部 staging，D2H 必须等 kernel 结束） |
+| **重叠的前提** | **pinned memory**（`cudaMallocHost` / `cudaHostAlloc`） |
+| **同步与计时** | 跨 stream 用 **`cudaStreamWaitEvent`（非阻塞）**；不要用 `cudaDeviceSynchronize` 打断流水线；计时用 `cudaEventElapsedTime` |
+| **CUDA Graphs** | 当"**单 kernel 时间 < launch 开销（5~10 µs）**"时用（MoE 小 GEMM、逐层小算子）：1000 个小 kernel 可从 7~12 ms → ~3 ms |
+| **MPS** | 多进程共享一张卡时，配合 Hyper-Q 让多进程 work 真正并发 |
+| **GPUDirect 三形态** | **P2P**（GPU↔GPU）/ **GDR**（NIC↔显存，NCCL 跨机打满带宽前提）/ **GDS**（NVMe↔显存，`cuFile`） |
+| **GDR 打通显存的四步** | ① 显存经 **BAR1 aperture** 暴露到 PCIe 地址空间 → ② 内核模块 **`nvidia-peermem`** pin 住 GPU 页交给 RDMA 栈 → ③ 用户态用 CUDA VMM API 分配并经 RM ioctl 创建 **ThirdPartyP2P（NV503C）** 对象（GeForce 报 EFAULT 的根因）→ ④ **NIC 用 PCIe P2P DMA 直写 HBM，绕开 host DRAM** |
+| **GPU 访问网卡** | 把 NIC 的 BAR（队列/寄存器）**mmap 到用户态** → kernel 也能 load/store |
+| **门铃（doorbell）** | 发送 = "**填 WQE 写内存 + 一次 doorbell MMIO 写**"；**硬件不会持续扫描内存里的队列**，故必须"敲门"；小消息瓶颈在**提交/通知**路径（→ 批量 post / inline / 少发信号；接收侧可改轮询降延迟） |
+| **GPU-initiated communication** | kernel 内直接构造 WQE + 写 doorbell（GPUDirect Async / NVSHMEM），省掉每层 **device→host→device** 的 ~5~10 µs 往返 |
+| **四类内存一句话** | **pinned 解决"能不能异步"、zero-copy 解决"能不能不拷贝"（走 PCIe，慢 1~2 个数量级）、UVA 解决"指针要不要分开写"、UM 解决"放不下怎么办"** |
+
 ## 三条"必须记住的反直觉"
 
 1. **`nvidia-smi` 利用率 98% ≠ 算力打满**：它只表示"有 kernel 在跑"，MFU 可能只有 30%；要用 roofline 判断 bound 类型；
 2. **occupancy 高 ≠ 快**：occupancy 只保证 TLP，真正的延迟隐藏还要 ILP，两者通过寄存器用量此消彼长；
 3. **升级更快的卡可能只快一点**：拐点右移会让原本 compute-bound 的算子掉到 memory-bound 一侧（A100→H100 只快 1.6× 而非 3.2×），此时该做的是省带宽而不是继续堆算力。
 
-> **关联文档**：互联技术（NVLink/NVSwitch/PCIe/CXL/InfiniBand/RoCE/HCCL/HCCS）见 `Communication.md`；并行切分（DP/TP/PP/SP/EP/FSDP 与集合通信原语）见 `Parallel.md`；显存怎么被训练与推理吃掉的完整账见 `Agent-lighting.md` 第 19 节；TQ/Mooncake 的存储分层见 `TQ.md`、`Mooncake.md`。
+> **关联文档**：互联技术（NVLink/NVSwitch/PCIe/CXL/InfiniBand/RoCE/HCCL/HCCS）见 `Communication.md`——其中**第 7 节**是 GPUDirect 的**网络侧**结论（GDR/GDS 的收益、`NCCL_NET_GDR_LEVEL`、`cuFile`），本文 §12 是它的**GPU 侧机制**（BAR1 / `nvidia-peermem` / ThirdPartyP2P / 门铃 / 四类内存）；并行切分（DP/TP/PP/SP/EP/FSDP 与集合通信原语）见 `Parallel.md`；显存怎么被训练与推理吃掉的完整账见 `Agent-lighting.md` 第 19 节；TQ/Mooncake 的存储分层见 `TQ.md`、`Mooncake.md`。
+
+**§11 / §12 的来源**（除文首通用来源外）：
+
+- CUDA Stream / Hyper-Q：[NVIDIA 官方对 Hyper-Q 的表述（经 SHARCNET 文档转述）](https://helpwiki.sharcnet.ca/wiki/index.php?title=Hyper-Q_/_MPS)——"32 simultaneous, hardware-managed connections (compared to the single connection available with Fermi)"、"false serialization across tasks"；MPS 文档见 NVIDIA *CUDA Multi-Process Service Overview*
+- CUDA 并发/重叠与 pinned 语义：[NVIDIA CUDA C++ Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/)（异步拷贝、stream、event、Graphs 的官方口径）
+- GPUDirect 的三形态与历史：[ACM Computing Surveys, *The Landscape of GPU-Centric Communication*](https://dl.acm.org/doi/full/10.1145/3813799)——"With the introduction of GPUDirect RDMA in CUDA 5.0..."
+- **BAR1 P2P / `nvidia-peermem` / ThirdPartyP2P 的具体机制**：[mcornea/geforce-gpudirect-rdma](https://github.com/mcornea/geforce-gpudirect-rdma)（开源实验：GeForce 上打通 GDR 需要强制 BAR1 P2P、把 peermem 切到 persistent P2P API、并用 RM ioctl 手工创建 NV503C 对象；含 25GbE 实测 ~2922 MiB/s 打满链路）
+- 低延迟 GPU 侧通信（门铃/轮询）实践参考：[eunomia-bpf/basic-cuda-tutorial 低延迟 GPU 包处理示例](https://github.com/eunomia-bpf/basic-cuda-tutorial)
+
+> **口径提醒**：`Communication.md` 第 7 节写"P100+"，本文按资料来源写"**CUDA 5.0 起在 Tesla 卡上提供**"（GPUDirect RDMA 随 CUDA 5.0/Kepler 代引入）；两处不冲突但以"数据中心卡 + 软件分段限制"这个结论为准——**消费卡并非硬件不支持，而是驱动/软件层未开放**。
 
