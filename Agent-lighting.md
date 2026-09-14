@@ -2,7 +2,7 @@
 
 > **Microsoft 的 agent 强化学习训推框架：Algorithm × Runner × TrajStore（LightningStore）三件套 + VERL 集成。**
 
-Agent Lightning（`agentlightning`，简称 agl）是微软研究院开源的"**用强化学习训练任意 agent**"的框架，核心卖点是**对 agent 几乎零代码改动**（任何 agent 框架甚至纯 Python 都能接入）。它的架构围绕三个核心组件组织：**Algorithm（算法，系统的"大脑"）、Runner（执行器，系统的"工人"）、LightningStore（轨迹存储，系统的"数据库+消息队列"）**——三者构成一个持续循环：Algorithm 派发任务 → Runner 执行 agent 并流式回传轨迹（spans）→ Algorithm 从 store 取回轨迹、转成训练样本、更新模型。**我们实际采用三机分离部署：store、algo、agent（runner）分别部署在三台不同的机器，全部通过 store 的 HTTP 地址连接**——本指南全文都以此部署形态为语境（三机分离下，algo 机与 agent 机对 store 的一切访问都是 HTTP；只有 Runner 进程内部的 Agent 调用和算法内部的 Adapter 转换是实例直接调用）。本指南先逐个讲清这三个部分各自的职责与实现，再讲它们如何组成整体架构，最后重点讲与 **verl**（Volcengine 的开源 RL 训练框架）的集成关系；**第三部分（第 6~11 节）专门钻进轨迹本身**——一条轨迹是在哪一行代码被"抓住"的（三条记录通路 + 插桩细节）、`Span` 模型长什么样、怎么变成 HTTP 请求落到 store（OTLP protobuf 批量 vs 逐条 JSON，含 proxy 的子树缓冲专线）、到了 store 之后怎么从一堆扁平 span **重建成一棵树**（`TraceTree.from_spans` + `repair_hierarchy`）、怎么变成训练用的 triplet，以及分布式下的**有序性/幂等/静默失败**语义；**第四部分（第 12~18 节）讲共卡（colocate）下"推理 ↔ 训练"的全流程**——三种 `RolloutMode` 与"为什么共卡是解决空泡的 baseline"、参数到底在哪（`engine.to()` + `BaseEngineCtx._context_switch` + vLLM sleep level 1/2）、wake/sleep 的完整调用链与硬顺序、权重同步的两条路（`naive` 同卡直传 vs `checkpoint_engine` 跨卡 NCCL 多播 + bucket 切块）、项目 TQ 方案（`tqbridge` + `ReplayBuffer` + `KVBatchMeta`）的一次完整 `_train_step`、训练每一步的内部细节（micro-batch → forward → loss → backward → clip → step → lr），以及项目实测的空泡账与修复方案。
+Agent Lightning（`agentlightning`，简称 agl）是微软研究院开源的"**用强化学习训练任意 agent**"的框架，核心卖点是**对 agent 几乎零代码改动**（任何 agent 框架甚至纯 Python 都能接入）。它的架构围绕三个核心组件组织：**Algorithm（算法，系统的"大脑"）、Runner（执行器，系统的"工人"）、LightningStore（轨迹存储，系统的"数据库+消息队列"）**——三者构成一个持续循环：Algorithm 派发任务 → Runner 执行 agent 并流式回传轨迹（spans）→ Algorithm 从 store 取回轨迹、转成训练样本、更新模型。**我们实际采用三机分离部署：store、algo、agent（runner）分别部署在三台不同的机器，全部通过 store 的 HTTP 地址连接**——本指南全文都以此部署形态为语境（三机分离下，algo 机与 agent 机对 store 的一切访问都是 HTTP；只有 Runner 进程内部的 Agent 调用和算法内部的 Adapter 转换是实例直接调用）。本指南先逐个讲清这三个部分各自的职责与实现，再讲它们如何组成整体架构，最后重点讲与 **verl**（Volcengine 的开源 RL 训练框架）的集成关系；**第三部分（第 6~11 节）专门钻进轨迹本身**——一条轨迹是在哪一行代码被"抓住"的（三条记录通路 + 插桩细节）、`Span` 模型长什么样、怎么变成 HTTP 请求落到 store（OTLP protobuf 批量 vs 逐条 JSON，含 proxy 的子树缓冲专线）、到了 store 之后怎么从一堆扁平 span **重建成一棵树**（`TraceTree.from_spans` + `repair_hierarchy`）、怎么变成训练用的 triplet，以及分布式下的**有序性/幂等/静默失败**语义；**第四部分（第 12~18 节）讲共卡（colocate）下"推理 ↔ 训练"的全流程**——三种 `RolloutMode` 与"为什么共卡是解决空泡的 baseline"、参数到底在哪（`engine.to()` + `BaseEngineCtx._context_switch` + vLLM sleep level 1/2）、wake/sleep 的完整调用链与硬顺序、权重同步的两条路（`naive` 同卡直传 vs `checkpoint_engine` 跨卡 NCCL 多播 + bucket 切块）、项目 TQ 方案（`tqbridge` + `ReplayBuffer` + `KVBatchMeta`）的一次完整 `_train_step`、训练每一步的内部细节（micro-batch → forward → loss → backward → clip → step → lr），以及项目实测的空泡账与修复方案；最后第 19 节把整条流程再收敛成**一张"每一步、每一类张量在哪块内存（HBM / host DRAM / 外部存储）"的驻留矩阵 + 14 步时间线**，并给出 HBM 峰值曲线与 host DRAM 账。
 
 > 说明：本文基于官方仓库 `agent-lightning-official` 的 **v0.3.0** 分支（tag `v0.3.0`，commit 3b5d7338）讲解。**我们实际训练使用的是 v1 执行模式**（`AgentModeDaemon` 的 `mode` 参数默认即 `"v1"`）——v1 模式下任务的派发、轨迹的回收、资源的传递全部通过 LightningStore 完成（Runner 与算法完全解耦）；v0 模式（自起 Flask server）仅作为历史兼容保留，本文以 v1 为主线。**部署形态统一为三机分离（见第 4 点详述）**：store 单独一台机器跑 `LightningStoreServer`（`agl store --port 4747`），algo 机器和 agent 机器都作为 `LightningStoreClient` 通过 HTTP 连它。
 
@@ -1919,19 +1919,24 @@ async def otlp_logs():
 
 ### 1. 现有问题：为什么"共卡"是绕不开的第一选择
 
-RL 训练里 GPU 上有两类完全不同的负载：**推理（rollout）**要的是"大 KV cache + 高并发小 batch"，**训练**要的是"参数/梯度/优化器状态 + 大 batch 反向"。它们**不可能同时塞进同一张卡的显存**——以 1.5B 模型在 8 卡上为例（$P=1.5\text{B}$，bf16 参数/梯度 + fp32 Adam）：
+RL 训练里 GPU 上有两类完全不同的负载：**推理（rollout）**要的是"大 KV cache + 高并发小 batch"，**训练**要的是"参数/梯度/优化器状态 + 大 batch 反向"。它们**不可能同时塞进同一张卡的显存**——以 1.5B 模型在 8 卡上为例（$P=1.5\text{B}$，**参数以 fp32 初始化/存储**，FSDP `MixedPrecision(param_dtype=bf16)` 只在计算时 cast，AdamW fp32）：
 
 | 项目 | 总量 | 单卡（8 卡 FSDP 分片） |
 |---|---|---|
-| 模型参数（bf16） | $2P = 3$ GB | 0.375 GB |
-| 梯度（bf16） | $2P = 3$ GB | 0.375 GB |
+| 模型参数（**fp32 存储**） | $4P = 6$ GB | 0.75 GB |
+| 梯度（与参数同 dtype，fp32） | $4P = 6$ GB | 0.75 GB |
 | Adam 一阶+二阶动量（fp32） | $8P = 12$ GB | 1.5 GB |
-| fp32 master weights | $4P = 6$ GB | 0.75 GB |
-| **训练侧小计** | | **≈ 3 GB/卡**（还要加激活） |
-| vLLM 权重（bf16，TP=1） | 3 GB | 3 GB/卡 |
+| **训练侧小计** | | **≈ 3 GB/卡**（+ 激活，见下） |
+| vLLM 权重（**bf16**，`rollout.dtype=bfloat16`，TP=1） | $2P = 3$ GB | 3 GB/卡 |
 | vLLM KV cache | $2 \times L \times H_{kv} \times d_{head} \times \text{tokens}$ | 由 `gpu_memory_utilization` 决定 |
 
-**两边都是 3 GB 级**，而 24 GB 卡上还要留激活、通信 buffer、CUDA context——所以只有两条路：
+**这张表里最容易答错的一行是 dtype**：verl 的 FSDP engine 配置 `model_dtype: fp32`（`verl-v0.8.0/verl/trainer/config/engine/fsdp.yaml:33`），`_build_fsdp_module` 里 `MixedPrecision(param_dtype=bf16, reduce_dtype=fp32, buffer_dtype=fp32)`（`workers/engine/fsdp/transformer_impl.py:346-356`）——**`param_dtype` 只决定 forward/backward 的计算精度，不改变参数的存储 dtype**，所以：
+
+- **参数与梯度都是 fp32 存储**（$4P$ 各一份），**没有额外的 fp32 master weights**（参数本身就是 fp32，这也是为什么表里没有 master 那一行）；
+- **梯度 reduce 用 fp32**（`reduce_dtype=fp32`）——通信量按 fp32 算，不是 bf16；
+- **激活默认被梯度检查点压住**（`model/hf_model.yaml:34` 的 `enable_gradient_checkpointing: True` 是默认开），激活 offload 默认关（`workers/config/model.py:118` 的 `enable_activation_offload: bool = False`，开启后走 `verl/utils/activation_offload.py`）。
+
+**两边都是 3 GB 级**，而 24 GB 卡上还要留激活、通信 buffer、CUDA/NPU context——所以只有两条路：
 
 1. **共卡（colocate / 时间复用）**：同一批卡上先跑推理、再跑训练，**切换时把一方的显存让出来**。优点：零额外机器、权重搬运在同卡/同机（便宜）、天然 on-policy（权重刚更新就能拿去采样）。缺点：**推理和训练不能重叠**，切换本身有开销；
 2. **分卡（disaggregate）**：推理一组卡、训练一组卡，**真异步重叠**。优点：无切换、可重叠；缺点：多花卡、权重跨机传输贵、必须处理 off-policy（staleness）。
@@ -2273,8 +2278,8 @@ async def release_kv_cache_replicas(self):
   推理阶段：vLLM 权重 3 GB/卡 + KV cache（限额 0.5×24 = 12 GB/卡）
            训练侧：参数/梯度/优化器 ≈ 0（全在 CPU）
   切换：sleep(level=2) → 释放权重 + KV cache → 显存回到 ~0
-  训练阶段：FSDP 参数 0.375 + 梯度 0.375 + Adam 1.5 + master 0.75 ≈ 3 GB/卡（+激活）
-  退出：train_mode 退出 → 全部搬回 CPU（D2H 拷贝 3 GB/卡）
+  训练阶段：FSDP 参数(fp32) 0.75 + 梯度(fp32) 0.75 + Adam(fp32) 1.5 ≈ 3 GB/卡（+激活，已默认开梯度检查点）
+  退出：train_mode 退出 → 全部搬回 CPU（D2H 拷贝 3 GB/卡；参数/梯度 fp32、优化器 fp32）
   代价：每步多 2 次 H2D + 2 次 D2H 的 3 GB 级拷贝（无 pinned → 不重叠，纯串行）
 
 【配置 B：不 offload（分卡/显存够用）】
@@ -2428,7 +2433,7 @@ t1  sleep_replicas()（level 2：offload_tags=()）
               of which 0.00 GiB is backed up in CPU and the rest 13.00 GiB is discarded directly."
            训练侧仍 0.0 GB                                          GPU 占用 ≈ 0.0 GB
 t2  train_mode() → load_fsdp_model_to_gpu + load_fsdp_optimizer
-           参数 0.375 + 梯度 0.375 + Adam 1.5 + master 0.75 ≈ 3.0 GB
+           参数(fp32) 0.75 + 梯度(fp32) 0.75 + Adam(fp32) 1.5 ≈ 3.0 GB
            + 激活（remove-padding 后按 token 数）                    GPU 占用 ≈ 3.0+ GB
 t3  optimizer_step() 后 train_mode 退出 → 全部搬回 CPU             GPU 占用 ≈ 0.0 GB
 t4  update_weights()（naive）
@@ -3425,7 +3430,7 @@ epochs = 1（PPO 通常 1；若 epochs=2 则整个 mini-batch 序列跑两遍）
 6. 退出 train_mini_batch → train_mode.__exit__ → zero_grad + offload 到 CPU
 
 【显存峰值估算（每卡）】
-  参数 0.375 + 梯度 0.375 + Adam 1.5 + master 0.75 ≈ 3 GB
+  参数(fp32) 0.75 + 梯度(fp32) 0.75 + Adam(fp32) 1.5 ≈ 3 GB
   + 激活（micro_batch=4，remove-padding 后按 token 数；设 4×2048 token）
   ⇒ 这就是 micro_batch_size_per_gpu 存在的意义：**用更小的 micro-batch 换激活显存**
 
@@ -3551,6 +3556,205 @@ def train_mini_batch(self, data: TensorDict) -> TensorDict:
 **三个结论**：① **共卡是 baseline，不是终点**——它的固有成本是"推理与训练串行 + 每次切换的显存交接"；② **TQ 化的代价是可定位、可修复的**：`update_actor +15s` 的根因被精确到了 `losses.py:85-91` 的 `to_padded_tensor()` 与"TQ 存的是 nested 而 baseline 存的是 padded"这一字段布局差异，修复只需在 `train_mini_batch` 入口转一次；③ **排查方法论比结论更值钱**：先排除"基类/规模/TQ 读取"三个变量，再把差异收敛到"同一行代码在不同数据布局下的行为"，最后给出最小改动的修复与验证闭环（含数值一致性检查）。
 
 > **面试一句话总结**：项目用 `TQ_PERF_COMPARE_AND_FIX.md` 做了一次教科书式的性能归因——先排除 trainer 基类、batch 规模（两边约 245 个 triplet）、TQ 读取（仅 0.5s）三个变量，把差异收敛到"**TQ 以 nested 存储而 baseline 以 padded 存储**"这一字段布局差异上，根因精确到 `verl/workers/utils/losses.py:85-91` 的 `to_padded_tensor()`：baseline 是 no-op、TQ 版每个 micro-batch 都要真转换 10+ 个 nested 字段，在 NPU 上 4 个 micro-batch 累计 **~15s**；`update_weights +5s` 则是 TQ 栈的 host 线程/带宽与 FSDP `param_offload` 的竞争；修复方案 A 是在 `train_mini_batch` 入口**一次性**把 loss 相关字段转 padded（保留 `input_ids/position_ids` 为 nested），预期 `update_actor` 回到 2~5s、整体比 baseline 还快 ~2s——**共卡的空泡分三类：长尾（等最慢 rollout，`poll_interval=3.0s` 的轮询延迟）、切换（wake/sleep 各 1~3s）、同步（全量 3 GB 权重无增量）**，而共卡的利用率上限就是 $1/(1+\text{切换}/\text{计算})$，想突破就必须回到分卡/异步路线。
+
+---
+
+## 19. 全流程逐步：每一步、每一类张量在哪（HBM / host DRAM / 存储）
+
+### 1. 现有问题：机制讲完了，但面试要的是"一条时间线"
+
+第 12~18 节是按**机制**组织的（三种 RolloutMode → offload 开关 → 切换链 → 权重同步 → TQ 训练循环 → 训练五层栈 → 时间账）。但面试里真正会连着追问的是**同一件事的三个问法**：
+
+1. "这一步**参数**在哪？"（HBM 还是 host DRAM）
+2. "**梯度 / 优化器状态 / 激活**呢？KV cache 呢？"
+3. "**轨迹**呢？在 HBM、DRAM，还是 Mooncake 里？"
+
+而共卡场景下有**三层内存**（HBM / host DRAM / 外部存储），说错一层整个回答就废了。同时要注意分工：**"异步训练空泡"那份面经负责"怎么让推理与训练重叠"（长尾/切换/同步三类空泡、partial rollout、one-step-off 等 7 种方法）；这一节负责"共卡 baseline 下完整流程的每一步张量驻留"**——两份的接口就是第 12 节那条循环和本节的时间线。
+
+### 2. 方法论：先列账、再给状态矩阵、最后走一遍时间线
+
+#### （1）先把"张量账"列全：12 类，一类都不能漏
+
+| # | 张量 / 状态 | 谁创建 | dtype | 1.5B 模型总量 | 常态归宿 |
+|---|---|---|---|---|---|
+| 1 | **FSDP 参数分片**（`flat_param`） | `_build_fsdp_module` | **fp32**（存储） | $4P = 6$ GB | HBM 训练态 / host DRAM 推理态 |
+| 2 | **梯度**（`flat_param.grad`，与参数同 dtype） | `loss.backward()` | fp32 | $4P = 6$ GB | 同上（`grad` 开关硬绑 `model`） |
+| 3 | **Adam `exp_avg`** | `optimizer.step()` 首次 | fp32 | $4P = 6$ GB | 同上（受 `optimizer_offload`） |
+| 4 | **Adam `exp_avg_sq`** | 同上 | fp32 | $4P = 6$ GB | 同上 |
+| 5 | **激活** | forward | bf16（autocast） | 与 micro-batch × token 数成正比 | **只在训练态存在**，backward 后释放 |
+| 6 | **vLLM 权重** | rollout server 启动 / `update_weights` | **bf16**（`rollout.dtype`） | $2P = 3$ GB | HBM 推理态 |
+| 7 | **KV cache** | prefill/生成时按需分配 | bf16（默认） | 由 `gpu_memory_utilization` 限额 | HBM 推理态；sleep 时**丢弃**（level 1/2 都丢） |
+| 8 | **权重同步临时张量** | `get_per_tensor_param()` | bf16（`.to(torch.bfloat16)`） | 峰值 = **最大单个张量**（≈ 0.43 GB） | HBM 瞬时，`del` 后回收 |
+| 9 | **通信 buffer** | FSDP all-gather / NCCL bucket / CUDA IPC | fp32 或 uint8 | FSDP 峰值见（5）；bucket = 2×`bucket_size` | HBM 常驻 |
+| 10 | **TQ 里的轨迹张量** | LLMProxy 写入 | int64/bf16 混合 | 随 batch 与步数增长 | **host DRAM**（SimpleStorage / Mooncake segment 都在 DRAM，RDMA 注册并 pin） |
+| 11 | **pinned host 备份** | vLLM `sleep(level=1)` | uint8 拷贝 | ≈ vLLM 权重（3 GB） | **host DRAM，且不可换出** |
+| 12 | **checkpoint 文件** | `save_checkpoint` | 落盘 | 与模型同量级 | 磁盘 / HDFS（不占 HBM） |
+
+**三个容易答错的点**：① **参数存储是 fp32 不是 bf16**（`MixedPrecision.param_dtype` 只管 forward/backward 的计算精度）；② **没有独立的 fp32 master weights**（参数本身就是 fp32，所以不要照搬"bf16 参数 + fp32 master"那套账）；③ **梯度 reduce 也是 fp32**（`reduce_dtype=fp32`），所以 FSDP 通信量按 fp32 算。
+
+#### （2）三层内存的分工（术语先对齐）
+
+| 层 | 昇腾叫法 | 装什么 | 特征 |
+|---|---|---|---|
+| **HBM** | HBM（GPU 侧叫显存/VRAM） | 参数、梯度、优化器状态、激活、vLLM 权重、KV cache、通信 buffer | 带宽最高（TB/s 级）、容量最小 |
+| **host DRAM** | 内存 | offload 下来的参数/梯度/优化器、pinned 权重备份、**TQ 的轨迹数据** | 容量大、带宽受 PCIe/NVLink 限制 |
+| **外部存储** | 磁盘 / SSD | checkpoint、Mooncake 的 SSD 层（见 `TQ.md` 的分层存储） | 容量最大、最慢 |
+
+#### （3）七个状态的驻留矩阵（核心表）
+
+行是 12 类张量，列是流程的 7 个状态（**H**=HBM，**D**=host DRAM，**—**=不存在）：
+
+| 张量 \ 状态 | ① 初始化 | ② 推理（rollout） | ③ 切换(睡) | ④ 训练 | ⑤ 切换(醒+同步) | ⑥ 验证 | ⑦ 存档 |
+|---|---|---|---|---|---|---|---|
+| 1 参数 | H→**D**（建完即 offload） | D（`param_offload`）/ H（false） | D | **H** | H→D | H（前向） | **H（临时）**→D |
+| 2 梯度 | — | D | D | **H** | →D | — | — |
+| 3/4 优化器 | D | D | D | **H** | →D | — | — |
+| 5 激活 | — | — | — | **H（峰值）** | 释放 | H（少量） | — |
+| 6 vLLM 权重 | H | **H** | **释放**（level 2）/ **D(pinned)**（level 1） | — | **H（重灌）** | H | — |
+| 7 KV cache | H（按限额） | **H** | **释放** | — | **H（重建）** | H | — |
+| 8 同步临时张量 | — | — | — | — | **H（逐个张量）** | — | — |
+| 9 通信 buffer | H（FSDP/通信库） | — | — | **H（all-gather 峰值）** | H（bucket） | — | — |
+| 10 轨迹 | — | **D（TQ 写入）** | D | D（按需读回） | D | D | — |
+| 11 pinned 备份 | — | — | **D（level 1 才有）** | D | D→释放 | — | — |
+| 12 checkpoint | D→H→D（load） | — | — | — | — | — | **磁盘** |
+
+**这张表要能口头复述的两条主线**：① **参数/梯度/优化器三者永远同步搬家**（`grad` 硬绑 `model`，且 `_context_switch` 一次调用把它们一起搬）——所以"参数在 HBM"就等于"梯度、优化器也在 HBM"；② **vLLM 权重与 KV cache 在 HBM 上是"互斥让位"**：推理态它们占着，训练态必须被 sleep 释放（level 2 连权重都丢），这就是"共卡必须切换"的物理原因。
+
+#### （4）逐步时间线：一个 step 的 14 步（带代码位置）
+
+```text
+【阶段 0：初始化 —— 只跑一次】
+ init_workers:
+   ① 建 FSDP engine（模型以 model_dtype=fp32 载入 HBM）→ 建完立刻 to("cpu") 把
+      参数/梯度/优化器 offload 到 host DRAM（fsdp/transformer_impl.py:202-207）
+   ② 建 rollout server（vLLM 权重 bf16 落 HBM）
+   ③ 建 CheckpointEngineManager（main_ppo_sync.py:730-737）
+   ④ checkpoint_manager.sleep_replicas()   ← 注释原文 "sleep all replicas to load checkpoint"
+      （main_ppo_sync.py:739-740）⇒ 此时 vLLM 的 HBM 被清空，为读 checkpoint 腾地
+【阶段 1：加载 checkpoint】trainer.py:459 → engine.load_checkpoint（fsdp/transformer_impl.py:772-792）
+   参数 HBM ← 读盘 → barrier → 参数回 DRAM；**优化器 state 也被 offload 回 DRAM**
+【阶段 2：首次权重同步】trainer.py:460 checkpoint_manager.update_weights()
+   vLLM resume weights → get_per_tensor_param 逐张量物化 → 写进 vLLM 权重 buffer
+   → engine.to("cpu") → empty_cache → resume kv_cache
+   ⇒ 此后 vLLM 权重与 FSDP 参数**各有一份**：vLLM 在 HBM，FSDP 在 DRAM
+
+【阶段 3：每个 step 的循环】agentlightning/verl/trainer.py:280-440 + fit:519-603
+ 第 1 步  wake_up_replicas()（trainer.py:296）
+           vLLM 权重+KV cache 上 HBM（level 2 的权重是"重新灌"）
+ 第 2 步  set_up_data_and_server(global_steps=...)（:299-302）
+           128 条 running 屏障写进 TQ（host DRAM）
+ 第 3 步  ★ agent 跑 rollout（本步最耗时）
+           vLLM：权重 3 GB + KV cache 在 HBM
+           FSDP：参数/梯度/优化器在 host DRAM（不抢 HBM）
+           LLMProxy：把轨迹张量写进 TQ（host DRAM）→ Store 覆写 reward
+ 第 4 步  replay_buffer.sample()（:304-306）★ 忙等
+           driver 只持有 keys/tags（KB 级），**轨迹张量仍在 TQ**
+ 第 5 步  clear_data_and_server()（:308）
+ 第 6 步  sleep_replicas()（:310）
+           level 2：vLLM 权重+KV 全部 unmap 释放（HBM 清零）
+           level 1：权重拷到 pinned host DRAM 备份，KV 释放
+ 第 7 步  [reward] / 过滤 is_drop / _balance_batch（:351-378）
+           ★ _balance_batch 的 padding 样本要写回 TQ（padding_utils.py:179）
+ 第 8 步  _compute_old_log_prob（:390-391）
+           worker 侧 tqbridge 从 TQ 取数 → 前向（engine 的 eval/train ctx 会把参数搬上 HBM）
+           → 写回 old_log_probs/entropy 到 TQ
+ 第 9 步  _compute_ref_log_prob（:394-396）/ _compute_values（:399-401）
+ 第 10 步 _compute_advantage（:406-407）取 7 个字段 → 算 → 写回 advantages/returns
+ 第 11 步 _update_critic（若 use_critic）/ _update_actor（:415-418）
+           ★ 训练五层栈（第 17 节）：train_mode 进入 → 参数/梯度/优化器 H2D
+             → 每个 micro-batch forward（激活产生）+ backward（激活释放、梯度累积）
+             → optimizer.step（更新 fp32 参数与动量）
+             → train_mode 退出 → 全部 D2H 回 DRAM + zero_grad
+ 第 12 步 update_weights()（fit:567-576）
+           resume weights → 逐张量物化到 HBM（峰值 = 最大单张量）
+           → 写进 vLLM → engine.to("cpu") → empty_cache → resume kv_cache
+ 第 13 步 tq.kv_clear(keys=batch.keys, ...)（fit:598）
+           释放这一步在 TQ 里的轨迹（host DRAM / Mooncake）
+ 第 14 步 save_checkpoint（按 save_freq，fit:560-564）
+           ★ engine.save_checkpoint（fsdp/transformer_impl.py:749-770）：
+             if _is_offload_param or 参数已在 CPU → load_fsdp_model_to_gpu（临时上 HBM）
+             → 写盘 → barrier → offload 回 CPU
+```
+
+**注意第 11 步里"参数上 HBM"有两个触发点**：训练本身（`train_mode()`，第 17 节）和**存档**（`save_checkpoint` 会临时搬上 HBM，`fsdp/transformer_impl.py:760-762`）——后者最容易被忽略，也是"存档时 OOM"的常见原因。同理 `load_checkpoint`（`:780-792`）也是"先上 HBM 读盘、再回 DRAM，并把优化器 state 也 offload 回去"。
+
+#### （5）四个隐性 HBM 占用（面试加分项）
+
+| 隐性占用 | 说明 | 量级 |
+|---|---|---|
+| **FSDP all-gather 峰值** | ZeRO-3 下 forward 到某一层时，**该层的完整参数**要被 all-gather 到 HBM（不是只有分片），所以"分片 0.75 GB/卡"**不是**峰值 | 峰值 ≈ 最大一层全量参数 + 激活；靠 `reshard_after_forward`（默认 **true**，`engine/fsdp.yaml:23`）压住 |
+| **通信 buffer** | NCCL/HCCL communicator、FSDP reduce-scatter/all-gather 的 staging | 数十~数百 MB 常驻 |
+| **bucket 双 buffer** | 分卡权重同步时 **2×`bucket_size`**（默认 2×2 GB = 4 GB/rank） | 共卡走 `naive` 时为 0 |
+| **pinned host 不可换出** | vLLM `sleep(level=1)` 的权重备份用 `pin_memory=True`，**会一直占住 host DRAM 且不可被换页** | ≈ vLLM 权重（3 GB 级） |
+
+#### （6）激活的三把闸门（HBM 峰值的最大变量）
+
+| 闸门 | 配置 | 默认 | 效果 |
+|---|---|---|---|
+| 梯度检查点 | `model.enable_gradient_checkpointing` | **True**（`model/hf_model.yaml:34`） | 用重算换显存，激活峰值大降 |
+| 激活 offload | `model.enable_activation_offload` | **False**（`workers/config/model.py:118`） | 开启后走 `verl/utils/activation_offload.py:500` 的 `enable_activation_offloading()`，把激活搬去 host DRAM |
+| micro-batch | `micro_batch_size_per_gpu` | 需显式设 | 线性影响激活峰值 |
+
+#### （7）昇腾 NPU 与 GPU 的差异（本项目跑在 NPU 上）
+
+| 维度 | NPU（昇腾） | GPU |
+|---|---|---|
+| 显存术语 | **HBM** | HBM/GDDR，口语仍叫"显存" |
+| vLLM sleep level | **只能用 level 1**（`vllm_async_server.py` 里 `is_torch_npu_available(...)` → `sleep_level = 1`，因为 vllm-ascend 还不支持 level 2） | level 2（≥ vLLM 0.8.5） |
+| 集合通信后端 | **hccl**（`hccl_checkpoint_engine.py`；注意它的注册名被写成了 `"nccl"`） | nccl / nixl |
+| 变长张量算子 | `torch.nested` 多为**慢速/回退路径**（第 18 节 15s 的根因） | 同样偏慢但没那么严重 |
+| 大页/锁页 | 需要 `ulimit -l unlimited`、大页配置（与 `TQ.md` 里 Yuanrong 的 `--enable_huge_tlb` 同一类要求） | 同 |
+
+### 3. 具体数值样例
+
+#### 样例 A：一个 step 的 HBM 占用曲线（1.5B，8 卡，共卡，`param_offload=true`，level 2）
+
+```text
+时刻                 vLLM 权重  KV cache  FSDP 参/梯/优化器  激活   同步临时   HBM 峰值
+─────────────────────────────────────────────────────────────────────────────────────
+t0 初始化(建完)         3.0       0.0          0.0(已在DRAM)   0.0     0.0       3.0
+t1 sleep 后(读 ckpt)    0.0       0.0          0.0             0.0     0.0       0.0
+t2 首次 update_weights  3.0       0.0          0.0             0.0     0.43      3.4  ← 逐张量物化
+t3 wake_up(推理开始)    3.0      10.0          0.0             0.0     0.0      13.0
+t4 rollout 进行中       3.0      10.0          0.0             0.0     0.0      13.0
+t5 sleep_replicas       0.0       0.0          0.0             0.0     0.0       0.0
+t6 train_mode 进入      0.0       0.0          3.0             0.0     0.0       3.0
+t7 训练(峰值)           0.0       0.0          3.0            ~1-3    0.0     4~6+   ← all-gather 再加
+t8 train_mode 退出      0.0       0.0          0.0             0.0     0.0       0.0
+t9 update_weights       3.0       0.0          0.0             0.0     0.43      3.4
+t10 resume kv_cache     3.0      10.0          0.0             0.0     0.0      13.0
+─────────────────────────────────────────────────────────────────────────────────────
+⇒ 全程 HBM 峰值 ≈ 13 GB（24 GB 卡可行）；**训练阶段与推理阶段不重叠**是共卡的代价
+⇒ 若 free_cache_engine=false：t5 不释放 → t7 变 13+3+激活 ≈ 17+ GB → 逼近/超过 24 GB
+```
+
+#### 样例 B：host DRAM 账（同一配置）
+
+```text
+host DRAM 常驻：
+  offload 的是**本 rank 的分片**：(参数 4P + 梯度 4P + Adam 8P)/8 卡 = (6+6+12)/8 = 3 GB/进程
+  若 level 1：再加 pinned 权重备份 3 GB/卡（不可换出 → 影响 OS 内存回收）
+  TQ 轨迹：一 step 245 个 triplet × 每个几万字节 → 十 MB 级；
+          但 num_data_storage_units=8 × total_storage_size=100000 是**配额上限**（见 TQ.md）
+  ⇒ host DRAM 需求 ≈ 3 GB/进程（offload）+ TQ 配额 + pinned 备份
+  ⇒ 这解释了第 18 节"update_weights +5s"：offload 的 D2H/H2D 与
+    TQ 栈（controller + 8 storage unit + store + proxy + 轮询线程）抢同一条内存带宽
+```
+
+#### 样例 C：与"异步训练空泡"面经的分工
+
+| 问题 | 本文（共卡完整流程） | 异步空泡面经 |
+|---|---|---|
+| 参数在哪 / 怎么 offload | ✅ 第 13、19 节 | 引用 |
+| 权重怎么同步 | ✅ 第 15 节（naive vs checkpoint_engine） | 引用（delta sync 作为优化） |
+| 一次 step 的完整顺序 | ✅ 第 16、17、19 节 | 只看重叠部分 |
+| 空泡分类与消除（长尾/切换/同步） | 只给"共卡固有成本 + 利用率上限"（第 12、18 节） | ✅ 主体 |
+| partial rollout / one-step-off / fully async | — | ✅ 主体 |
+| staleness 控制 | — | ✅ 主体 |
+
+**接口就是第 12 节那条循环**：本文给的是"串行版本的每一步"，异步面经给的是"把哪几步拆开并行、代价是什么"。
+
+> **面试一句话总结**：共卡下"每一步张量在哪"有一条极简主线——**训练态：参数(fp32)、梯度(fp32)、Adam 动量(fp32) 三者在 HBM，激活也在 HBM 且随 micro-batch 变化（`enable_gradient_checkpointing=True` 是默认，`enable_activation_offload=False` 是默认）；推理态：这三者被 offload 到 host DRAM，HBM 让给 vLLM 的 bf16 权重（3 GB）与 KV cache（由 `gpu_memory_utilization` 限额）；切换点：`sleep_replicas` 把 vLLM 权重+KV 释放（level 2 全丢 / level 1 权重进 pinned DRAM），`train_mode()` 进入时把参数/梯度/优化器一起 H2D、退出时一起 D2H**；权重同步时 `get_per_tensor_param` **逐张量物化**，所以 HBM 峰值只是"最大单个张量"（≈0.43 GB），而 NCCL 分卡路径要额外常驻 2×`bucket_size`；**TQ 里的轨迹张量始终在 host DRAM**（SimpleStorage 与 Mooncake 的 segment 都在 DRAM，且被 RDMA 注册 pin 住），driver 全程只持有 keys/tags；四个容易漏的隐性占用是 **FSDP all-gather 峰值（分片大小 ≠ 峰值）、通信 buffer、bucket 双 buffer、pinned 备份不可换出**；NPU 侧要特别记住 **sleep level 只能用 1**、通信走 hccl、`torch.nested` 是慢路径。
 
 ---
 
