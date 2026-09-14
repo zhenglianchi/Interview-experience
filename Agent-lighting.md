@@ -2,7 +2,7 @@
 
 > **Microsoft 的 agent 强化学习训推框架：Algorithm × Runner × TrajStore（LightningStore）三件套 + VERL 集成。**
 
-Agent Lightning（`agentlightning`，简称 agl）是微软研究院开源的"**用强化学习训练任意 agent**"的框架，核心卖点是**对 agent 几乎零代码改动**（任何 agent 框架甚至纯 Python 都能接入）。它的架构围绕三个核心组件组织：**Algorithm（算法，系统的"大脑"）、Runner（执行器，系统的"工人"）、LightningStore（轨迹存储，系统的"数据库+消息队列"）**——三者构成一个持续循环：Algorithm 派发任务 → Runner 执行 agent 并流式回传轨迹（spans）→ Algorithm 从 store 取回轨迹、转成训练样本、更新模型。**我们实际采用三机分离部署：store、algo、agent（runner）分别部署在三台不同的机器，全部通过 store 的 HTTP 地址连接**——本指南全文都以此部署形态为语境（三机分离下，algo 机与 agent 机对 store 的一切访问都是 HTTP；只有 Runner 进程内部的 Agent 调用和算法内部的 Adapter 转换是实例直接调用）。本指南先逐个讲清这三个部分各自的职责与实现，再讲它们如何组成整体架构，最后重点讲与 **verl**（Volcengine 的开源 RL 训练框架）的集成关系。
+Agent Lightning（`agentlightning`，简称 agl）是微软研究院开源的"**用强化学习训练任意 agent**"的框架，核心卖点是**对 agent 几乎零代码改动**（任何 agent 框架甚至纯 Python 都能接入）。它的架构围绕三个核心组件组织：**Algorithm（算法，系统的"大脑"）、Runner（执行器，系统的"工人"）、LightningStore（轨迹存储，系统的"数据库+消息队列"）**——三者构成一个持续循环：Algorithm 派发任务 → Runner 执行 agent 并流式回传轨迹（spans）→ Algorithm 从 store 取回轨迹、转成训练样本、更新模型。**我们实际采用三机分离部署：store、algo、agent（runner）分别部署在三台不同的机器，全部通过 store 的 HTTP 地址连接**——本指南全文都以此部署形态为语境（三机分离下，algo 机与 agent 机对 store 的一切访问都是 HTTP；只有 Runner 进程内部的 Agent 调用和算法内部的 Adapter 转换是实例直接调用）。本指南先逐个讲清这三个部分各自的职责与实现，再讲它们如何组成整体架构，最后重点讲与 **verl**（Volcengine 的开源 RL 训练框架）的集成关系；**第三部分（第 6~11 节）专门钻进轨迹本身**——一条轨迹是在哪一行代码被"抓住"的（三条记录通路 + 插桩细节）、`Span` 模型长什么样、怎么变成 HTTP 请求落到 store（OTLP protobuf 批量 vs 逐条 JSON，含 proxy 的子树缓冲专线）、到了 store 之后怎么从一堆扁平 span **重建成一棵树**（`TraceTree.from_spans` + `repair_hierarchy`）、怎么变成训练用的 triplet，以及分布式下的**有序性/幂等/静默失败**语义。
 
 > 说明：本文基于官方仓库 `agent-lightning-official` 的 **v0.3.0** 分支（tag `v0.3.0`，commit 3b5d7338）讲解。**我们实际训练使用的是 v1 执行模式**（`AgentModeDaemon` 的 `mode` 参数默认即 `"v1"`）——v1 模式下任务的派发、轨迹的回收、资源的传递全部通过 LightningStore 完成（Runner 与算法完全解耦）；v0 模式（自起 Flask server）仅作为历史兼容保留，本文以 v1 为主线。**部署形态统一为三机分离（见第 4 点详述）**：store 单独一台机器跑 `LightningStoreServer`（`agl store --port 4747`），algo 机器和 agent 机器都作为 `LightningStoreClient` 通过 HTTP 连它。
 
@@ -373,7 +373,7 @@ class LightningStoreClient(LightningStore):
 
 **这段代码关键在哪**：`LightningStoreClient` 实现了和 `LightningStoreServer` **完全相同的接口**（都是 `LightningStore` 子类），所以 Algorithm/Runner 代码**一行不用改**——三机分离时注入 Client（内部走 HTTP）、单机调试时注入内存 store（直接方法调用），对调用方完全透明。这正是"三机分离部署"的代码基础：store 机器跑 Server，algo/agent 机器注入指向它的 Client。
 
-**存储的内容**（五类数据 + 一个队列）：`rollouts`（任务单元，含输入/元数据/生命周期状态 queuing→preparing→running→succeeded/failed/requeuing/cancelled）、`attempts`（每次执行尝试，一个 rollout 可多次 attempt，对应失败重试；状态 preparing→running→succeeded/failed，watchdog 可判 timeout/unresponsive）、`spans`（轨迹事件，按 (rollout_id, attempt_id, sequence_id) 单调序号排序）、`resources`（版本化资源，如 prompt 模板 / LLM 端点）、`workers`（runner 心跳元数据），以及一个 `rollout_queue`（FIFO 任务队列）。**Attempt 与 Rollout 的关系**：rollout 是"外部视图"，attempt 是"内部执行视图"——Runner 实际执行的是 attempt，rollout 状态是"最新 attempt 状态 + 排队/取消控制"的聚合。
+**存储的内容**（五类数据 + 一个队列 + 一个计数器）：`rollouts`（主键 `rollout_id`；任务单元，含输入/元数据/生命周期状态 queuing→preparing→running→succeeded/failed/requeuing/cancelled）、`attempts`（主键 `rollout_id + attempt_id`；每次执行尝试，一个 rollout 可多次 attempt，对应失败重试；状态 preparing→running→succeeded/failed，watchdog 可判 timeout/unresponsive）、`spans`（主键 `rollout_id + attempt_id + span_id`；轨迹事件，同一 rollout 内按 `sequence_id` 单调排序）、`resources`（主键 `resources_id`；版本化资源，如 prompt 模板 / LLM 端点）、`workers`（主键 `worker_id`；runner 心跳元数据）、一个 `rollout_queue`（FIFO 任务队列），以及一个 `span_sequence_ids` KeyValue（按 `rollout_id` 的单调计数器）。**Attempt 与 Rollout 的关系**：rollout 是"外部视图"，attempt 是"内部执行视图"——Runner 实际执行的是 attempt，rollout 状态是"最新 attempt 状态 + 排队/取消控制"的聚合。
 
 **分层实现**（`store/` 目录，官方 classDiagram）：
 
@@ -383,7 +383,7 @@ class LightningStoreClient(LightningStore):
 
 **开箱即用的实现**：`InMemoryLightningStore`（默认，零依赖，适合开发/CI/测试，锁模式可配 asyncio/thread）、`MongoLightningStore`（生产持久化、多进程安全、支持 `partition_id` 多 trainer 隔离）。通过 `capabilities` 属性（thread_safe / async_safe / zero_copy / otlp_traces）声明各自能力。
 
-**spans 的分布式有序性**（关键设计）：分布式下不同进程产生的 span 时间戳可能乱序，store 强制每个 span 在写入前先 `get_next_span_sequence_id(rollout_id, attempt_id)` 领取单调递增的序号，保证 (rollout_id, attempt_id) 内的轨迹可稳定排序/合并。OTEL span 经 `Span.from_opentelemetry()` 归一化后存储，且 store 暴露标准 OTLP `/v1/traces` 端点，任何 OpenTelemetry 兼容的 SDK/collector 都能直接灌 span。
+**spans 的分布式有序性**（关键设计）：分布式下不同进程产生的 span 时间戳可能乱序，store 强制每个 span 在写入前先 `get_next_span_sequence_id(rollout_id, attempt_id)` 领取单调递增的序号，保证**同一 rollout 内**的轨迹可稳定排序/合并。**注意计数粒度**：该方法的 `attempt_id` 只出现在签名里，计数器实际以 `rollout_id` 为键（`store/collection_based.py:1041-1049`，docstring 原话 "The number is strictly increasing for **each rollout**"），所以**重试产生的新 attempt 不会重置序号**，跨 attempt 的 span 必须靠 `attempt_id` 过滤来区分（详见第 11 节）。spans collection 的主键是 `["rollout_id", "attempt_id", "span_id"]`（`store/collection/memory.py:826`），这也是重复上传能被幂等丢弃的根据。OTEL span 经 `Span.from_opentelemetry()` 归一化后存储，且 store 暴露标准 OTLP `/v1/traces` 端点（`store/client_server.py:940-955`），任何 OpenTelemetry 兼容的 SDK/collector 都能直接灌 span——**这条 OTLP 路也是我们三机分离部署下实际走的传输路径**（详见第 8 节）。
 
 ### 3. 具体数值样例
 
@@ -639,6 +639,1276 @@ Algorithm 查询 spans ──▶ Adapter（TracerTraceToTriplet）
 
 ---
 
+# 三、轨迹（Trace / Span）的完整生命周期：产生 → 记录 → HTTP 传输 → 建树 → 转训练样本
+
+前面讲了"谁负责什么"，这一部分专门钻进**数据本身**：一条轨迹在 Agent Lightning 里到底长什么样、它是在哪一行代码被"抓住"的、又是怎么变成 HTTP 请求落到 store 的、到了 store 之后怎么从一堆扁平 span 重建成一棵树、最后怎么变成 verl 能吃的 triplet。**这是面试里最容易被追问到底层的部分**（"你说 Tracer 自动记录，那它到底 hook 了什么？""span 怎么保证顺序？""父子关系断了两条 span 还算一棵树吗？"）。
+
+## 6. 轨迹是怎么被记录的：三条记录通路
+
+### 1. 现有问题：agent 代码零改动的前提下，轨迹从哪来
+
+Agent Lightning 的卖点是"agent 几乎零代码改动"，但训练又需要**逐次 LLM 调用的 token 级信息**（`prompt_token_ids` / `response_token_ids` / `logprobs` / reward）。这两件事天然矛盾：**不改 agent 代码，凭什么知道它调了几次模型、每次用了哪些 token？** 答案是把"记录"这件事拆成**三条互不相同的通路**，各自负责一类信号：
+
+1. **函数插桩（instrumentation）**——不需要 agent 配合，靠 monkey-patch 把第三方库（agentops / litellm / langchain / vllm）的关键函数换掉，在调用前后自动开 span、写属性。这是"自动记录"的主力；
+2. **主动 emitter**——agent 自己知道"这一轮我得了多少分"，需要主动上报（`emit_reward` / `emit_message` / `emit_object` / `emit_exception`）。这是"语义记录"，插桩抓不到；
+3. **LLMProxy 侧记录**——agent 的 LLM 调用全都经过 proxy，proxy 作为独立服务自己也能产生 span（它是 LiteLLM 的 OpenTelemetry 集成），而且**只有它知道 agent 用的是哪个 rollout/attempt**。
+
+三条通路产生的 span 最终汇到同一个 `TracerProvider`，由同一个 `SpanProcessor` 统一落库——所以先要理解 **Tracer 的全局单例机制**，否则会看不懂"为什么 emit_reward 必须在 trace_context 里才不报错"。
+
+### 2. 方法论：插桩、emitter、proxy 三路记录是怎么实现的
+
+**（1）Tracer 抽象与"当前活跃 Tracer"的单例语义。** `Tracer` 是插件式基类（`tracer/base.py:27`），核心接口是 `trace_context()`（异步上下文管理器，进入时开 trace、退出时收口）、`create_span()`（凭空造 span，emitter 用）、`operation_context()`（记录一段操作，返回 `SpanRecordingContext` 可记异常/属性/状态）、`get_last_trace()`（取最近一次 trace 的 span 列表）。
+
+关键机制在 `with_active_tracer_context` 装饰器 + 模块级全局变量（`tracer/base.py:22,257-285`）：
+
+```python
+_active_tracer: Optional[Tracer] = None
+
+def set_active_tracer(tracer: Tracer):
+    global _active_tracer
+    if _active_tracer is not None:
+        raise ValueError("An active tracer is already set. Cannot set a new one.")
+    _active_tracer = tracer
+
+class _ActiveTracerAsyncCM(AsyncContextManager[T]):
+    async def __aenter__(self):
+        set_active_tracer(self._tracer)      # 嵌套会直接抛错
+        ...
+    async def __aexit__(self, *args, **kwargs):
+        try:
+            return await self._inner.__aexit__(*args, **kwargs)
+        finally:
+            clear_active_tracer()
+```
+
+**这段代码关键在哪**：① `trace_context` 被 `@with_active_tracer_context` 包住，所以"进入 trace 上下文"= "把某个 Tracer 设为进程内的活跃 Tracer"；② `set_active_tracer` 遇到已有活跃 Tracer 会 `raise`，即**同进程不支持 trace 上下文嵌套**（多 runner 要各占一个进程/线程）；③ emitter 就是靠 `get_active_tracer()` 拿到这个单例来造 span 的——**这就是"emit_reward 必须在 trace_context 内"的根因**。
+
+**（2）两条记录通路的差别：`OtelTracer` vs `AgentOpsTracer`。** 这是最容易答错的一点——两个 Tracer 的能力完全不同：
+
+| Tracer | 能记录什么 | 源码自述 |
+|---|---|---|
+| `OtelTracer`（`tracer/otel.py:73`） | 只有 Agent Lightning **自己的信号**（emitter 产生的 reward/message/object/annotation span） | "You should be able to collect agent-lightning signals like rewards with this tracer, but **no other function instrumentations like `openai.chat.completion`**" |
+| `AgentOpsTracer`（`tracer/agentops.py:32`） | OTel 全部能力 + 第三方库插桩（openai / litellm / langchain / vllm） | 继承 `OtelTracer`，额外调 `instrument_all()` |
+
+`AgentOpsTracer._initialize_tracer_provider()` 的初始化顺序很关键（`tracer/agentops.py:70-96`）：
+
+```python
+def _initialize_tracer_provider(self, worker_id: int):
+    if self.instrument_managed:
+        self.instrument(worker_id)          # = instrument_all()，先插桩
+    if self.agentops_managed:
+        os.environ.setdefault("AGENTOPS_API_KEY", "dummy")     # 不需要真 key
+        if not agentops.get_client().initialized:
+            agentops.init(auto_start_session=False)            # 只初始化 SDK，不开 session
+    span_processors = get_span_processors(self._get_tracer_provider(), LightningSpanProcessor)
+    if len(span_processors) > 0:
+        self._lightning_span_processor = span_processors[0]    # 复用已有的，避免重复注册
+    else:
+        self._lightning_span_processor = LightningSpanProcessor()
+        self._get_tracer_provider().add_span_processor(self._lightning_span_processor)
+```
+
+**注意 `AGENTOPS_API_KEY` 默认塞的是字符串 `"dummy"`**——因为 Agent Lightning **不把数据发到 AgentOps 云端**，只用它的本地插桩能力。
+
+**（3）"不发云端"的证据：`_patch_exporters` 把 exporter 换成可旁路的实现。** `instrumentation/agentops.py:49-58` 直接把 agentops 模块里的 exporter 和客户端换成 `Bypassable*` 子类：
+
+```python
+def _patch_exporters():
+    agentops.sdk.core.AuthenticatedOTLPExporter = BypassableAuthenticatedOTLPExporter
+    agentops.sdk.core.OTLPMetricExporter = BypassableOTLPMetricExporter
+    if hasattr(agentops.sdk.core, "OTLPSpanExporter"):
+        agentops.sdk.core.OTLPSpanExporter = BypassableOTLPSpanExporter
+    agentops.client.api.V3Client = BypassableV3Client
+    agentops.client.api.V4Client = BypassableV4Client
+```
+
+而 `BypassableV3Client.fetch_auth_token` 在服务未启用时**直接返回假的 token**（`instrumentation/agentops.py:292-297`）：
+
+```python
+def fetch_auth_token(self, *args, **kwargs) -> AuthTokenResponse:
+    if _agentops_service_enabled:
+        return super().fetch_auth_token(*args, **kwargs)
+    else:
+        return AuthTokenResponse(token="dummy", project_id="dummy")
+```
+
+`_agentops_service_enabled` 默认 `False`（`instrumentation/agentops.py:29`），也就是**默认纯本地模式**：不鉴权、不上报、不请求 agentops.ai。`BypassableAuthenticatedOTLPExporter` 更是同时继承 `LightningStoreOTLPExporter`（`instrumentation/agentops.py:248`），把导出目标**直接改指向 LightningStore**。
+
+**（4）插桩到底"插"了什么：monkey-patch `handle_chat_attributes`。** agentops 内部用 `handle_chat_attributes(args, kwargs, return_value)` 把一次 LLM 调用的信息转成 OTel span 属性。Agent Lightning 把它整体替换，**追加 vLLM 特有的 token 字段**（`instrumentation/agentops.py:92-147`，按 agentops 版本走 `_patch_new_agentops` / `_patch_old_agentops` 两条分支）：
+
+```python
+_original_handle_chat_attributes = handle_chat_attributes
+
+def _handle_chat_attributes_with_tokens(args=None, kwargs=None, return_value=None, **kws):
+    attributes = _original_handle_chat_attributes(args=args, kwargs=kwargs, return_value=return_value, **kws)
+    return_value = _unwrap_legacy_response(return_value)      # 处理 LegacyAPIResponse（LiteLLM / LangChain）
+
+    if return_value is not None and hasattr(return_value, "prompt_token_ids"):
+        attributes["prompt_token_ids"] = list(return_value.prompt_token_ids)
+    if return_value is not None and hasattr(return_value, "response_token_ids"):
+        attributes["response_token_ids"] = list(return_value.response_token_ids[0])
+    ...
+    if hasattr(first_choice, "logprobs") and first_choice.logprobs is not None:
+        attributes["logprobs.content"] = json.dumps([lp.model_dump() for lp in first_choice.logprobs.content])
+    return attributes
+```
+
+**这段代码关键在哪**：训练需要的 token id 和 logprob **不是 OTel 标准字段**，是靠这个补丁塞进 span attributes 的；没有它，后面 Adapter 拿不到 token，轨迹就是废的。
+
+**（5）token id 的完整传递链条（六跳，面试可以直接背这条链）。** 这是理解"轨迹为什么能变成训练样本"的关键：
+
+```text
+① vLLM 引擎内部产生 prompt_token_ids / response_token_ids
+     ↓  instrumentation/vllm.py: OpenAIServingChat.chat_completion_full_generator 被替换，
+        用 _generate_inceptor() 包住 result_generator，边算边把 token ids 抓出来，
+        再 response.model_copy(update={"prompt_token_ids":..., "response_token_ids":...})
+     ↓
+② 这两个字段被塞进 ChatCompletionResponse（vLLM 侧新增字段）
+     ↓  注释：该插桩已上游化（"merged to upstream vLLM since v0.10.2"）
+③ OpenAI SDK 客户端反序列化出对象（可能是 LegacyAPIResponse，
+    需要 _unwrap_legacy_response() 调 response.parse()）
+     ↓
+④ agentops 的 handle_chat_attributes 读出 token ids（Agent Lightning 的补丁）
+     ↓
+⑤ 写进 OTel span 的 attributes["prompt_token_ids"] / ["response_token_ids"] / ["logprobs.content"]
+     ↓
+⑥ TracerTraceToTriplet.span_to_triplet() 读回 token ids → Triplet.prompt["token_ids"] / response["token_ids"]
+     ↓
+⑦ AgentModeDaemon 转成 verl DataProto 的 input_ids / response_ids → 真正进训练
+```
+
+**一个真实的坑**：`instrumentation/__init__.py:25-32` 里 vLLM 插桩的 import 被显式注释掉了，并留了一句全大写的警告：
+
+```python
+# MAGIC! DO NOT TOUCH THIS!
+# vllm import will cause reward tracing function to fail and produce nothing.
+# try:
+#     from . import vllm
+#     VLLM_INSTALLED = True
+# except ImportError:
+#     pass
+```
+
+也就是说 **v0.3.0 的默认组合里，vLLM 的 token-id 插桩不通过这条路径启用**（改由 verl 侧的 `PatchedvLLMServer` + `instrument_vllm()` 显式调，见 `verl/async_server.py`），否则会破坏 reward 的 tracer。
+
+**（6）第二条通路：emitter 主动上报。** `emit_reward(1.0)` 的落点是 `emit_annotation`（`emitter/reward.py:204-206` → `emitter/annotation.py:35-67`）：
+
+```python
+def emit_annotation(annotation: Dict[str, Any], propagate: bool = True) -> SpanCoreFields:
+    annotation_attributes = flatten_attributes(annotation, expand_leaf_lists=False)   # 嵌套 dict 展平
+    check_attributes_sanity(annotation_attributes)
+    sanitized_attributes = sanitize_attributes(annotation_attributes)
+
+    if propagate:
+        tracer = get_active_tracer()
+        if tracer is None:
+            raise RuntimeError("No active tracer found. Cannot emit annotation span.")
+    else:
+        tracer = DummyTracer()
+
+    return tracer.create_span(name=AGL_ANNOTATION, attributes=sanitized_attributes,
+                              status=TraceStatus(status_code="OK"))
+```
+
+**三个要点**：① `flatten_attributes` 把嵌套 dict 展平成点分键——多维 reward `{"task_completion": 1.0, "efficiency": 0.8}` 最终是 `agentlightning.reward.0.name` / `agentlightning.reward.0.value` 这样的扁平属性（`semconv.py:108-123`），**读取时再由 `_attributes_unflatten_multiple` 反展平**；② `propagate=False` 走 `DummyTracer`，只返回字段不上报（用于"只想拿字段给别的 span 用"的场景）；③ `get_active_tracer() is None` 时**抛 RuntimeError** ——这就是"必须在 `trace_context` 内 emit"的硬约束。
+
+多维度 reward 的写法与约定（`emitter/reward.py:179-206`）：primary_key 指定的那维排第一，**读取时取列表第一个作为 scalar reward**（`emitter/reward.py:218-222`：`return reward_list[0].value`）。
+
+**（7）第三条通路：proxy 侧记录。** LLMProxy 是 LiteLLM 起的独立服务，挂了一组中间件（`llm_proxy.py:536-620`），其中 `RolloutAttemptMiddleware` 保留了"记录轨迹"的必要上下文（详见第 8 节）：
+
+```python
+class RolloutAttemptMiddleware(BaseHTTPMiddleware):
+    """Rewrites /rollout/{rid}/attempt/{aid}/... -> /...
+    and injects x-rollout-id, x-attempt-id, x-sequence-id headers."""
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        match = re.match(r"^/rollout/([^/]+)/attempt/([^/]+)(/.*)?$", path)
+        if match:
+            rollout_id, attempt_id = match.group(1), match.group(2)
+            new_path = match.group(3) if match.group(3) is not None else "/"
+            request.scope["path"] = new_path                  # 重写路径，下游看到干净的 OpenAI 路径
+            store = get_active_llm_proxy().get_store()
+            if store is not None:
+                sequence_id = await store.get_next_span_sequence_id(rollout_id, attempt_id)
+                request.scope["headers"] = list(request.scope["headers"]) + [
+                    (b"x-rollout-id", rollout_id.encode()),
+                    (b"x-attempt-id", attempt_id.encode()),
+                    (b"x-sequence-id", str(sequence_id).encode()),
+                ]
+        return await call_next(request)
+```
+
+URL 的 `/rollout/{rid}/attempt/{aid}` 前缀是 `ProxyLLM.get_base_url()` 拼出来的（`types/resources.py:110-143`）：先去掉尾部 `/v1`，拼上 `/rollout/{rollout_id}/attempt/{attempt_id}`，再把 `/v1` 加回去——**这就是"每个 rollout 一个唯一端点"的实现**，proxy 靠它把请求归属到具体 attempt，并顺手分配 sequence id。
+
+**（8）三路信号最终在哪落地：`LightningSpanProcessor.on_end()`。** 所有通路产生的 span 在"结束时"进同一个处理器（`tracer/otel.py:472-519`）：
+
+```python
+STORE_WRITE_TIMEOUT_SECONDS = 10.0
+
+def on_end(self, span: ReadableSpan) -> None:
+    if not span.context or not span.context.trace_flags.sampled:   # 未采样的 span 直接丢
+        return
+
+    if not self._disable_store_submission and self._store and self._rollout_id and self._attempt_id:
+        try:
+            with suppress_instrumentation():        # 别让"上传 span"这个动作自己又产生 span
+                self._ensure_loop()
+                uploaded_span = self._await_in_loop(
+                    self._store.add_otel_span(self._rollout_id, self._attempt_id, span),
+                    timeout=STORE_WRITE_TIMEOUT_SECONDS,
+                )
+                if uploaded_span is not None:
+                    self._spans.append(uploaded_span)
+        except TimeoutError:
+            logger.warning("Timed out adding span %s to store after %.1f seconds. ...", span.name, ...)
+            self._spans.append(Span.from_opentelemetry(span, ..., sequence_id=self._local_sequence_id))
+        except Exception:
+            logger.exception(f"Error adding span to store: {span.name}. The span will be store locally only.")
+```
+
+**四个关键设计**：① `on_end` 是**同步**接口（OTel SDK 在业务线程里调它），但 `add_otel_span` 是协程——于是 `LightningSpanProcessor` **自建一个名为 `otel-loop` 的守护线程跑私有 event loop**，用 `asyncio.run_coroutine_threadsafe(...).result(timeout=10)` 把协程同步化；② `suppress_instrumentation()` 防止"上传动作"被插桩后无限递归；③ 超时或异常时**只落本地 `_spans`**，不对调用方抛异常（注释：`on_end MUST NOT raise`）——代价是 **store 里永久缺这条 span**（第 11 节展开）；④ 提供一个"自死锁"保护（`tracer/otel.py:401-433`）：如果 `on_end` 恰好跑在 `otel-loop` 线程自己身上（GC 在 loop 线程里触发 `__del__` 的罕见情形），就改用 `call_soon_threadsafe` 发后不理，否则 `fut.result()` 会永久卡死。
+
+### 3. 具体数值样例
+
+假设一个 SQL agent 一次 rollout：**3 轮 LLM 调用 + 2 次工具执行 + 1 个 reward**，逐条演算 span 是怎么被造出来的：
+
+```text
+进入 trace_context(name=rollout_id, rollout_id="r-1", attempt_id="a-1")
+  → OtelTracer.trace_context 里做两件事：
+     · 若 store.capabilities["otlp_traces"] == True → _enable_native_otlp_exporter()
+     · self._lightning_span_processor.with_context(store, "r-1", "a-1")   ← 给后续所有 span 打上归属
+
+第 1 轮 LLM 调用（agent 调 openai chat completions，走 proxy）：
+  · proxy 的 RolloutAttemptMiddleware 命中 /rollout/r-1/attempt/a-1/v1/chat/completions
+    → 重写为 /v1/chat/completions，并分配 x-sequence-id=1，注入 3 个 header
+  · LiteLLM 的 OTel 集成开 span: name="openai.chat.completion", parent=root
+  · agentops 的 handle_chat_attributes 被 AGL 补丁替代 → 往属性里塞：
+      prompt_token_ids   = [128000, 9707, ...]         (512 个 int)
+      response_token_ids = [2675, 527, ...]            (180 个 int)
+      logprobs.content   = '[{"token":"SELECT", ...}]' (180 条，JSON 字符串)
+  · span.end() → LightningSpanProcessor.on_end()
+      → 私有 otel-loop 线程执行 add_otel_span("r-1","a-1", span)  （10s 超时）
+      → store 返回 span（带 sequence_id=1）→ 追加进本地 _spans
+
+第 1 次工具执行（agent 自己调 execute_sql）：
+  · 若 agent 用 @operation 装饰器包装 → operation_context 开一个 span
+      name="agentlightning.operation", attributes["agentlightning.operation.name"]="execute_sql"
+  · 若 agent 什么都不做 → 这个动作不会被记录（插桩只覆盖被 hook 的库）
+
+第 2、3 轮 LLM 调用：同上，sequence_id = 2、3
+
+reward 上报：
+  · agent 代码显式调用：emit_reward(1.0)
+  · emit_annotation → flatten → {"agentlightning.reward.0.value": 1.0}
+  · tracer.create_span(name="agentlightning.annotation", attributes={...})
+      → on_end → add_otel_span → sequence_id = 4
+
+trace_context 退出：
+  · _lightning_span_processor.__exit__ 清空 store/rollout_id/attempt_id
+  · clear_active_tracer()
+
+最终 store 里这个 attempt 有 5~6 条 span，sequence_id 1..4（+ 工具 span 若有）
+```
+
+**三个量化结论**：① **不是所有 agent 动作都能被记录**——插桩只覆盖被 hook 的库（openai/litellm/langchain/vllm）和显式 `@operation` 的代码，普通 Python 函数调用不会被记录；② **每条 span 一次 HTTP/一次 store 调用**，10s 是硬超时；③ `prompt_token_ids` 有 512 个整数，`logprobs.content` 是 180 条 JSON——**一条 LLM span 的属性体积远超 span 本身的结构字段**，这是第 8 节讨论传输开销的前提。
+
+> **面试一句话总结**：Agent Lightning 的轨迹记录靠三条通路——① **函数插桩**（`AgentOpsTracer` → `instrument_all()` monkey-patch agentops 的 `handle_chat_attributes`，把 vLLM 的 `prompt_token_ids`/`response_token_ids`/`logprobs` 追加进 span attributes，并把 agentops 的 exporter 换成 `Bypassable*` 实现**纯本地、不发 agentops 云端**）；② **主动 emitter**（`emit_reward` → `emit_annotation` → `flatten_attributes` 展平成 `agentlightning.reward.0.value` → `get_active_tracer().create_span()`，因此**必须在 `trace_context` 内**，否则 `RuntimeError: No active tracer found`）；③ **proxy 侧记录**（`RolloutAttemptMiddleware` 重写 `/rollout/{rid}/attempt/{aid}/...` 并注入 `x-rollout-id`/`x-attempt-id`/`x-sequence-id`）；三路 span 统一在 `LightningSpanProcessor.on_end()` 落地，由专属 `otel-loop` 线程把协程 `add_otel_span` 同步化，**10s 超时、异常只落本地不抛**；`OtelTracer` 只收 AGL 自身信号、`AgentOpsTracer` 才带第三方库插桩——这一条最容易被问倒。
+
+---
+
+## 7. Span 数据模型：一条轨迹在 store 里到底长什么样
+
+### 1. 现有问题：原生的 `ReadableSpan` 不能直接跨机存储
+
+OTel 的 `ReadableSpan` 是**内存对象**：它有 `Resource`、`SpanContext`、看起来像 tuple 的 attributes、`status` 是枚举对象、时间戳是**纳秒整数**，还挂着 `span_processor` 之类的运行时引用。直接 `json.dumps` 必然失败，跨机器传输更不可能。同时训练侧还需要三类 OTel 里**根本不存在**的字段：**属于哪个 rollout / 哪个 attempt / 在一堆 span 里排第几**。所以 Agent Lightning 必须定义自己的规范 Span 模型：既要能无损装下 OTel 的语义字段，又要能安全序列化跨机，还要能挂上业务路由字段。
+
+### 2. 方法论：`Span` 模型与 `from_opentelemetry` 的逐字段映射
+
+**（1）`Span` 的字段分四组**（`types/tracer.py:251-306`，`model_config = ConfigDict(extra="allow")`）：
+
+| 组 | 字段 | 含义 |
+|---|---|---|
+| **业务路由** | `rollout_id` / `attempt_id` / `sequence_id` | 归属哪个 rollout、哪次 attempt、attempt 内第几个（排序依据） |
+| **OTel 身份** | `trace_id` / `span_id` / `parent_id` | 一次 trace 的 ID、本 span 的 ID、父 span 的 ID（**建树就靠 parent_id**） |
+| **OTel 核心** | `name` / `status` / `attributes` / `events` / `links` / `start_time` / `end_time` | span 名称、状态（UNSET/OK/ERROR）、属性字典、事件列表、链接列表、起止时间（**秒**，浮点） |
+| **OTel 结构** | `context` / `parent` / `resource` | `SpanContext` / 父 `SpanContext` / `OtelResource`（含 schema_url） |
+| **额外字段** | `extra="allow"` | 所有未建模的 OTel 字段经 JSON 化后原样保留 |
+
+**注意 `trace_id` 的注释**（`types/tracer.py:270`）：`# one rollout can have traces coming from multiple places`——**一个 rollout 可以有多条 trace**（比如 agent 自己的 trace + proxy 产生的 trace），所以 `trace_id` 不能当"轨迹 ID"用，**真正的分组键是 `(rollout_id, attempt_id)`**，`TraceTree.from_spans` 也确实是按传入的 span 列表（一个 attempt 的 span）建树的。
+
+**（2）转换函数 `Span.from_opentelemetry`**（`types/tracer.py:308-371`）：
+
+```python
+@classmethod
+def from_opentelemetry(cls, src: ReadableSpan, rollout_id: str, attempt_id: str, sequence_id: int) -> "Span":
+    context = src.get_span_context()
+    trace_id = context.trace_id if context else 0
+    span_id = context.span_id if context else 0
+    return cls(
+        rollout_id=rollout_id, attempt_id=attempt_id, sequence_id=sequence_id,
+        trace_id=trace_api.format_trace_id(trace_id),                       # 32 位 hex
+        span_id=trace_api.format_span_id(span_id),                          # 16 位 hex
+        parent_id=(trace_api.format_span_id(src.parent.span_id) if src.parent else None),
+        name=src.name,
+        status=TraceStatus.from_opentelemetry(src.status),                  # 枚举 → "OK"/"ERROR" 字符串
+        attributes=dict(src.attributes) if src.attributes else {},
+        events=[Event.from_opentelemetry(e) for e in src.events] if src.events else [],
+        links=[Link.from_opentelemetry(l) for l in src.links] if src.links else [],
+        start_time=convert_timestamp(src.start_time),                       # 纳秒 → 秒
+        end_time=convert_timestamp(src.end_time),
+        context=SpanContext.from_opentelemetry(context) if context else None,
+        parent=(SpanContext.from_opentelemetry(src.parent) if src.parent else None),
+        resource=OtelResource.from_opentelemetry(src.resource),
+        **extract_extra_fields(src, ["name", "context", "parent", "resource", ...]),   # 未建模字段兜底
+    )
+```
+
+**这段代码关键在哪**：① **三类 ID 全部格式化成 hex 字符串**（`trace_api.format_trace_id` / `format_span_id`），这样跨进程/跨机比较和 JSON 序列化都无损；② `parent_id` 只在 `src.parent` 存在时才有值，**它就是后面建树的唯一凭据**；③ 时间戳统一过 `convert_timestamp` 变成秒（浮点）；④ `extract_extra_fields` 是**向前兼容的兜底**：把 `ReadableSpan.__dict__` 里所有未建模字段 `json.dumps(default=str)` 再 `json.loads` 回来，保证"OTel 升级新增字段也不会丢"，同时保证"没建模也能序列化"。
+
+`convert_timestamp` 的启发式值得单独记（`types/tracer.py:42-53`）：
+
+```python
+def convert_timestamp(timestamp: Optional[int]) -> Optional[float]:
+    if not timestamp:
+        return None
+    return timestamp / 1_000_000_000 if timestamp > 1e12 else timestamp
+```
+
+**用"是否大于 1e12"来区分"纳秒"和"秒"**——1e12 秒是公元 33658 年，所以现实的秒级时间戳绝不会超过它，纳秒级则必然超过。这是个很典型的手写 heuristic。
+
+**（3）三个构造入口，对应三条来源**：
+
+| 构造函数 | 用途 | 谁会调 |
+|---|---|---|
+| `from_opentelemetry(src, rollout_id, attempt_id, sequence_id)` | 从真实 OTel span 转换 | `add_otel_span`（三路记录通路的落点） |
+| `from_attributes(attributes, ...)` | 从裸属性**合成** span（自动生成随机 trace_id/span_id，默认 name=`agentlightning.virtual`） | `TraceTree.from_spans` 造虚拟父节点；OTLP 路径解析 |
+| `from_core_fields(core, ...)` | 从 `SpanCoreFields` 构造 | emitter 返回的字段 → 真正的 span |
+
+**（4）命名常量表**（`semconv.py`，面试可以背下来判断 span 类型）：
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `AGL_ANNOTATION` | `agentlightning.annotation` | annotation span（reward/tag/metadata 的载体） |
+| `AGL_OPERATION` | `agentlightning.operation` | operation span（`@operation` 装饰的范围） |
+| `AGL_REWARD` | `agentlightning.reward` | reward 的**属性前缀**（`agentlightning.reward.0.value`） |
+| `AGL_MESSAGE` / `AGL_OBJECT` / `AGL_EXCEPTION` / `AGL_VIRTUAL` | `agentlightning.message` / `.object` / `.exception` / `.virtual` | 对应 emitter 与虚拟节点 |
+| `LightningResourceAttributes.ROLLOUT_ID` | `agentlightning.rollout_id` | **resource 级**属性（OTLP 路由用） |
+| `LightningResourceAttributes.ATTEMPT_ID` | `agentlightning.attempt_id` | 同上 |
+| `LightningResourceAttributes.SPAN_SEQUENCE_ID` | `agentlightning.span_sequence_id` | 同上（十进制字符串） |
+
+### 3. 具体数值样例
+
+一个 LLM 调用 span 转成 `Span` 后的**真实结构**（字段名与类型都来自源码，具体值做了脱敏）：
+
+```json
+{
+  "rollout_id": "r-7f3a1c",
+  "attempt_id": "a-0b92e4",
+  "sequence_id": 2,
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "parent_id": "9c1e4d2ab5f70c31",
+  "name": "openai.chat.completion",
+  "status": {"status_code": "OK", "description": null},
+  "attributes": {
+    "gen_ai.request.model": "Qwen2.5-1.5B-Instruct",
+    "gen_ai.request.temperature": 0.7,
+    "gen_ai.response.id": "chatcmpl-9x2K",
+    "prompt_token_ids": [128000, 9707, 2675, "... 512 个"],
+    "response_token_ids": [2675, 527, 1401, "... 180 个"],
+    "logprobs.content": "[{\"token\":\"SELECT\",\"logprob\":-0.02}, ... 180 条]"
+  },
+  "events": [{"name": "exception", "attributes": {}, "timestamp": 1731250000.12}],
+  "links": [],
+  "start_time": 1731250000.10,
+  "end_time": 1731250001.85,
+  "context": {"trace_id": "4bf9...", "span_id": "00f0...", "is_remote": false, "trace_state": {}},
+  "parent":  {"trace_id": "4bf9...", "span_id": "9c1e...", "is_remote": false, "trace_state": {}},
+  "resource": {"attributes": {"service.name": "agentlightning"}, "schema_url": ""}
+}
+```
+
+**逐字段解读三个面试常问点**：
+
+```text
+① 为什么 sequence_id=2 而 span_id 是一串乱码？
+   span_id 是 OTel 随机生成的（RandomIdGenerator），用于表达"谁是谁的父节点"；
+   sequence_id 是 store 分配的单调整数，用于表达"谁先谁后"。
+   分布式的核心矛盾是"时钟不可信"，所以顺序必须靠序号而不是时间戳。
+
+② 为什么既存 parent_id 又存 parent（SpanContext）？
+   parent_id 是"建树用的轻量键"（TraceTree 只用它）；
+   parent 是完整的父上下文（含 trace_id / trace_state），给需要跨 trace 关联的场景用。
+   OTLP 协议里只有 parent_span_id，所以从 OTLP 解析时 parent 一律为 None（utils/otlp.py:212 注释）。
+
+③ 为什么 attributes 里会混着 "logprobs.content" 这种 JSON 字符串？
+   因为 OTel 的属性值只能是 string/bool/int/float 及其序列（AttributeValue 联合类型，
+   types/tracer.py:76-85），嵌套结构必须自己序列化成字符串；
+   AGL 因此成对提供了 flatten_attributes（写）/_attributes_unflatten_multiple（读）。
+```
+
+**存储侧的一个小但重要的实现细节**：`add_span` 会顺手把 store 的序号计数器**抬到不小于这个 span 的 sequence_id**（`store/collection_based.py:1056-1065` → `_sync_span_sequence_id` → `span_sequence_ids.chmax`）。作用是：**外部传入的乱序/较大序号不会导致后续分配重号**。
+
+> **面试一句话总结**：Agent Lightning 用自研的 Pydantic `Span` 模型（`types/tracer.py:251`）替代 OTel 的 `ReadableSpan`，把字段分成四组——**业务路由**（`rollout_id`/`attempt_id`/`sequence_id`）、**OTel 身份**（`trace_id`/`span_id`/`parent_id`，全部格式化成 hex 字符串）、**OTel 核心与结构**（name/status/attributes/events/links/时间戳→秒/context/parent/resource）、**`extra="allow"` 兜底**（未建模字段 JSON 化保留，保证 OTel 升级不丢数据）；`from_opentelemetry` 负责逐字段映射，`convert_timestamp` 用 `> 1e12` 启发式区分纳秒与秒；`trace_id` **不是**轨迹分组键（一个 rollout 可能有多条 trace），真正的分组键是 `(rollout_id, attempt_id)`，建树唯一依赖 `parent_id`；三个构造入口 `from_opentelemetry` / `from_attributes`（合成虚拟节点）/ `from_core_fields`（emitter）分别对应三条来源。
+
+---
+
+## 8. HTTP 传输：Span 怎么从 agent 机器跨到 store 机器
+
+### 1. 现有问题：轨迹是"流"，而 HTTP 是"一问一答"
+
+三机分离部署下（agent 机器 → store 机器），轨迹上传有三个矛盾：① **span 是边跑边产生的流**，如果每条都同步阻塞 agent 线程，agent 会被网络拖慢；② **parent 和 child 不是同时结束的**，如果 parent 先结束就先上传，到达 store 的顺序天然是乱的；③ **单条 span 可能很大**（上一节的例子：512 个 prompt token id + 180 条 logprob 全在 attributes 里），逐条传的序列化和请求开销会被放大。所以 Agent Lightning 准备了**两条正式通路 + 一条 proxy 专线**，并按 store 的能力自动选路。
+
+### 2. 方法论：三条传输路径与"按能力选路"机制
+
+**（0）选路开关：`store.capabilities["otlp_traces"]`。** 各实现的声明（源码位置见括号）：
+
+| store 实现 | thread_safe | async_safe | zero_copy | **otlp_traces** | 结果 |
+|---|---|---|---|---|---|
+| `InMemoryLightningStore`（`store/memory.py:149-153`） | 可配 | True | False | **False** | 走**逐条 JSON** |
+| `MongoLightningStore`（`store/mongo.py:83-87`） | True | True | True | **False** | 走**逐条 JSON** |
+| `LightningStoreServer`（`store/client_server.py:313-318`） | True | True | True | **True** | 走 **OTLP 批量** |
+| `LightningStoreClient`（`store/client_server.py:1377-1388`） | True | True | True | **True** | 走 **OTLP 批量** |
+
+**结论（对我们的三机分离部署很关键）**：store 机器上跑的是 `LightningStoreServer`，algo/agent 机器注入的是 `LightningStoreClient`，**两侧都声明 `otlp_traces=True`**，所以实际走的是 **OTLP protobuf 批量上传**。而**单机 shared-memory 调试（InMemory）反而走逐条 JSON**——和直觉相反。
+
+选路代码在 `OtelTracer.trace_context`（`tracer/otel.py:157-173`）：
+
+```python
+if rollout_id is not None and attempt_id is not None:
+    if store.capabilities.get("otlp_traces", False) is True:
+        self._enable_native_otlp_exporter(store, rollout_id, attempt_id)   # 批量路
+    else:
+        self._disable_native_otlp_exporter()                              # 逐条路
+    ctx = self._lightning_span_processor.with_context(store=store, rollout_id=rollout_id, attempt_id=attempt_id)
+    with ctx:
+        yield trace_api.get_tracer(__name__, tracer_provider=self._tracer_provider)
+```
+
+**注意 `_enable_native_otlp_exporter` 有个副作用**：它会把 `LightningSpanProcessor` **关掉**（`processor.disable_store_submission = True`，`tracer/otel.py:269`），并把 rollout/attempt **写进 TracerProvider 的 `_resource`**（`tracer/otel.py:255-262`）——因为既然走 OTLP 批量路，就不需要逐条上传了，归属信息改由 resource 属性携带。
+
+**（1）OTLP 批量路（ftrace）：一次 POST 传整批 span。**
+
+**出口侧**：`LightningStoreOTLPExporter` 继承官方 `OTLPSpanExporter`，只做一件事——**把 rollout_id / attempt_id 合并进每个 span 的 resource**（`utils/otlp.py:295-315`）：
+
+```python
+def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+    if self._rollout_id is not None and self._attempt_id is not None:
+        for span in spans:
+            span._resource = span._resource.merge(
+                Resource.create({
+                    LightningResourceAttributes.ROLLOUT_ID.value: self._rollout_id,
+                    LightningResourceAttributes.ATTEMPT_ID.value: self._attempt_id,
+                })
+            )
+        return super().export(spans)      # 官方 exporter：protobuf 序列化 + HTTP POST
+    elif not self.should_bypass():
+        return super().export(spans)      # 兜底：按普通 OTLP 行为
+    else:
+        return SpanExportResult.SUCCESS   # should_bypass() 默认 True → 直接吞掉
+```
+
+**`should_bypass()` 返回 `True`**（`utils/otlp.py:291-293`）意味着：**如果没有 rollout/attempt（即不是在为 store 上传），就什么都不发**——这正是"AGL 借 agentops 的插桩但不往 agentops 云端发数据"在传输层的最后一道阀门。
+
+**入口侧**：server 的 `/v1/traces` 路由（`store/client_server.py:940-955`）：
+
+```python
+def _setup_otlp(self, api: APIRouter):
+    async def _trace_handler(request: PbExportTraceServiceRequest) -> None:
+        spans = await spans_from_proto(request, self.get_many_span_sequence_ids)
+        await self.add_many_spans(spans)
+
+    @api.post("/traces")
+    async def otlp_traces(request: Request):
+        return await handle_otlp_export(
+            request, PbExportTraceServiceRequest, PbExportTraceServiceResponse, _trace_handler, "traces"
+        )
+```
+
+路由前缀是 `API_V1_PREFIX` + `/traces`，所以完整路径是 **`POST /v1/traces`**（`otlp_traces_endpoint()` 返回 `f"{self.endpoint}/v1/traces"`，`client_server.py:320-322`）。
+
+**协议处理 `handle_otlp_export`**（`utils/otlp.py:56-110`）的四条硬约束：
+
+1. **只支持二进制 protobuf**：`Content-Type` 必须是 `application/x-protobuf`，否则 400（注释：`For brevity we only support binary protobuf here`）；
+2. **支持 gzip 双向压缩**：请求头 `Content-Encoding: gzip` 则解压（`_read_body_maybe_gzip`），响应若 `Accept-Encoding` 含 gzip 则压缩返回；
+3. **空 body 也返回 200**（OTLP 规范允许）；
+4. 400 响应的 body 也是 protobuf 编码的 `google.rpc.Status`（OTLP/HTTP 规范要求）。
+
+**`spans_from_proto` 的解析与批量领号**（`utils/otlp.py:113-226`）——三层循环 `resource_spans → scope_spans → spans`，关键是**归属信息的优先级**：
+
+```python
+# Resource 级属性
+resource_attrs = _kv_list_to_dict(resource_spans.resource.attributes)
+rollout_id_resource = resource_attrs.get(LightningResourceAttributes.ROLLOUT_ID.value)
+sequence_id_resource = resource_attrs.get(LightningResourceAttributes.SPAN_SEQUENCE_ID.value)
+...
+# Span 级属性可以覆盖 Resource 级（"Override the resource-level attributes with the span-level attributes"）
+rollout_id_raw = rollout_id_span if rollout_id_span is not None else rollout_id_resource
+sequence_id = _normalize_sequence_id(sequence_id_raw)
+...
+# 没有 sequence_id 的 span 先标记 -1，最后一次性批量领号
+if sequence_id is None:
+    current_sequence_id = -1
+...
+bulk_issue_requests = [(s.rollout_id, s.attempt_id) for s in output_spans if s.sequence_id < 0]
+bulk_sequence_ids = await sequence_id_bulk_issuer(bulk_issue_requests)     # 一次原子调用领 N 个号
+```
+
+**这是 OTLP 路最大的性能优势**：整批 span 只做**一次**批量领号（`get_many_span_sequence_ids`），而不是每条 span 一次；相比之下逐条路每条都要先领号。另外**缺失 rollout/attempt 的 span 会被直接丢弃**（`utils/otlp.py:174-182`，`logger.warning` 后 `continue`）——所以 resource 属性没打上就等于 span 丢了。
+
+**（2）逐条 JSON 路：每条 span 两次 HTTP。** 客户端实现（`store/client_server.py:1912-1928`）非常直白：
+
+```python
+async def add_otel_span(self, rollout_id, attempt_id, readable_span, sequence_id=None) -> Optional[Span]:
+    # unchanged logic, now benefits from retries inside add_span/get_next_span_sequence_id
+    if sequence_id is None:
+        sequence_id = await self.get_next_span_sequence_id(rollout_id, attempt_id)   # 第 1 次 HTTP
+    span = Span.from_opentelemetry(readable_span, rollout_id=rollout_id,
+                                   attempt_id=attempt_id, sequence_id=sequence_id)
+    return await self.add_span(span)                                                 # 第 2 次 HTTP
+```
+
+而 `add_span` 发的是 **Pydantic JSON**（`store/client_server.py:1885-1887`）：
+
+```python
+async def add_span(self, span: Span) -> Optional[Span]:
+    data = await self._request_json("post", "/spans", json=span.model_dump(mode="json"))
+    return Span.model_validate(data) if data is not None else None
+```
+
+落到 server 侧的路由是 **`POST /v1/agl/spans`**（`API_V1_PREFIX` + `API_AGL_PREFIX="/agl"` + `/spans`，`client_server.py:74,438,784-786`，状态码 201）。
+
+**关键差别**：`ReadableSpan` **从来没有被跨机传输**——它在客户端本地就被 `Span.from_opentelemetry` 转成了可序列化的 `Span`，网络上跑的是 **`Span` 的 JSON**。这一点常被误解成"把 OTel 对象 pickle 过去"。
+
+**（3）proxy 专线：子树缓冲批量导出。** LLMProxy 自己也是 span 生产者，它用的是另一个 exporter——`LightningSpanExporter`（`llm_proxy.py:196-497`），设计目标是**"等一棵子树完整了再整体发"**：
+
+```python
+class LightningSpanExporter(SpanExporter):
+    """Buffered OTEL span exporter with subtree flushing and training-store sink.
+
+    Design:
+    * Spans are buffered until a root span's entire subtree is available.
+    * A private event loop on a daemon thread runs async flush logic.
+    * Rollout/attempt/sequence metadata is reconstructed by merging headers from any span within a subtree.
+    """
+```
+
+它的四个动作：
+
+```python
+# ① 找根：parent is None 的就是根
+def _get_root_span_ids(self) -> Iterable[int]:
+    for span in self._buffer:
+        if span.parent is None:
+            span_context = span.get_span_context()
+            if span_context is not None:
+                yield span_context.span_id
+
+# ② 深度优先收集整棵子树的 span_id
+def _get_subtrees(self, root_span_id: int) -> Iterable[int]:
+    yield root_span_id
+    for span in self._buffer:
+        if span.parent is not None and span.parent.span_id == root_span_id:
+            yield from self._get_subtrees(span.get_span_context().span_id)
+
+# ③ 从 buffer 里"整棵摘走"
+def _pop_subtrees(self, root_span_id: int) -> List[ReadableSpan]:
+    subtree_span_ids = set(self._get_subtrees(root_span_id))
+    ...  # 分裂成 subtree_spans / new_buffer
+
+# ④ 合并子树内任意 span 携带的 requester_custom_headers，取出三个 ID
+headers_str = span.attributes.get("metadata.requester_custom_headers")   # 字符串化的 dict
+headers = ast.literal_eval(headers_str)                                  # 安全解析
+rollout_id  = headers_merged.get("x-rollout-id")
+attempt_id  = headers_merged.get("x-attempt-id")
+sequence_id = headers_merged.get("x-sequence-id")                        # 必须是数字字符串
+```
+
+**注意两个设计细节**：① 三个 ID 是**从 HTTP header 还原**的（`RolloutAttemptMiddleware` 注入 → LiteLLM 插桩把 headers 存成 `metadata.requester_custom_headers` 字符串 → 这里 `ast.literal_eval` 解析回来），所以**"从任意一个 span 里 merge 出来"就够了**，不要求根 span 上有；② 拿到 ID 后，如果 store 支持 OTLP，就给**整棵子树**的每个 span 合并 resource 然后**一次性 `export(subtree_spans)`**；否则退化成对子树里每条 span 调 `store.add_otel_span`（`llm_proxy.py:412-439`）。
+
+**（4）客户端的可靠性设计：重试、健康探测、session 按 event loop 隔离。**
+
+```python
+def __init__(self, ..., retry_delays: Sequence[float] = (1.0, 2.0, 5.0),
+             health_retry_delays: Sequence[float] = (0.1, 0.2, 0.5)):
+    self._sessions: Dict[int, aiohttp.ClientSession] = {}   # id(loop) -> ClientSession
+```
+
+`_request_json` 的重试语义（`store/client_server.py:1485-1541`）：
+
+```python
+attempts = (0.0,) + self._retry_delays        # 立即试一次，然后按 1s/2s/5s 退避
+for delay in attempts:
+    ...
+    async with http_call(url, json=json, params=params) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+except aiohttp.ClientResponseError as cre:
+    if 400 <= cre.status < 500 and cre.status != 408:
+        raise                                  # 4xx（除 408）是应用层错误 → 不重试
+    ...                                        # 5xx → 先探 /health 再重试
+except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectorError,
+        aiohttp.ClientOSError, asyncio.TimeoutError) as net_exc:
+    if not await self._wait_until_healthy(session):
+        break                                  # 服务器不健康 → 不再重试
+```
+
+**为什么要"按 event loop 缓存 session"**（`store/client_server.py:1426-1441` 的注释写得很清楚）：同一个 client 会从**多个线程的多个 event loop** 被调用（uvicorn 的 loop、otel-loop、LightningSpanExporterLoop），而 `aiohttp.ClientSession` **不是 loop-agnostic 也不线程安全**，"Using it from another loop can hang on the first request"——所以用 `id(loop)` 做 key 各存一个 session。
+
+**（5）server 侧的透明路由：`_call_store_method`。** 这是"同一套接口，同进程直调、跨进程走 HTTP"的实现（`store/client_server.py:1010-1047`）：
+
+```python
+async def _call_store_method(self, method_name: str, *args, **kwargs) -> Any:
+    if self.store is not None and self.store.capabilities.get("zero_copy", False):
+        return await getattr(self.store, method_name)(*args, **kwargs)     # zero-copy：直接调
+    if os.getpid() == self._owner_pid:                                      # owner 进程：本地调
+        if method_name == "wait_for_rollouts":
+            return await getattr(self.store, method_name)(*args, **kwargs)  # 长阻塞，不持锁
+        if self.store is not None and self.store.capabilities.get("thread_safe", False):
+            return await getattr(self.store, method_name)(*args, **kwargs)  # 线程安全：不加锁
+        else:
+            with self._lock:
+                return await getattr(self.store, method_name)(*args, **kwargs)
+    if self._client is None:
+        self._client = LightningStoreClient(self.endpoint)                  # 非 owner：建 HTTP client
+    return await getattr(self._client, method_name)(*args, **kwargs)
+```
+
+**这段代码关键在哪**：Algorithm 和 Runner 调的是**同一个方法名**，`Server` 自己按"是不是 owner 进程 + store 能力"决定走本地调用还是 HTTP——**调用方完全无感**，这就是"三机分离不用改一行业务代码"的代码基础。
+
+### 3. 具体数值样例
+
+同一次 rollout（3 轮 LLM + 1 个 reward，共 4 条 span），对比两条通路：
+
+```text
+【逐条 JSON 路】（InMemory store / 单机 shared-memory）
+每条 span 2 次 HTTPS：
+  · POST /v1/agl/spans/next   ← 领 sequence_id（请求体 {"rollout_id","attempt_id"}，响应 {"sequence_id":N}）
+  · POST /v1/agl/spans        ← 提交 Span 的 Pydantic JSON
+4 条 span → 8 次 HTTP 请求
+序列化：每条 span 做 1 次 model_dump(mode="json") + 1 次 model_validate
+单条 span 的 JSON 体积粗估（按字段长度推算，非实测）：
+  · response_token_ids 180 个 int，JSON 里每个约 6 字节        ≈ 1.1 KB
+  · prompt_token_ids  512 个 int                              ≈ 3.1 KB
+  · logprobs.content  180 条，每条约 45 字节 JSON              ≈ 8.1 KB
+  · messages 原文（prompt + completion）                       ≈ 2~3 KB
+  · 结构字段（id/status/timestamps/context/resource/events）    ≈ 1 KB
+  ⇒ 一条带 logprobs 的 LLM span ≈ 15 KB 量级；不带 logprobs ≈ 6 KB
+4 条 span ≈ 30~40 KB JSON
+
+【OTLP 批量路】（Server/Client，即我们的三机分离部署）
+一次 trace 生命周期内的 span 由 BatchSpanProcessor 攒批，整体 POST 一次：
+  · POST /v1/traces   Content-Type: application/x-protobuf（可再 gzip）
+  ⇒ 4 条 span = 1 次 HTTP 请求
+序列化：protobuf（比 JSON 紧凑，且 int 数组有原生 packed encoding）
+领号：整批一次 get_many_span_sequence_ids（1 次原子 inc(rollout_id, 4)）而非 4 次
+server 侧：spans_from_proto → add_many_spans（内部主键去重 + 失败退化为逐条）
+```
+
+**量化的三条结论**：① **OTLP 路把 HTTP 请求数从 $2N$ 降到 $1$**（N 条 span），并且序列化从 JSON 换成 protobuf；② **span 体积几乎完全由 attributes 决定**（token ids + logprobs 占了 80% 以上），所以"轨迹带宽"本质上等于"token 数量 × 常数"，这直接决定了双机全异步训练里网络上要跑多少数据；③ `wait_for_rollouts` 在 client 侧有个刻意限制（`client_server.py:1940-1943`）：
+
+```python
+if timeout is not None and timeout > 0.1:
+    raise ValueError("Timeout must be less than 0.1 seconds in LightningStoreClient to avoid blocking the event loop")
+```
+
+**即 client 侧的 `wait_for_rollouts` 单次等待不允许超过 0.1s**——这就是 `AgentModeDaemon` 必须自己写"轮询循环"（`timeout=0` 反复调）而不是"一次阻塞等到天荒地老"的原因。
+
+> **面试一句话总结**：Agent Lightning 的 span 传输按 `store.capabilities["otlp_traces"]` 自动选路——**`LightningStoreServer`/`LightningStoreClient` 声明 True（我们的三机分离部署就走这条）**：出口用 `LightningStoreOTLPExporter` 把 rollout/attempt 合并进每个 span 的 resource，官方 `OTLPSpanExporter` 以 **protobuf（`Content-Type: application/x-protobuf`，支持 gzip）一次性 `POST /v1/traces`**，入口 `handle_otlp_export` → `spans_from_proto` 从 resource/span 属性还原归属并**整批一次领号**，再 `add_many_spans`；**`InMemoryLightningStore`/`MongoLightningStore` 声明 False**，退化为**每条 span 两次 HTTP**（`POST /v1/agl/spans/next` 领号 + `POST /v1/agl/spans` 提交 `Span` 的 Pydantic JSON，**`ReadableSpan` 从不跨机**）；proxy 另有专线 `LightningSpanExporter`——按 `parent is None` 找根、DFS 收集子树、**整棵子树攒齐才导出**，三个 ID 从 HTTP header（`x-rollout-id`/`x-attempt-id`/`x-sequence-id`）经 `metadata.requester_custom_headers` + `ast.literal_eval` 还原；客户端重试用 `(1.0,2.0,5.0)` 退避、4xx（除 408）不重试、5xx/网络错先探 `/health`，且 `aiohttp.ClientSession` **按 `id(loop)` 一 loop 一个**避免跨 loop 挂死。
+
+---
+
+## 9. Span 树是怎么构建出来的：从扁平列表到 `TraceTree`
+
+### 1. 现有问题：store 里只有一张扁平的 span 表
+
+`query_spans(rollout_id, attempt_id)` 返回的是**一个列表**，按 `sequence_id` 排序。但训练需要的语义是**树形**的："这次 LLM 调用属于哪个 agent？这个 reward 是给哪一步的？"——扁平列表回答不了。更麻烦的是**分布式现实会让树"断"**：
+
+- **顶层 session span 可能丢失**（比如 agentops 的 session span 没被上传成功），于是子 span 的 `parent_id` 指向一个**列表里不存在**的 ID；
+- **混合插桩系统会导致层级错乱**：一个 agent 同时用 openai 插桩和 langchain 回调，LLM span 可能**直接挂在 root 上**而不是挂在所属 agent 下面（源码原话见下）；
+- **一次 attempt 可能有多个根**（agent 自己一个 trace + proxy 另一个 trace），而下游要的是"一棵树"。
+
+所以必须有一套**容错建树算法**：先按 `parent_id` 建图，再补丢失的父节点，再把错位的节点按时间重新挂载。
+
+### 2. 方法论：`TraceTree.from_spans` 的五步算法 + `repair_hierarchy` 重挂
+
+**（1）数据结构**（`adapter/triplet.py:99-136`）：`TraceTree` 就是一个三元组 `{id, span, children}`，`id` 直接复用 `span.span_id`；`start_time` / `end_time` 是 `span` 的透传属性（**重挂父节点要靠它们**）。
+
+**（2）`from_spans` 的五步**（`adapter/triplet.py:225-315`）：
+
+```python
+@classmethod
+def from_spans(cls, spans: List[Span]) -> "TraceTree":
+    if not spans:
+        raise ValueError("No spans provided to create TraceTree.")
+
+    # 第 1 步：按 span_id 建索引
+    id_to_span = {span.span_id: span for span in spans}
+
+    # 第 2 步：建"父 → 子列表"前向图，同时收集根
+    forward_graph: dict[str, list[str]] = {}
+    root_ids: list[str] = []
+    for span in spans:
+        span_id = span.span_id
+        if span.parent_id is None:
+            root_ids.append(span.span_id)          # 显式根：parent 为空
+        else:
+            if span.parent_id not in forward_graph:
+                forward_graph[span.parent_id] = []
+            forward_graph[span.parent_id].append(span_id)
+
+    # 第 3 步：容错——父节点不在 span 列表里时，把它也当根
+    # "Sometimes the top-level session span is lost."
+    unfound_roots = set(forward_graph.keys()) - set(id_to_span.keys())
+    for unfound_root in unfound_roots:
+        root_ids.append(unfound_root)
+
+    # 第 4 步：后序递归建树；缺失节点用 from_attributes 合成"虚拟 span"
+    def visit(node_id: str) -> "TraceTree":
+        children: list[TraceTree] = []
+        if node_id in forward_graph:
+            for child_id in forward_graph[node_id]:
+                children.append(visit(child_id))
+
+        if node_id not in id_to_span:
+            assert len(children) > 0
+            virtual_span = Span.from_attributes(       # name 默认 = AGL_VIRTUAL
+                rollout_id=children[0].span.rollout_id,
+                attempt_id=children[0].span.attempt_id,
+                sequence_id=children[0].span.sequence_id,
+                trace_id=children[0].span.trace_id,
+                span_id=node_id,                       # 复用"幽灵父节点"的 id
+                parent_id=None, attributes={},
+                start_time=min(c.start_time for c in children if c.start_time is not None),
+                end_time=max(c.end_time for c in children if c.end_time is not None),
+            )
+            return cls(node_id, virtual_span, children=children)
+        else:
+            return cls(node_id, id_to_span[node_id], children=children)
+
+    # 第 5 步：多于一个根 → 再造一个 "virtual-root" 把所有根收进来
+    if len(root_ids) > 1:
+        root_spans = [visit(root_id) for root_id in root_ids]
+        virtual_root = TraceTree(id="virtual-root", span=Span.from_attributes(..., name="virtual-root", ...),
+                                children=root_spans)
+        return virtual_root
+    elif len(root_ids) == 0:
+        raise ValueError("No root spans found in the trace.")
+    else:
+        return visit(root_ids[0])
+```
+
+**五个设计点，每个都能单独出面试题**：
+
+| 步骤 | 设计 | 为什么必须这样 |
+|---|---|---|
+| 2 | 用**前向图**（`parent → [children]`）而不是后向指针 | 自顶向下递归建树需要 O(1) 取子节点；后向 `parent_id` 在 `find_llm_calls` 等查询里用不到 |
+| 3 | `unfound_roots = forward_graph.keys() - id_to_span.keys()` | **父 span 丢失时不能直接丢子树**，必须把"幽灵父节点"提升为根，否则整条轨迹消失 |
+| 4 | `visit` 是**后序**（先递归子节点再建自己） | 合成虚拟 span 需要知道子节点的 `start_time/end_time` 才能取 min/max；也就是"自底向上补时间" |
+| 4 | 虚拟 span 用 `Span.from_attributes` 生成 | 它在 store 里**并不存在**，只是为了保持树结构完整；name 默认 `agentlightning.virtual`，`attributes={}` |
+| 5 | 多根时套 `virtual-root` | 下游 `find_llm_calls`/`match_rewards` 都假设"有一个树根可以开始遍历" |
+
+**（3）`repair_hierarchy()`：按"时间包含关系"重挂错位节点**（`adapter/triplet.py:478-520`）。源码 docstring 把动机说得很明白：
+
+```python
+def repair_hierarchy(self) -> None:
+    """Repair missing parent-child relationships introduced by mixed tracing systems.
+
+    Some agent frameworks emit spans via multiple subsystems, which can cause LLM completion
+    spans to float directly under the root span instead of being nested under the correct agent.
+    The method re-parents those spans to the closest ancestor that fully envelopes the child in
+    time.
+
+    If we don't, when we want to select the LLM completion span with agent as filter.
+    We will never get the correct span underneath.
+    """
+```
+
+算法本身很短：
+
+```python
+# 只有一个孩子时，递归修它自己就返回
+# （因为 agentops.end_trace 会把所有 span 额外包一层合成根，例如 "run_one.session"）
+if len(self.children) == 1:
+    self.children[0].repair_hierarchy()
+    return
+
+nodes_to_repair = list(self.children)
+for repair_node in nodes_to_repair:
+    if len(self.children) == 1:
+        break
+    closest_parent = None
+    closest_duration = float("inf")
+    for node in self.traverse():
+        if node.id == repair_node.id or node is self:
+            continue
+        # 候选条件：node 在时间上"完全包住" repair_node
+        if node.start_time <= repair_node.start_time and node.end_time >= repair_node.end_time:
+            duration_delta = node.end_time - repair_node.end_time + repair_node.start_time - node.start_time
+            if duration_delta > 0 and duration_delta < closest_duration:
+                closest_duration = duration_delta          # 取"包得最紧"的那个
+                closest_parent = node
+    if closest_parent is not None:
+        self.children.remove(repair_node)
+        closest_parent.children.append(repair_node)
+```
+
+注意 `duration_delta = (node.end - repair.end) + (repair.start - node.start)` 正好等于**父节点时长 − 子节点时长**，所以"`duration_delta` 最小的正数"= **时间上包得最紧的那个祖先**（`> 0` 排除了时长完全相等的退化情况）。
+
+**（4）配套的查询与可视化工具**（都是后续 step 的依赖）：
+
+| 方法 | 作用 |
+|---|---|
+| `traverse()` | 深度优先遍历返回所有节点（`match_rewards`/`repair_hierarchy` 依赖） |
+| `find_id(id)` | 按 id 在子树里查找 |
+| `agent_name()` | **从属性识别"这是哪个 agent 的 span"**（7 种框架规则，见下表） |
+| `is_reward_span()` / `maybe_reward_dict()` | 判断这条 span 是否携带 reward |
+| `find_llm_calls(...)` | 找出符合条件的 LLM 调用 span（第 10 节） |
+| `names_tuple()` / `visualize()` / `to_json()` | 调试：嵌套名字元组 / Graphviz 画图（`dot.render(..., format="png")`）/ JSON 序列化 |
+
+**`agent_name()` 的 7 条识别规则**（`adapter/triplet.py:317-365`）——这是"混合框架下如何定位 agent 子树"的答案，也是面试很好的加分项：
+
+| 来源框架 | 判定依据（属性名） |
+|---|---|
+| OpenAI Agents SDK | `agent.name` |
+| AgentOps `@agent` 装饰器 | `agentops.span.kind == "agent"` → 取 `operation.name` |
+| Autogen team | `recipient_agent_type` |
+| LangGraph | `langchain.chain.type` |
+| agent-framework | `executor.id` |
+| Weave | `type == "agent"` → 取 `agentlightning.operation.input.name` |
+| Weave + LangChain | span 名以 `langchain.Chain.` 开头 → 取 `lc_name` |
+
+### 3. 具体数值样例
+
+**给 6 条 span（其中 1 条父节点丢失、1 条 reward），逐步演算建树过程**：
+
+```text
+输入 spans（同一 rollout="r-1" / attempt="a-1"）：
+  s1_root   name="agent.run"              parent=None   [0.0, 10.0]
+  s2_agent  name="agentops.agent"         parent=s1     [0.5,  9.5]  attr: operation.name="SqlAgent"
+  s3_llm1   name="openai.chat.completion" parent=s2     [1.0,  2.5]  attr: gen_ai.response.id="resp-1"
+  s4_tool   name="tool.execute_sql"       parent=s2     [2.6,  3.0]
+  s5_llm2   name="openai.chat.completion" parent=sGHOST [3.2,  5.0]  attr: gen_ai.response.id="resp-2"
+  s6_reward name="agentlightning.annotation" parent=s2  [5.1,  5.2]  attr: agentlightning.reward.0.value=1.0
+  （sGHOST 不在列表里 —— 模拟"顶层 session span 丢失"）
+
+第 1 步：id_to_span = {s1, s2, s3, s4, s5, s6}（6 项）
+
+第 2 步：forward_graph 与 root_ids
+  s1.parent is None           → root_ids = [s1]
+  s2.parent=s1 → forward_graph[s1] = [s2]
+  s3.parent=s2 → forward_graph[s2] = [s3]
+  s4.parent=s2 → forward_graph[s2] = [s3, s4]
+  s5.parent=sGHOST → forward_graph[sGHOST] = [s5]
+  s6.parent=s2 → forward_graph[s2] = [s3, s4, s6]
+  ⇒ forward_graph = { s1:[s2], s2:[s3,s4,s6], sGHOST:[s5] }
+
+第 3 步：unfound_roots = {s1, s2, sGHOST} − {s1..s6} = {sGHOST}
+  ⇒ root_ids = [s1, sGHOST]   ← 幽灵父节点被提升为根，s5 的子树得救
+
+第 4 步：后序 visit(s1) → visit(s2) → visit(s3)/visit(s4)/visit(s6) → 回填
+        visit(sGHOST) → visit(s5) → 合成虚拟 span（时长 = s5 的 [3.2, 5.0]）
+
+第 5 步：len(root_ids) == 2 → 造 "virtual-root"
+  virtual-root [0.0, 5.0]（start=root_spans[0].start, end=root_spans[-1].end）
+    ├── s1_root            [0.0, 10.0]
+    │     └── s2_agent     [0.5,  9.5]   [SqlAgent]
+    │           ├── s3_llm1  [1.0, 2.5]  (resp-1)
+    │           ├── s4_tool  [2.6, 3.0]
+    │           └── s6_reward[5.1, 5.2]  (reward=1.0)
+    └── sGHOST(virtual)    [3.2, 5.0]    ← 错位：它其实是 SqlAgent 内部的 span
+          └── s5_llm2      [3.2, 5.0]  (resp-2)
+
+第 6 步：repair_hierarchy()（根有两个孩子，不早退）
+  修 s1_root：找"包住 [0.0,10.0] 的最紧节点"（排除自己与根）
+     候选 s2_agent [0.5,9.5] 不含 0.0；sGHOST [3.2,5.0] 不含 → closest_parent=None → 不动
+  修 sGHOST [3.2,5.0]：候选
+     s1_root   [0.0,10.0] 含 → delta = (10.0−5.0)+(3.2−0.0) = 8.2
+     s2_agent  [0.5, 9.5] 含 → delta = ( 9.5−5.0)+(3.2−0.5) = 7.2   ← 最小
+     s3_llm1   [1.0, 2.5] 不含（2.5 < 5.0）
+     s4_tool   [2.6, 3.0] 不含
+     s6_reward [5.1, 5.2] 不含
+     ⇒ closest_parent = s2_agent → 把 sGHOST 从 virtual-root 摘下，挂到 s2_agent 下
+
+最终树（repair 后）：
+  virtual-root
+    └── s1_root
+          └── s2_agent [SqlAgent]
+                ├── s3_llm1   (resp-1)
+                ├── s4_tool
+                ├── s6_reward (reward=1.0)
+                └── sGHOST(virtual)
+                      └── s5_llm2 (resp-2)
+```
+
+**三个结论**：① **丢父节点不会丢数据**（虚拟 span 补位，第 3、4 步）；② **错位的层级能被时间关系修回来**（第 6 步，`sGHOST` 从根下移到 `SqlAgent` 下）；③ 修好之后 `find_llm_calls(agent_match="SqlAgent")` 才能把 `s3_llm1` 和 `s5_llm2` **都**捞到——**如果跳过 `repair_hierarchy`，`s5_llm2` 会因为不在 `SqlAgent` 子树里而被过滤掉，这条轨迹就少了一个训练样本**。这就是 `TracerTraceToTriplet(repair_hierarchy=True)` 这个开关的实际价值（`adapter/triplet.py:775-776, 825-847`）。
+
+> **面试一句话总结**：Span 在 store 里是**扁平列表**，树是在 Adapter 里现建的——`TraceTree.from_spans`（`adapter/triplet.py:225`）五步走：① 按 `span_id` 建索引；② 按 `parent_id` 建 `parent → [children]` 前向图并收集 `parent_id is None` 的根；③ **容错**——把"在 `forward_graph` 里当爹但自己不在 span 列表里"的 ID 也提升为根（"Sometimes the top-level session span is lost"）；④ **后序**递归建节点，缺失节点用 `Span.from_attributes` 合成"虚拟 span"（name=`agentlightning.virtual`，时间取子节点的 min/max）；⑤ 多根时再套一个 `virtual-root`；之后 `repair_hierarchy()` 用**时间包含关系**把因混合插桩而上浮的 span 重挂到"包得最紧的祖先"（`duration_delta = 父时长 − 子时长` 取最小正数），`agent_name()` 用 7 条框架规则（`agent.name` / `agentops.span.kind` / `recipient_agent_type` / `langchain.chain.type` / `executor.id` / Weave `type` / `langchain.Chain.` 前缀）定位 agent 子树——**不修层级就会漏掉挂在 root 下的 LLM span，直接少训练样本**。
+
+---
+
+## 10. 从 Span 树到训练样本：reward 匹配与 triplet 抽取
+
+### 1. 现有问题：一次 rollout 一个 reward，但有多次 LLM 调用
+
+RL 训练要的是 `(prompt, response, reward)` 三元组。但 agent 场景里**reward 是整条轨迹末尾给的一个标量**（SQL 是否跑通），而 LLM 调用有 3 次。三个必须回答的问题：① 哪些 span 算"可训练的 LLM 调用"（工具调用/内部规划不算）；② 同一个 reward 分给哪一次调用；③ 最终 reward 怎么落到 token 上。分错就等于给了错误的信用分配（credit assignment）。
+
+### 2. 方法论：`find_llm_calls` → `span_to_triplet` → `match_rewards` → `to_trajectory`
+
+**（1）`find_llm_calls`：四个过滤维度**（`adapter/triplet.py:398-476`）。递归遍历树，同时传递四个状态：
+
+```python
+def find_llm_calls(self, *, llm_call_match, agent_match,
+                   within_matching_subtree=None, within_reward=None,
+                   within_llm_call=None, existing_llm_call_response_ids=None):
+    llm_calls = []
+    is_llm_call = True
+    if within_matching_subtree is None or within_reward is True:
+        is_llm_call = False                                  # ① 必须在"匹配的 agent 子树"内，且不在 reward 子树内
+    if re.search(llm_call_match, self.span.name) is None:
+        is_llm_call = False                                  # ② span 名要匹配 llm_call_match 正则
+    if is_llm_call:
+        response_id = _attributes_get_multiple(
+            self.span.attributes, ["gen_ai.response.id", "agentlightning.operation.output.id"])
+        if response_id is None and within_llm_call is True:
+            is_llm_call = False                              # ③ 嵌套 LLM 调用：无 response_id 的不重复计
+        if (response_id is not None and existing_llm_call_response_ids is not None
+                and response_id in existing_llm_call_response_ids):
+            is_llm_call = False                              # ④ 同一个 response_id 只算一次（去重）
+        if is_llm_call:
+            llm_calls.append((self, within_matching_subtree))
+            ...existing_llm_call_response_ids.add(response_id)
+            within_llm_call = True
+    ...
+    for child in self.children:                              # 递归传状态
+        llm_calls.extend(child.find_llm_calls(..., within_matching_subtree=within_matching_subtree, ...))
+```
+
+四道过滤的语义：**② 名字正则**（默认 `r"openai\.chat\.completion"`）、**① agent 子树**（`agent_match` 命中后 `within_matching_subtree=agent_name`，其子树内的 LLM 调用才被认领）、**③ 嵌套去重**（外层 LLM 调用内部的嵌套调用若无 `response_id` 就不再计）、**④ response_id 去重**（同一响应只留一条）。
+
+**（2）`span_to_triplet`：把 span 属性摊成 triplet**（`adapter/triplet.py:631-700`）。token id 因为要兼容多个 tracer，用了**候选键列表**：
+
+```python
+prompt_token_ids = _attributes_get_ids_multiple(span.attributes, [
+    "prompt_token_ids",
+    "agentlightning.operation.output.prompt_token_ids",              # Weave tracer
+]) or []
+response_token_ids = _attributes_get_ids_multiple(span.attributes, [
+    "response_token_ids",
+    "agentlightning.operation.output.response_token_ids.0",          # Weave tracer
+    "agentlightning.operation.output.choices.0.token_ids",           # Weave + 新版 vLLM
+    "agentlightning.operation.output.choices.0.provider_specific_fields.token_ids",  # 新 vLLM + 新 OpenAI SDK
+]) or []
+...
+prompt_payload = {"token_ids": prompt_token_ids, "raw_content": prompt_raw_content, "image_urls": image_urls}
+response_payload = {"token_ids": response_token_ids, "raw_content": completion_raw_content}
+logprobs_content = span.attributes.get("logprobs.content")            # FIXME: Weave tracer 尚不支持 logprob
+if isinstance(logprobs_content, str):
+    response_payload["logprobs"] = json.loads(logprobs_content)
+return Triplet(prompt=prompt_payload, response=response_payload, reward=None,
+               metadata=dict(request=..., response=..., response_id=..., agent_name=...))
+```
+
+`Triplet` 的定义极简（`types/core.py`）：`{prompt: Any, response: Any, reward: Optional[float], metadata: Dict[str, Any]}`。
+
+**（3）`match_rewards`：两种分配策略**（`adapter/triplet.py:522-575`）：
+
+| 策略 | 算法 | 语义 |
+|---|---|---|
+| `FIRST_OCCURRENCE`（默认） | 把全树按 `start_time` 排序，边走边记"已出现的 LLM 调用（id, end_time）"；遇到 reward span 时**从后往前**找第一个 `end_time <= reward.start_time` 的调用，把 reward 给它 | "**时间上最后一次已完成的 LLM 调用**"拿到 reward |
+| `FIRST_SIBLING` | 在每个节点内部，只看**直接子节点**里的 LLM 调用与 reward，同样从后往前匹配 | "**同一个父节点下、reward 之前最后完成的** LLM 调用"拿到 reward |
+
+两者都用"从后往前"遍历，代码里那句注释解释了原因：
+
+```python
+for assign_to_id, assign_to_end_time in reversed(assign_to):
+    # This reward happens before the end of the LLM call.
+    if assign_to_end_time > item.start_time:
+        continue                                  # reward 必须在这次调用结束之后才算数
+    if assign_to_id in rewards:
+        continue                                  # 已有 reward 的不覆盖
+    rewards[assign_to_id] = agentops_output.get("value", None)
+    break
+```
+
+**（4）`to_trajectory`：整条流水线的收口**（`adapter/triplet.py:702-758`）——找 LLM 调用 → 转 triplet → 过滤掉没有 token id 的 → 匹配 reward → 补 `final_reward`：
+
+```python
+if final_reward is not None and len(transitions) > 0:
+    transitions[-1] = transitions[-1].model_copy(update={"reward": final_reward})   # 只打到最后一条
+```
+
+**（5）verl 侧最终怎么用这些 triplet**（`verl/daemon.py`）：
+
+```python
+# _validate_data_v1：final_reward 由"从后往前搜第一个非 None 的 triplet.reward"决定
+final_reward: Optional[float] = None
+if triplets:
+    for triplet in reversed(triplets):
+        if triplet.reward is not None:
+            final_reward = triplet.reward
+            break
+```
+
+```python
+# get_train_data_batch：同一 rollout 的**所有 triplet 共用同一个 final_reward**
+trace_list = [{"prompt_ids": t.prompt.get("token_ids", []),
+               "response_ids": t.response.get("token_ids", []),
+               "image_urls": t.prompt.get("image_urls", [])} for t in rollout.triplets]
+info = {"reward": final_reward, "trace_list": trace_list, "data_id": original_sample["data_id"]}
+...
+# 在最后一个 token 位置写入 token 级分数
+# "Create token-level scores by placing the final reward at the last token position"
+scores = torch.tensor(reward_list, dtype=torch.bfloat16).to(device)
+```
+
+**这就是"identical assignment（同值分配）"的代码证据**：一条 rollout 拆成 $K$ 个 triplet（$K$ = LLM 调用次数），**每个 triplet 都是一条独立训练样本，且都带同一个 `final_reward`**，reward 最终落在**该 triplet response 的最后一个 token** 上。源论文出处：arXiv:2508.03680。
+
+### 3. 具体数值样例
+
+沿用第 9 节修好层级后的那棵树（2 次 LLM 调用 + 1 个 reward=1.0），对比两种 reward 策略：
+
+```text
+树的 LLM 调用（agent_match="SqlAgent"，llm_call_match="openai\.chat\.completion"）：
+  s3_llm1 [1.0, 2.5] response_id=resp-1
+  s5_llm2 [3.2, 5.0] response_id=resp-2
+reward span：s6_reward [5.1, 5.2] value=1.0
+
+策略 A：FIRST_OCCURRENCE（默认）
+  按 start_time 排序遍历：
+    s1_root(0.0) → s2_agent(0.5) → s3_llm1(1.0)：命中 LLM → assign_to=[(s3,2.5)]
+    s4_tool(2.6)：非 LLM → assign_to 不变
+    sGHOST(3.2) → s5_llm2(3.2)：命中 LLM → assign_to=[(s3,2.5), (s5,5.0)]
+    s6_reward(5.1)：是 reward → reversed 遍历：
+        (s5, 5.0)：5.0 > 5.1 ? 否 → rewards[s5]=1.0，break
+  结果：s3.reward=None，s5.reward=1.0
+  → 只有"最后一次 LLM 调用"拿到 reward
+
+策略 B：FIRST_SIBLING
+  按节点遍历，item=s2_agent 时只看它的直接子节点 [s3, s4, s6, sGHOST]：
+    s3 是 LLM → assign_to=[(s3,2.5)]
+    s4 不是
+    s6 是 reward → reversed：s3 的 2.5 > 5.1 ? 否 → rewards[s3]=1.0
+  结果：s3.reward=1.0，s5.reward=None
+  → "同父下的第一次 LLM 调用"拿到 reward（因为它与 reward 同属 SqlAgent 的直接子节点）
+
+两者输出完全不同的 credit assignment！这正是 RewardMatchPolicy 存在的意义。
+
+to_trajectory 的输出（策略 A + final_reward=1.0）：
+  transition[0] = Triplet(prompt={token_ids:[512 个]}, response={token_ids:[180 个]}, reward=None)
+  transition[1] = Triplet(prompt={token_ids:[700 个]}, response={token_ids:[150 个]}, reward=1.0)
+  → 因为 final_reward 非空，transitions[-1] 被覆写为 reward=1.0（本来就是 1.0，无变化）
+
+daemon 侧（_validate_data_v1）：
+  从后往前搜第一个非 None → final_reward = 1.0（取自 transition[1]）
+  trace_list = [ {prompt_ids:512, response_ids:180}, {prompt_ids:700, response_ids:150} ]
+  info = {"reward": 1.0, "trace_list": [...], "data_id": <原样本 id>}
+
+get_train_data_batch 侧：
+  同一个 rollout 的 2 个 triplet → 2 条训练样本，**reward 都是 1.0**
+  token_level_scores：在每条样本 response 的最后一个 token 位置写 1.0
+  统计量：training/n_triplets += 2；training/n_truncated_triplets（被 max_response_length 截断的）
+
+对比"如果没做 repair_hierarchy"：
+  s5_llm2 因为挂在根下（不在 SqlAgent 子树内）被 find_llm_calls 过滤掉
+  → 只剩 1 个 triplet → 这条 rollout 的训练样本数腰斩
+```
+
+**四个量化结论**：① **一条 rollout 的训练样本数 = LLM 调用次数 $K$**（不是 1，也不是 token 数）；② **reward 策略会让"谁拿 reward"完全改变**（策略 A 给 s5，策略 B 给 s3），而 `final_reward` 覆写最后一跳又会让"最后一次调用"必然带上 reward；③ verl 侧同一 rollout 的 $K$ 条样本**共享同一个 reward**（identical assignment）；④ 修层级能**把样本数从 1 恢复到 2**——这是 `repair_hierarchy` 的直接收益。
+
+> **面试一句话总结**：Span 树 → 训练样本分四步——① `find_llm_calls` 用**四道过滤**（span 名正则 `openai\.chat\.completion`、必须在匹配的 agent 子树内、嵌套 LLM 调用去重、`gen_ai.response.id` 去重）找出可训练的 LLM 调用；② `span_to_triplet` 把每个调用摊成 `Triplet{prompt:{token_ids,raw_content,image_urls}, response:{token_ids,raw_content,logprobs}, reward, metadata}`，token id 用**候选属性键列表**兼容 OTel / Weave / 新旧 vLLM 四种写法；③ `match_rewards` 两种策略——`FIRST_OCCURRENCE`（全树按时间排序，reward 给"时间上最后一次已完成"的调用）与 `FIRST_SIBLING`（只在同父兄弟里找），两者**从后往前**匹配且要求 `llm_end <= reward_start`；④ `to_trajectory(final_reward)` 把 final_reward 打到最后一跳，verl 的 `AgentModeDaemon` 再"从后往前搜第一个非 None reward"作为该 rollout 的 `final_reward`，并让**该 rollout 的所有 triplet 共享它**（identical assignment，arXiv:2508.03680），最后在每条样本 response 的**最后一个 token** 位置写 token-level score。
+
+---
+
+## 11. 有序性、幂等与故障语义（深水区）
+
+### 1. 现有问题：分布式下"顺序"和"重复"都是问题
+
+三机分离 + 多 runner 的现实带来三个必须显式设计的语义：① **时钟不可信**——agent 机器和 store 机器的时钟可能差几百毫秒，`start_time` 排序在多机场景下不可靠；② **同一条 span 可能被上传两次**（重试、proxy 与 tracer 双写、`BatchSpanProcessor` 重发）；③ **上传失败不能拖垮 agent**——但"失败静默"又会导致训练数据悄悄缺一条。这三件事如果没有明确设计，训练侧的样本数就会**随机波动**，而且极难排查。
+
+### 2. 方法论：store 分配序号 + 主键幂等 + 上传即心跳 + 静默降级
+
+**（1）顺序：序号由 store 统一分配，且**键是 `rollout_id`**。** `store/collection_based.py:1008-1054`：
+
+```python
+async def _issue_many_span_sequence_ids(self, rollout_ids: List[str]) -> List[int]:
+    """Issue a new span sequence ID for a given rollout."""
+    request_counts: Dict[str, int] = defaultdict(int)
+    for rollout_id in rollout_ids:
+        request_counts[rollout_id] += 1                    # 同一次批量里同一 rollout 要几个号
+
+    latest_values: Dict[str, int] = {}
+    for rollout_id, count in request_counts.items():
+        async with self.collections.atomic(mode="rw", snapshot=False, labels=["span_sequence_ids"]) as collections:
+            latest_values[rollout_id] = await collections.span_sequence_ids.inc(rollout_id, count)   # 原子自增
+    ...
+
+async def get_next_span_sequence_id(self, rollout_id: str, attempt_id: str) -> int:
+    """Get the next span sequence ID for a given rollout and attempt.
+    The number is strictly increasing for each rollout.
+    The store will not issue the same sequence ID twice.
+    """
+    ret = await self._issue_many_span_sequence_ids([rollout_id])
+    return ret[0]
+```
+
+**这里有个值得单独指出的实现细节**：`get_next_span_sequence_id(rollout_id, attempt_id)` **接收** `attempt_id`，但**计数器只以 `rollout_id` 为键**——docstring 也明确写 "strictly increasing for **each rollout**"。含义是：**同一个 rollout 的第二次 attempt（重试）不会重置序号**，序号召集会跨 attempt 继续累加。所以：
+- 同一 attempt 内的 span 靠 `sequence_id` 稳定排序（这是设计目标）；
+- 跨 attempt 的 span **不能**只靠 `sequence_id` 区分，必须同时按 `attempt_id` 过滤——这正是算法侧要用 `query_spans(rollout_id, attempt_id="latest")` 的原因（`verl/daemon.py` 的 `_validate_data_v1`）；
+- proxy 中间件里那句注释 "Allocate a monotonic sequence id per (rollout, attempt)"（`llm_proxy.py:564`）表达的是**意图**，实际计数粒度以 store 实现为准。
+
+**外部传入的序号会被"抬升"而不是"覆盖"**（`store/collection_based.py:1034-1038`）：
+
+```python
+async def _sync_span_sequence_id(self, rollout_id: str, sequence_id: int) -> None:
+    """Sync the span sequence ID for a given rollout from the input span sequence ID."""
+    async with self.collections.atomic(mode="rw", snapshot=False, labels=["span_sequence_ids"]) as collections:
+        await collections.span_sequence_ids.chmax(rollout_id, sequence_id)     # 取 max，不是 set
+```
+
+`chmax`（**ch**ange to **max**）保证：**即便有外部实体塞进来一个很大的序号，计数器也只会单向变大，绝不会回退导致后续分配重号**。
+
+**（2）幂等：靠 `spans` collection 的主键去重 + 逐条退化重试。** `store/collection_based.py:1112-1147`：
+
+```python
+async def _insert_spans_with_fallback(self, spans: Sequence[Span]) -> Sequence[Span]:
+    async def _add_span_fallback(collections, span: Span) -> bool:
+        try:
+            await collections.spans.insert([span])
+            return True
+        except DuplicatedPrimaryKeyError:                             # 重复 span
+            logger.error(f"Duplicated span added for rollout={span.rollout_id}, "
+                         f"attempt={span.attempt_id}, span={span.span_id}. Skipping.")
+            return False
+
+    successful_spans: List[Span] = []
+    try:
+        async with self.collections.atomic(mode="w", snapshot=..., commit=False, labels=["spans"]) as collections:
+            await collections.spans.insert(spans)                     # 先批量插
+        successful_spans.extend(spans)
+    except DuplicatedPrimaryKeyError:
+        for span in spans:                                            # 有一条重复 → 整体退化为逐条
+            async with self.collections.atomic(mode="w", ...) as collections:
+                if await _add_span_fallback(collections, span):
+                    successful_spans.append(span)
+    return successful_spans
+```
+
+**语义**：span 的主键（`rollout_id + attempt_id + span_id`）天然提供幂等——**重复上传不会产生两条 span，而是被丢弃并打 ERROR 日志**；批量插入一旦撞重复就退化成逐条插入，**其余不重复的 span 仍然入库**（不会因为一条重复丢掉整批）。源码里还有一句诚实的 FIXME：`Part of the insertion might complete though the full operation fails` —— 非事务性插入的边界情况。
+
+**（3）"上传 span 就是心跳"：attempt/rollout 状态会被 span 顺带推进。** `add_span` 成功后走 `_post_add_spans` → `_on_attempt_heartbeat`（`store/collection_based.py:1181-1235`）：
+
+```python
+# Update attempt heartbeat and ensure persistence
+attempt.last_heartbeat_time = time.time()
+if attempt.status in ["preparing", "unresponsive"]:
+    attempt.status = "running"                       # 第一次收到 span → attempt 进入 running
+await collections.attempts.update([attempt], update_fields=["last_heartbeat_time", "status"])
+
+# If the status has already timed out or failed, do not change it (but heartbeat is still recorded)
+
+# Update rollout status if it's the latest attempt
+if latest_attempt is not None and attempt.attempt_id == latest_attempt.attempt_id:
+    if rollout.status in ["preparing", "queueing", "requeuing"]:
+        rollout.status = "running"                   # 最新 attempt 在跑 → rollout 也 running
+```
+
+**这段代码关键在哪**：① **span 上传 = 心跳**，所以一个正常产生轨迹的 runner 不会因为"忘调 `update_worker`"而被 watchdog 判为 unresponsive；② 状态推进是**单向且保守**的——已经 `succeeded`/`failed`/超时的 attempt/rollout **不会被 span 改回 running**（注释明确写了），避免"迟到的 span 复活一个已终结的 rollout"。
+
+**（4）故障语义：写 store 失败是"静默降级 + 本地留存 + 日志"，不阻断 agent。** 回看第 6 节的 `on_end`：超时（`STORE_WRITE_TIMEOUT_SECONDS = 10.0`）或任何异常，只在本地 `self._spans` 里留一份并 `logger.warning/exception`，**绝不向 agent 抛异常**（注释：`on_end MUST NOT raise`）。
+
+**这意味着一个非常重要的工程事实（面试可以主动说）**：
+
+$$ \text{store 里的 span 数} = \text{实际产生的 span 数} - \text{上传失败的 span 数} $$
+
+而**上传失败是静默的**——训练侧只会看到"这个 rollout 的 triplet 少了几个"甚至"没有 triplet"，表现为**训练样本数莫名波动**。工程上的应对是：监控 `tracer/otel.py` 的两条日志（`Timed out adding span ...` / `Error adding span to store: ...`），并把 `_spans`（本地留存列表）在必要时落盘。**更隐蔽的是 token 相关的失败**：`to_trajectory` 会把"没有 token id 的 LLM 调用"过滤掉（`_skip_empty_token_spans`），所以 **token 插桩没生效的轨迹会"看起来跑成功了，但训练时被静默丢弃"**——这也是第 6 节那个 `# MAGIC! DO NOT TOUCH THIS!` 警告存在的原因。
+
+**（5）OTLP 路的额外故障点：缺 ID 的 span 被直接丢弃。** `utils/otlp.py:174-182`：
+
+```python
+if rollout_id is None or attempt_id is None:
+    logger.warning(
+        "Both rollout_id and attempt_id must be present in resource attributes. "
+        "Spans will not be able to log to the store because of missing IDs: rollout_id=%s, attempt_id=%s, sequence_id=%s",
+        rollout_id, attempt_id, sequence_id,
+    )
+    continue
+```
+
+对比逐条路：逐条路是把 `rollout_id`/`attempt_id` 当**函数参数**传的，不可能丢；OTLP 路要**靠 resource 属性携带**，所以一旦 `_enable_native_otlp_exporter` 没生效（或 resource 合并失败），整批 span 会被静默丢弃（只有一条 warning）。**这是选路机制带来的新故障模式**，也是排查"OTLP 路上传成功但 store 里没数据"的第一个检查点。
+
+**（6）v0.3.0 的边界（现状）**：OTLP 只实现了 traces，metrics 与 logs 端点**直接返回 501**（`store/client_server.py:957-968`）：
+
+```python
+# Other API endpoints are not supported yet
+@api.post("/metrics")
+async def otlp_metrics():
+    return Response(status_code=501)
+
+@api.post("/logs")
+async def otlp_logs():
+    return Response(status_code=501)
+```
+
+也没有实现 OTLP 的 `partial_success` 字段（`utils/otlp.py:94` 注释：`Partial success field is left unset`），即**服务端不告诉客户端"我丢了几条"**——所以"静默丢 span"在协议层面是允许的。
+
+### 3. 具体数值样例
+
+```text
+场景：同一个 rollout r-1/attempt a-1，store 计数器初始为 0
+
+【序号分配】4 条 span 声称的顺序 vs 实际分配
+  proxy 中间件先为每次 LLM 请求领号（在第 3 节例子中为 1、2、3），
+  emitter 的 reward span 随后领号：
+    第 1 次 inc(r-1, 1) → 返回 1
+    第 2 次 inc(r-1, 1) → 返回 2
+    第 3 次 inc(r-1, 1) → 返回 3
+    第 4 次 inc(r-1, 1) → 返回 4
+  若改用 OTLP 批量路：4 条 span 一次 inc(r-1, 4) → 返回 4，客户端本地切分为 1、2、3、4
+  ⇒ 请求数从 4 次原子操作降到 1 次（第 8 节的关键性能差异）
+
+【乱序到达也不影响排序】
+  假设 span#2 因为网络慢，在 span#3 之后才到 store：
+    写入顺序：1 → 3 → 2 → 4
+    store 里的 sequence_id 仍是 1、2、3、4
+    查询时 ORDER BY sequence_id → 恢复正确顺序（这就是不用时间戳排序的意义）
+
+【外部塞号被抬升】
+  假设某 span 自带 sequence_id=100（来自 proxy 的 x-sequence-id）
+    写入时 chmax(r-1, 100) → 计数器变成 100
+    后续 inc(r-1, 1) → 返回 101（不会重号）
+
+【重复上传】
+  span#2 被上传两次：
+    第 1 次：insert 成功 → successful_spans=[s2]
+    第 2 次：批量 insert 抛 DuplicatedPrimaryKeyError
+             → 退化为逐条：s2 抛重复 → return False（打 ERROR 日志，丢弃）
+    ⇒ store 里仍然只有 4 条 span，幂等成立
+
+【上传失败（最需要警惕的）】
+  span#3 上传超时（>10s）：
+    on_end 捕获 TimeoutError → logger.warning("Timed out adding span ... after 10.0 seconds. "
+                                              "The span will be stored locally but it's not guaranteed to be persisted.")
+    → 本地 _spans 里有 4 条；store 里只有 3 条
+  下游影响（假设 span#3 是一次 LLM 调用）：
+    轨迹的 LLM 调用数从 3 变成 2
+    → 该 rollout 的训练样本从 3 条变成 2 条（少一条）
+    → training/n_triplets 指标下降，但训练本身不会报错
+  这就是"训练样本数随机波动"的最常见根因之一。
+
+【跨 attempt 的序号连续性】
+  attempt a-1 用了 sequence_id 1..4；agent 崩溃 → rollout 重试 → attempt a-2
+    a-2 的第一条 span 领到的是 5（不是 1）
+  ⇒ 如果算法侧错用 query_spans(r-1)（不限 attempt）拿到的会是 a-1+a-2 混在一起、且序号连续的数据
+  ⇒ 正确做法：query_spans(r-1, attempt_id="latest")（verl daemon 的做法）
+```
+
+**五个量化结论**：① **序号是"分配"的而不是"比较"的**，所以乱序到达不影响正确性；② OTLP 批量路把**原子领号次数从 $N$ 降到 1**；③ 重复上传被主键幂等丢弃，**不会重复计数**；④ 上传失败是**静默的**，直接表现为训练样本数减少（最需要监控的指标）；⑤ 序号**跨 attempt 连续性**，所以查轨迹必须带 `attempt_id` 过滤。
+
+> **面试一句话总结**：分布式轨迹有三个必须显式设计的语义——① **有序**：`sequence_id` 由 store 用 `span_sequence_ids.inc()` 原子分配，**键是 `rollout_id`（docstring: "strictly increasing for each rollout"，`attempt_id` 只出现在签名里）**，因此重试不会重置序号、跨 attempt 的 span 必须靠 `attempt_id` 过滤；外部塞入的序号用 `chmax`（取 max）单向抬升绝不回退；OTLP 路支持整批一次领号。② **幂等**：`spans` collection 用主键（`rollout_id + attempt_id + span_id`）去重，批量插入撞重复时**退化为逐条插入**，重复 span 记 ERROR 日志后丢弃，其余仍入库。③ **故障**：`on_end` 有 10s 超时且**绝不向 agent 抛异常**（`on_end MUST NOT raise`），失败只在本地 `_spans` 留存 + 打日志；并且"上传 span 即心跳"（`_on_attempt_heartbeat` 会刷新 `last_heartbeat_time` 并把 `preparing/unresponsive → running`，但**不会把已终结的状态改回 running**）；OTLP 路额外有个"缺 rollout/attempt 的 span 被静默丢弃"的故障模式，且 v0.3.0 的 `/v1/metrics`、`/v1/logs` 直接返回 501、响应也不带 `partial_success`——**"静默丢 span → 训练样本数波动"是最需要监控的坑**。
+
+---
+
 ## 附：组件速查表
 
 | 组件 | 代码位置（v0.3.0） | 角色 | 关键接口 / 类 |
@@ -646,9 +1916,17 @@ Algorithm 查询 spans ──▶ Adapter（TracerTraceToTriplet）
 | Algorithm | `algorithm/` | 大脑：派任务、学数据、更新资源 | `Algorithm.run()`；`VERL` / `APO` / `Baseline` |
 | Runner | `runner/` | 工人：领任务、跑 agent、写轨迹 | `Runner`；`LitAgentRunner` |
 | LightningStore | `store/` | 数据库+队列：解耦两侧 | `enqueue/dequeue_rollout`、`add_otel_span`、`query_spans`、`update_attempt` |
-| Tracer | `tracer/` | 轨迹采集：插桩自动捕获 spans | `Tracer`；`AgentOpsTracer` / `OtelTracer` |
-| Adapter | `adapter/` | 轨迹→训练样本 | `TraceAdapter`；`TracerTraceToTriplet` |
-| LLMProxy | `llm_proxy.py` | agent↔模型的桥 + 插桩 + 换模型 | `LLMProxy`；`ProxyLLM`（main_llm 资源） |
+| Tracer | `tracer/` | 轨迹采集：插桩自动捕获 spans | `Tracer`；`OtelTracer`（只收 AGL 信号）/ `AgentOpsTracer`（带第三方库插桩） |
+| Span 模型 | `types/tracer.py:251` | 跨机可序列化的规范轨迹单元 | `Span`（`rollout_id`/`attempt_id`/`sequence_id`/`trace_id`/`span_id`/`parent_id`）；`Span.from_opentelemetry` |
+| 插桩补丁 | `instrumentation/agentops.py` | 把 vLLM 的 token id / logprob 塞进 span 属性 | `_patch_new_agentops` / `_patch_old_agentops`（patch `handle_chat_attributes`）；`Bypassable*Exporter`（不发 agentops 云端） |
+| vLLM 插桩 | `instrumentation/vllm.py` | 让 vLLM 响应带上 `prompt/response_token_ids` | `ChatCompletionResponsePatched`；`instrument_vllm()`（已上游化到 vLLM ≥ v0.10.2） |
+| Span 落库 | `tracer/otel.py:308` | 每个 span 结束时上传 store | `LightningSpanProcessor.on_end()`（专属 `otel-loop` 线程，10s 超时，失败只落本地） |
+| emitter | `emitter/` | agent 主动上报 reward / message / object / exception | `emit_reward` → `emit_annotation` → `get_active_tracer().create_span()`（须在 trace_context 内） |
+| Span 树 | `adapter/triplet.py:99` | 扁平 span 列表 → 树（含容错与重挂） | `TraceTree.from_spans`（补丢失父节点 + `virtual-root`）、`repair_hierarchy()`、`agent_name()`（7 种框架识别） |
+| Adapter | `adapter/` | 轨迹→训练样本 | `TraceAdapter`；`TracerTraceToTriplet`（`find_llm_calls` → `span_to_triplet` → `match_rewards` → `to_trajectory`） |
+| LLMProxy | `llm_proxy.py` | agent↔模型的桥 + 插桩 + 换模型 | `LLMProxy`；`ProxyLLM`（`get_base_url` 拼 `/rollout/{rid}/attempt/{aid}`）；`RolloutAttemptMiddleware`（注入 `x-rollout-id`/`x-attempt-id`/`x-sequence-id`）；`LightningSpanExporter`（子树缓冲批量导出） |
+| OTLP 传输 | `utils/otlp.py` | span 的 protobuf 批量上传协议 | `LightningStoreOTLPExporter`、`handle_otlp_export`、`spans_from_proto`（`POST /v1/traces`） |
+| Server/Client | `store/client_server.py` | 同一接口的跨机 HTTP 化 | `LightningStoreServer`（`otlp_traces=True`，`/v1/agl/*` + `/v1/traces`）、`LightningStoreClient`（`_request_json` 重试 + 按 event loop 缓存 session）、`_call_store_method`（同进程直调 / 跨进程 HTTP） |
 | Trainer | `trainer/` | 总装：接线所有组件 | `Trainer.fit()` |
 | ExecutionStrategy | `execution/` | 部署形态：线程 or 进程/机器 | `SharedMemoryExecutionStrategy` / `ClientServerExecutionStrategy` |
 | verl 集成 | `verl/` + `algorithm/verl/` | RL 训练后端 | `AgentLightningTrainer(RayPPOTrainer)`、`AgentModeDaemon`、`VERL(Algorithm)` |
