@@ -1,753 +1,772 @@
-# Kubernetes + KubeRay 完全指南（从核心概念到自定义 CRD 训练作业）
+# KubeRay 实操手册：从三台服务器到大规模训练集群
 
-> 对应实习亮点"管控面：基于 Ray 分布式框架的 AgenticRL 训练作业（Kubernetes CRD 资源）"与"并行创建 RayCluster Head 和 TrajStore 两条网络访问链路"。一句话知识框架：
-> **Kubernetes = 声明式容器编排系统（把"我要什么"写成 YAML，控制器持续让现实向期望收敛）；KubeRay = 把 Ray 集群变成 K8S 原生资源（RayCluster/RayJob 等 CRD + Operator）；AgenticRL 训练作业 = 自定义 CRD + Operator 把 agent-lighting 的 store/algo/agent 三件套按分离式架构编排成 K8S 工作负载**。
+> **这篇怎么用**：不讲概念定义，按"**准备机器 → 装 Operator → 起集群 → 跑训练 → 起服务 → 排障**"的顺序走一遍，每步都是能直接粘贴的命令和真实 YAML。YAML 全部来自本地 KubeRay 仓（`kuberay/ray-operator/config/samples/`），字段逐条解释。
 >
-> 素材来源：本地克隆 `C:\Users\HW\Desktop\简历投递\kubernetes`（HEAD `e72c2715`）、`C:\Users\HW\Desktop\简历投递\kuberay`（HEAD `ffec815`）、`agent-lightning-official`（v0.3.0）。配套阅读：`Ray.md`（Ray 本身）、`Agent-Lighting.md`（三件套与三机分离）、`Communication.md`（网络层）。
+> 前置阅读：`Ray.md`（GCS/raylet/Plasma 的机制）、`K8S-KubeRay.md` 里已删掉的纯概念部分可参考 K8s 官方文档。本文只保留"要动手的部分"。
+>
+> **素材来源**：`kuberay` 全仓（`docs/deploy/installation.md`、`ray-operator/config/samples/*.yaml`、`helm-chart/`）；`uniagent-lighting/docs/deployment.md`；`agent-lightning` v0.3.1 源码（`agentlightning/cli/store.py`、`agentlightning/store/client_server.py`）。
 
 ---
 
-# 一、Kubernetes 全部核心概念（先分点，逐个讲透）
-
-## 1. 工作负载（Workload）：Pod / ReplicaSet / Deployment / StatefulSet / DaemonSet / Job
-
-### 1. 现有问题
-
-- 一个应用跑起来需要什么？容器（进程隔离）→ 但容器会崩、会退出、需要多副本、需要更新；
-- 需要一层"**声明期望、自动收敛**"的抽象，让用户不关心"怎么拉起、怎么重启、怎么滚动"。
-
-### 2. 方法论（概念逐层递进）
-
-**① Pod——最小调度单元**：
-- 一个 Pod = 一组**共享网络命名空间与存储卷**的容器（通常是 1 主容器 + 可选 sidecar）；
-- 特点：Pod 内所有容器共享 **同一个 IP / localhost / 端口空间**、共享挂载的 Volume；Pod 是**临时**的（可被杀死、重建，IP 会变）；
-- 生命周期：`Pending → Running → Succeeded/Failed`，异常时 `CrashLoopBackOff`；
-- 关键字段：`spec.containers[].image/ports/resources`、`spec.restartPolicy`（Always/OnFailure/Never）、`spec.nodeSelector`、`spec.containers[].readinessProbe/livenessProbe/startupProbe`（探针：HTTP/TCP/Exec）。
-
-**② ReplicaSet（RS）——维持副本数**：
-- `spec.replicas` 期望副本数 + `spec.selector` 选 Pod；RS 的 controller 发现实际数 < 期望数就**创建 Pod**，多了就**删除**；
-- 只保证"数量"，不保证"更新"。
-
-**③ Deployment——RS 之上加滚动更新**：
-- Deployment 管理 RS，RS 管理 Pod，形成三层：**Deployment → ReplicaSet → Pod**；
-- 滚动更新：`strategy.rollingUpdate.maxUnavailable/maxSurge` 控制新旧 RS 的流量切换；`revisionHistoryLimit` 保留历史版本用于回滚（`kubectl rollout undo`）；
-- 这是**无状态应用**的标准载体。
-
-**④ StatefulSet——有状态应用（稳定身份 + 稳定存储）**：
-- 每个 Pod 有**稳定网络标识**：`<sts-name>-0, -1, -2...`，配合 **Headless Service** 用固定 DNS 名访问；
-- **稳定存储**：`volumeClaimTemplates` 为每个副本生成独立的 PVC（Pod 重建后挂同一块盘）；
-- **有序部署/删除**（`podManagementPolicy: OrderedReady`）；
-- 适用：数据库、ZooKeeper、**需要固定身份的分布式组件**（如 Ray head？不，head 用 Deployment 即可）。
-
-**⑤ DaemonSet——每节点一个**：
-- 每个 Node 上恰好跑一个副本（新节点加入自动起、删除自动清）；
-- 适用：日志采集（fluentd）、监控（node-exporter）、CNI 插件、**GPU 设备插件**。
-
-**⑥ Job / CronJob——一次性/定时任务**：
-- Job：跑完即结束的批任务，`completions`（要成功几个）、`parallelism`（并发几个）、`backoffLimit`（失败重试上限）、`ttlSecondsAfterFinished`（完成多久后清理）；
-- CronJob：按 cron 表达式定时创建 Job（`schedule`、`concurrencyPolicy`、`startingDeadlineSeconds`）；
-- **训练任务（如 AgenticRL 单次训练、评估）天然适合 Job 语义**——但长时、需资源编排的训练通常升级为自定义 CRD（第 21 点）。
-
-### 3. 具体数值样例
-
-- Deployment `replicas: 3`、`maxSurge: 1, maxUnavailable: 0`：滚动更新时先起 1 个新 Pod（总数 4），就绪后删 1 个旧 Pod（回到 3），逐个替换——**零停机**；
-- Job `completions: 4, parallelism: 2, backoffLimit: 3`：2 个并行跑，4 个成功即完成，单个失败自动重试最多 3 次；
-- StatefulSet 3 副本：Pod 名 `redis-0/1/2`，headless service 下 `redis-0.redis.default.svc` 固定可达，重建后仍叫 redis-0 且挂同一 PVC。
-
-> 面试一句话总结：**K8S 工作负载按"无状态/有状态/系统组件/批任务"分四类：Deployment（无状态，滚动更新）、StatefulSet（稳定身份+稳定存储）、DaemonSet（每节点一个）、Job/CronJob（一次性/定时）——底层都是"声明副本数，controller 收敛"的模式。**
-
----
-
-## 2. 服务与网络：Service / Ingress / NetworkPolicy / kube-proxy / CNI
-
-### 1. 现有问题
-
-- Pod 的 IP 是**临时**的（重建就变），客户端怎么稳定访问？多副本怎么负载均衡？集群外怎么访问？
-- 集群内网络谁打通？东西向安全怎么隔离？
-
-### 2. 方法论
-
-**① Service——稳定的服务入口（4 层）**：
-- **ClusterIP**（默认）：分配一个集群内虚拟 IP（VIP），`kube-proxy` 把发往 VIP 的流量按 **iptables / ipvs** 规则转发到后端 Pod（EndpointSlice 维护 Pod IP 列表）——集群内负载均衡；
-- **NodePort**：在每台节点上开一个端口（30000-32767），`nodeIP:nodePort` 可从集群外访问（生产少用）；
-- **LoadBalancer**：让云厂商（或 MetalLB）分配公网/云负载均衡器，流量 → NodePort → Pod；
-- **Headless**（`clusterIP: None`）：不分配 VIP，直接给每个 Pod 一条 DNS 记录——StatefulSet 稳定身份靠它；
-- **ExternalName**：把 Service 映射到外部 DNS 名。
-
-**② Ingress——7 层入口**：
-- 按 **host/path** 做 HTTP/HTTPS 路由（nginx-ingress / ingress-nginx / ALB），支持 TLS 终止、重写、限流；
-- IngressClass 选择具体 controller 实现。
-
-**③ 集群内 DNS（CoreDNS）**：`<service>.<namespace>.svc.cluster.local` 解析——Pod 间用服务名互访，KubeRay 的 head FQDN 就是 `raycluster-head-svc.default.svc...`。
-
-**④ NetworkPolicy——东西向防火墙**：
-- 按 Label Selector 定义"谁可以访问谁"（ingress/egress 规则 + 端口），由 CNI（Calico/Cilium）实现；
-- KubeRay 1.6+ 支持为 RayCluster 自动生成 head/worker 的 NetworkPolicy（`raycluster_types.go` 里 Head/Worker EgressRules）。
-
-**⑤ CNI（Container Network Interface）**：容器网络的插件化标准（Calico/BGP、Cilium/eBPF、flannel/VXLAN）——负责给每个 Pod 分配 IP、打通跨节点网络、实现 NetworkPolicy。
-
-### 3. 具体数值样例
-
-- `myapp` Deployment 3 副本 → Service `myapp`（ClusterIP 10.96.0.5）→ 客户端访问 `http://myapp:8080`，kube-proxy 按 ipvs 轮询转发到 3 个 Pod IP；
-- 从公网访问：`Ingress → Service(ClusterIP) → Pod`，Ingress controller 监听 80/443，按域名路由；
-- KubeRay 场景：`raycluster-head-svc`（ClusterIP）+ 若需外部访问加 NodePort/Ingress——**实习"TrajStore 公网 URL 暴露"就是给 TrajStore Service 配 LoadBalancer/Ingress**。
-
-> 面试一句话总结：**K8S 网络四层：CNI 给 Pod 发 IP 打通集群、kube-proxy 实现 Service 的 4 层负载均衡（iptables/ipvs）、Ingress 做 7 层 HTTP 路由、NetworkPolicy 做东西向隔离——Pod IP 会变，Service 名不变，应用只认服务名。**
-
----
-
-## 3. 配置与存储：ConfigMap / Secret / Volume / PV / PVC / StorageClass
-
-### 1. 现有问题
-
-- 配置（环境变量、参数）与镜像分离——改配置不该重新构建镜像；
-- 密钥（密码、token、证书）不能明文进镜像/YAML；
-- 容器是临时的，数据要持久化（训练 checkpoint、轨迹数据）。
-
-### 2. 方法论
-
-**① ConfigMap**：键值配置，注入方式：环境变量 / 文件挂载（volume）/ 命令行参数；改 ConfigMap 后需滚动重启 Pod 生效。
-**② Secret**：与 ConfigMap 同机制但**敏感数据**（etcd 里 base64 编码存储，注意"只是编码不是加密"）；类型：`Opaque`、`kubernetes.io/dockerconfigjson`（拉镜像凭证）、`kubernetes.io/tls`、`service-account-token`。
-**③ Volume（容器内挂载点）**：
-- `emptyDir`：Pod 生命周期内的临时目录（同 Pod 多容器共享）；
-- `hostPath`：挂宿主机目录（DaemonSet 常用，如日志）；
-- **PVC（PersistentVolumeClaim）**：声明式"我要 N GB 存储"，由 PV（实际存储，如云盘/NFS/本地盘）供给。
-**④ PV / PVC / StorageClass**：
-- PV = 集群级存储资源（静态创建或动态供给）；PVC = 用户申请；**StorageClass** = 动态供给模板（`provisioner: ebs.csi.aws.com`、`nfs.csi.k8s.io`...），PVC 引用 StorageClass 自动创建 PV；
-- **CSI（Container Storage Interface）**：存储插件化标准（云盘/NFS/Ceph 都是 CSI driver）。
-**⑤ 训练场景**：checkpoint 目录、数据集、轨迹库（TrajStore 的磁盘）都用 PVC 持久化，Pod 重建数据不丢。
-
-### 3. 具体数值样例
-
-- 训练作业声明 `volumeClaimTemplates`（StatefulSet）或 Deployment 挂 PVC：`requests.storage: 500Gi` + `storageClassName: nfs` → 自动创建 500Gi NFS PV 并挂载到 `/data`；
-- Secret 注入：`envFrom: secretRef` 或挂载成文件（`/etc/credentials`）——**华为云 TrajStore 密钥、E2B token 都走 Secret**；
-- 实习场景：TrajStore 的轨迹数据落 PVC，Pod 重启轨迹还在；Checkpoint 权重落 PVC 供续训。
-
-> 面试一句话总结：**配置用 ConfigMap、密钥用 Secret（etcd 里 base64）、持久化用 PV/PVC/StorageClass（CSI 动态供给）——三者都是"声明 + 注入"，让镜像与运行环境解耦；训练数据/checkpoint/轨迹库都挂 PVC 保证 Pod 重建不丢。**
-
----
-
-## 4. 元数据与组织：Namespace / Label / Annotation / Finalizer / OwnerReference
-
-### 1. 现有问题
-
-集群里资源成千上万，怎么**分组、筛选、标记、清理**？删除父资源时子资源怎么跟着删？
-
-### 2. 方法论
-
-- **Namespace**：逻辑隔离单元（`default/kube-system/kube-node-lease`）；RBAC、ResourceQuota、NetworkPolicy 都可按 namespace 隔离——**多租户/多环境（dev/prod）的边界**；
-- **Label / Selector**：键值标签 + 选择器（`equality: app=api` / `set-based: env in (dev,prod)`）；Service/RS/NetworkPolicy 都靠 selector 找目标——**K8S 的组织方式是"标签"，不是"层级"**；
-- **Annotation**：非标识性元数据（版本、负责人、工具配置），不被 selector 使用；
-- **Finalizer**：删除保护——资源标记删除（`deletionTimestamp`）后，**先等 Finalizer 列表清空**才真正删除；自定义 Operator 用它做"删除前清理"（如删 RayCluster 前先删底层 Pod/云资源）；
-- **OwnerReference**：声明父子关系（Deployment 拥有 RS，RS 拥有 Pod）→ **级联删除**（删 Deployment 自动删 RS 和 Pod）+ 垃圾回收（GC controller）；
-- UID：每个对象唯一标识，OwnerReference 用 UID 而非名字。
-
-### 3. 具体数值样例
-
-- `kubectl get pods -l app=raycluster-sample,role=worker`：按标签筛 worker Pod；
-- 删 Deployment：其 RS 与 Pod 因 OwnerReference 级联删除；若 Pod 有 Finalizer，删除会被"挂起"直到 Finalizer 被清；
-- KubeRay Operator 给 RayCluster 相关 Pod 打标签（`ray.io/cluster`、`ray.io/node-type: head|worker`），Service/NetworkPolicy 据此选择。
-
-> 面试一句话总结：**Namespace 分租户、Label 组织资源（selector 是 K8S 的"关联方式"）、Annotation 存元数据、Finalizer 做删除前清理、OwnerReference 实现级联删除与 GC——理解这套元数据机制是理解"声明式系统如何自组织"的关键。**
-
----
-
-## 5. 调度与资源：requests/limits / QoS / HPA / 亲和性 / 污点
-
-### 1. 现有问题
-
-- 多容器抢资源怎么办？调度器怎么选节点？GPU 怎么分配？负载高了怎么自动扩容？
-
-### 2. 方法论
-
-**① 资源请求与限制（requests/limits）**：
-- `requests`：调度依据（保证值）；`limits`：上限（CPU 可压缩、内存不可压缩，超限 OOMKill）；
-- **QoS 三类**：Guaranteed（requests==limits）、Burstable（requests<limits）、BestEffort（都不设）——驱逐顺序 BestEffort 先被赶；
-- **GPU**：`nvidia.com/gpu: 1` 是**扩展资源**（Extended Resource），只能设 limits 不能设 requests（K8S 1.27+ 支持细粒度），由**设备插件**（GPU device plugin）上报节点可用 GPU。
-
-**② HPA（HorizontalPodAutoscaler）**：按 CPU/内存/自定义指标（Prometheus）调整 Deployment 副本数：`minReplicas/maxReplicas` + `metrics` + `behavior`（扩容/缩容策略，缩容有冷却窗口）。
-
-**③ 节点选择与亲和**：
-- `nodeSelector`：简单键值匹配；
-- **nodeAffinity**：`requiredDuringScheduling`（硬）/`preferredDuringScheduling`（软）；
-- **podAffinity/antiAffinity**：与某类 Pod 同节点/异节点（训练：trainer 与 PS 同机、GPU Pod 与 GPU Pod 分散）；
-- **Taint/Toleration**：节点打污点（`dedicated=gpu:NoSchedule`），只有带对应 toleration 的 Pod 能调度上去——**GPU 节点池隔离**的标配；
-- **PriorityClass**：抢占（高优先级 Pod 挤掉低优先级）。
-
-### 3. 具体数值样例
-
-- 训练 Pod：`resources: {requests: {cpu: 8, memory: 32Gi, nvidia.com/gpu: 1}, limits: {...}}` → 调度器选有 1 张空闲 GPU 且满足 CPU/内存的节点；
-- GPU 节点打污点 `nvidia.com/gpu=true:NoSchedule` + 训练 Pod 带 toleration → **普通 Pod 不会误占 GPU 节点**；
-- HPA：`min: 1, max: 16`，指标 `pods/runner_queue_depth`（自定义）→ 队列深了自动扩 runner 副本（agent-lighting runner 扩缩容场景）。
-
-> 面试一句话总结：**调度 = 资源（requests 是准入线、limits 是上限）+ 亲和/污点（控制落点）+ QoS（驱逐顺序）；GPU 是扩展资源由设备插件上报；HPA 按指标自动扩缩容——训练场景用"GPU 污点节点池 + Pod 亲和（trainer 同机）+ HPA（runner 弹性）"组合。**
-
----
-
-## 6. 身份与安全：ServiceAccount / RBAC / SecurityContext / PodSecurity
-
-### 1. 现有问题
-
-- 集群内进程（如 Operator、训练作业）访问 API 要"身份"；谁能读/写什么资源要"授权"；容器要以最小权限跑。
-
-### 2. 方法论
-
-- **ServiceAccount（SA）**：Pod 内进程的身份（默认 `default`）；SA 绑定**挂载的 token**（`automountServiceAccountToken`），kubelet 挂到 `/var/run/secrets/kubernetes.io/serviceaccount/`；
-- **RBAC 四件套**：`Role`（namespace 内权限）/ `ClusterRole`（集群级）/ `RoleBinding` / `ClusterRoleBinding`；权限 = `apiGroups + resources + verbs`（get/list/watch/create/update/patch/delete）；
-- **SecurityContext**：容器/Pod 级安全设置（`runAsUser`、`privileged`、`capabilities`、`readOnlyRootFilesystem`）；
-- **PodSecurity（PSA）**：准入层强制 Pod 安全级别（privileged/baseline/restricted）；
-- **网络与密钥安全**：NetworkPolicy + Secret 最小暴露。
-
-### 3. 具体数值样例
-
-- KubeRay 的 autoscaler 需要读/写 RayCluster 状态 → Operator 自动创建 `ray-autoscaler-<cluster>` 的 SA + Role + RoleBinding（`reconcileAutoscalerServiceAccount/Role/RoleBinding` 源码可见）；
-- 自定义训练 Operator：ClusterRole 授予 `rayclusters/get/list/watch/update` + `pods/...` + `jobs/...` 等 verbs，Controller 以该 SA 运行；
-- Agent 沙箱 token（E2B）、云密钥全部走 Secret 注入，容器内 `runAsNonRoot: true` 降权。
-
-> 面试一句话总结：**SA 是身份、RBAC 是授权（Role/ClusterRole + Binding）、SecurityContext/PSA 是容器降权、NetworkPolicy+Secret 是最小暴露——Operator 必须自备一套 SA/RBAC，KubeRay autoscaler 就是现成例子。**
-
----
-
-## 7. 扩展机制：CRD / CR / Operator / Admission Webhook（本文的灵魂）
-
-### 1. 现有问题
-
-- K8S 只内置了 Deployment/Service 等"通用资源"；**训练作业、Ray 集群这类领域资源没有原生表达**——怎么办？
-- K8S 的设计答案：**API 可扩展**——用户自己定义资源类型（CRD），自己写控制器（Operator）实现"声明式收敛"。
-
-### 2. 方法论
-
-**① CRD（CustomResourceDefinition）——定义一种新资源类型**：
-```yaml
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: rayclusters.ray.io
-spec:
-  group: ray.io                 # API 组（资源分组）
-  names:
-    kind: RayCluster            # 资源 kind
-    plural: rayclusters         # 复数名（kubectl 用）
-    shortNames: [raycluster]    # 简写
-    singular: raycluster
-  scope: Namespaced             # 集群级 or 命名空间级
-  versions:
-    - name: v1
-      served: true
-      storage: true
-      schema:                   # OpenAPI v3 结构校验
-        openAPIV3Schema:
-          type: object
-          properties:
-            spec: { type: object, properties: {...} }
-            status: { type: object, properties: {...} }
-      subresources:
-        status: {}              # 允许 kubectl status 子资源（状态与规格分离）
+## 0. 先看全景：我们要搭出什么
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │  K8s Control Plane (node-1)             │
+                    │  apiserver / etcd / scheduler / cm      │
+                    │  + KubeRay Operator（watch CRD 并建 Pod）│
+                    └───────────────┬─────────────────────────┘
+                                    │ 调度
+        ┌───────────────────────────┼───────────────────────────┐
+        ▼                           ▼                           ▼
+┌───────────────┐          ┌───────────────┐          ┌───────────────┐
+│ node-2 (GPU)  │          │ node-3 (GPU)  │          │ node-N (GPU)  │
+│ Ray Head Pod  │          │ Ray Worker Pod│          │ Ray Worker Pod│
+│ GCS 6379      │◄─ Ray ──►│ :10001        │◄────────►│ :10001        │
+│ Dash 8265     │  gRPC    │               │          │               │
+│ Client 10001  │          │ GPU × 8       │          │ GPU × 8       │
+└───────────────┘          └───────────────┘          └───────────────┘
 ```
 
-**② CR（CustomResource）——资源实例**：就是 `kind: RayCluster` 的 YAML（第 14 点）。
-**③ Operator = CRD + Controller**：Controller 用 **reconcile loop** 监听 CR 变化，不断把"现实状态"向"CR 声明的期望状态"收敛（第 11 点详讲）；KubeRay、Prometheus Operator、cert-manager 都是 Operator。
-**④ Admission Webhook**：资源写入 etcd 前的拦截器——`MutatingWebhookConfiguration`（改对象，如注入 sidecar/默认值）、`ValidatingWebhookConfiguration`（校验拒绝）；KubeRay 1.6+ 的 RayCluster webhook 会校验 rayStartParams 合法性。
-**⑤ controller-runtime**（Kubebuilder/Operator SDK 的底层）：封装 informer + workqueue + reconcile 的 Go 框架。
+**四个角色**（后面每一步都在填这四块）：
 
-### 3. 具体数值样例
-
-- 用户写 20 行 `RayCluster` CR → KubeRay Operator 的 reconcile 自动创建 head Deployment、worker StatefulSet/Deployment、head Service、autoscaler RBAC——**用户只声明"要一个 1 head + 4 worker 的 Ray 集群"，其余全自动**；
-- 自定义 `AgenticRLTrainJob` CR（第 22 点）→ 你的 Operator 自动拉起 store/algo/runner 工作负载、跟踪状态、清理资源；
-- Webhook 示例：MutatingWebhook 给训练 Pod 自动注入 GPU 环境变量与 volume，用户 YAML 不用写这些样板。
-
-> 面试一句话总结：**CRD 让用户自定义"资源类型"（group/kind/schema/status），Operator（CRD+Controller）用 reconcile 循环让现实向声明收敛，Webhook 在写入前拦截校验/注入——K8S 的扩展能力就是"把领域知识（Ray、训练、数据库）编码成资源语义"，这是本文后面 KubeRay 与自定义训练作业的地基。**
+| 角色 | 是什么 | 谁创建 |
+|---|---|---|
+| **KubeRay Operator** | 一个 Deployment，watch `RayCluster`/`RayJob`/`RayService` CRD，按 spec 建/删 Pod | 你手动装（第 2 节） |
+| **RayCluster** | 一组 Pod = 1 个 head + N 个 worker group | Operator 按你的 YAML 建（第 3 节） |
+| **RayJob** | 一次性任务：建集群 → 跑 entrypoint → 销毁（或保留） | Operator（第 5 节） |
+| **RayService** | 常驻在线服务：Ray Serve + 零停机升级 | Operator（第 5 节） |
 
 ---
 
-# 二、Kubernetes 架构与串讲（把概念串成框架）
+## 1. 环境准备：三台服务器
 
-## 8. 控制平面：kube-apiserver / etcd / kube-scheduler / kube-controller-manager
+### 1.1 集群拓扑（本文的假设）
 
-### 1. 现有问题
+| 节点 | 角色 | 规格 | 装什么 |
+|---|---|---|---|
+| **node-1** | control-plane + Operator | 8C/32G，无 GPU | kubelet、containerd、KubeRay Operator |
+| **node-2** | GPU worker + **Ray head 落点** | 8×A100 80G | kubelet、containerd、nvidia 驱动 + toolkit |
+| **node-3** | GPU worker | 8×A100 80G | 同上 |
 
-"声明式系统"的骨架是什么？谁来存状态、谁来接 API、谁来做决策、谁去执行？
+**为什么 Ray head 落在 GPU 节点**：head 也要跑 driver 和部分 actor，而且 `ray-cluster.verl.yaml` 这类样例就是把 **4 张 GPU 直接给 head**（后面第 6 节会看到）。当然也可以把 head 放 CPU 节点、用 `num-cpus: "0"` 禁止业务调度上去（autoscaler 样例就是这么做的，见第 7.1 节）。
 
-### 2. 方法论（四个组件各司其职）
+### 1.2 前置条件清单
 
-**① kube-apiserver——一切流量的唯一入口（REST API）**：
-- 所有 kubectl/controller/scheduler/kubelet 的读写都走它；**只有 apiserver 能读写 etcd**；
-- 请求链路：**认证（Authentication）→ 授权（Authorization/RBAC）→ 准入（Admission：Mutating→Validating）→ 校验 → 写 etcd → 返回 + 广播 watch 事件**；
-- 内部结构（源码 `cmd/kube-apiserver/app/`）：`server.go` 用 Cobra 起命令，`config.go` 组装配置，`aggregator.go` 把**聚合 API**（metrics.k8s.io 等）与扩展 API（CRD）挂到同一网关；
-- **watch 机制**：客户端（controller/kubelet）通过长连接 watch 资源变化，实现"事件驱动"而非轮询。
+```bash
+# ① K8s 版本：官方要求至少 1.23
+#   kuberay/docs/deploy/installation.md:3
+#   "Make sure your Kubernetes cluster and Kubectl are both at version at least 1.23."
+kubectl version --short
 
-**② etcd——一致性的状态存储**：
-- 分布式 KV 存储，**Raft 共识**（多数派写入），存储集群全部对象（含 Secret 的 base64）；
-- 为什么 apiserver 是唯一写入口：保证 schema 校验/版本转换/准入都经过同一道闸。
+# ② 关闭 swap（kubelet 硬要求）
+sudo swapoff -a
+sudo sed -i '/ swap / s/^/#/' /etc/fstab
 
-**③ kube-scheduler——把 Pod 放到哪个节点**：
-- watch 未调度的 Pod（`spec.nodeName` 为空）→ **过滤（Filtering，硬约束）→ 打分（Scoring，软偏好）** → 写 Binding；
-- 硬约束：资源满足、节点亲和、污点容忍、端口不冲突；打分：资源余量、拓扑分布、亲和权重。
+# ③ 内核模块与转发参数
+sudo modprobe br_netfilter
+cat <<'EOF' | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+cat <<'EOF' | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sudo sysctl --system
 
-**④ kube-controller-manager——内置控制器集合**：
-- 每个控制器是一个 **reconcile loop**（第 11 点）：Deployment controller（维护 RS）、RS controller（维护 Pod 数）、Job controller、EndpointSlice controller、GC controller（级联删除）、Namespace controller...（源码 `cmd/kube-controller-manager/app/` 的 `apps.go/batch.go/autoscaling.go` 分别注册各组控制器）；
-- **cloud-controller-manager**：云厂商对接（LoadBalancer、Node 生命周期）。
+# ④ 容器运行时（containerd）+ cgroup driver 与 kubelet 对齐
+sudo containerd config default | sudo tee /etc/containerd/config.toml
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sudo systemctl restart containerd
 
-### 3. 具体数值样例
+# ⑤ GPU 节点：驱动 + container toolkit + device plugin
+nvidia-smi                      # 先确认驱动正常
+sudo nvidia-ctk runtime configure --runtime=containerd
+sudo systemctl restart containerd
+# device plugin 用 DaemonSet 部署（让 K8s 认识 nvidia.com/gpu 资源）
+kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.17.0/deployments/static/nvidia-device-plugin.yml
 
-- `kubectl create -f deploy.yaml` 的完整控制面路径：kubectl → apiserver（认证→RBAC→准入→写 etcd）→ Deployment controller watch 到新对象 → 创建 RS → RS controller 创建 Pod 对象 → scheduler watch 到未调度 Pod → 选节点写 Binding → 目标节点 kubelet 执行（第 10 点）；
-- 30 个节点集群：3 副本 apiserver + 3 副本 etcd（raft）+ 1 主 scheduler/controller-manager（可多副本 leader 选举）；
-- 一次 watch：controller 通过 `watch` 长连接收到 Pod 增删改事件，入 workqueue，触发 reconcile——**不是轮询，是事件驱动**。
-
-> 面试一句话总结：**控制平面四件套：apiserver 是唯一 API 入口（认证→授权→准入→etcd→watch）、etcd 用 Raft 存全部状态、scheduler 过滤+打分选节点、controller-manager 跑一堆内置 reconcile 循环——"声明式"的骨架就是"写进去 + watch + 收敛"。**
-
----
-
-## 9. 数据平面：kubelet / kube-proxy / 容器运行时 / CNI / CSI
-
-### 1. 现有问题
-
-控制面只做"决策"，真正把容器跑起来、把网络打通、把盘挂上的是节点侧组件。
-
-### 2. 方法论
-
-- **kubelet**：每个节点上的"代理"，核心职责：watch 分配到本节点的 Pod → 通过 **CRI**（Container Runtime Interface，gRPC）指挥容器运行时创建/启停容器 → 汇报状态（Pod 状态、资源用量、探针结果）→ 执行探针（liveness/readiness/startup）→ 挂载 volume（CSI）；
-- **容器运行时**：containerd / CRI-O（实现 CRI），内部用 runc 起容器、sandbox（pause 容器）持有网络命名空间；
-- **kube-proxy**：实现 Service 的转发规则（iptables/ipvs 模式），watch Service/EndpointSlice 更新规则；
-- **CNI 插件**：容器创建时被调用（`ADD/DEL`），分配 Pod IP、配置网络（Calico/Cilium/flannel）；
-- **CSI 驱动**：kubelet 挂载卷时调用 CSI 插件（云盘/NFS）。
-
-### 3. 具体数值样例
-
-- Pod 分配到 node1 后：kubelet watch 到 → 调 CRI `RunPodSandbox`（pause 容器起网络）→ CRI 调 CNI 给 sandbox 分配 IP → 调 CRI `CreateContainer` 起业务容器 → 挂 CSI 卷 → 容器启动 → 就绪探针通过 → 加入 Service 端点；
-- GPU 节点：设备插件（DaemonSet）上报 `nvidia.com/gpu: 8` → scheduler 据此分配 → kubelet 注入 GPU 环境变量。
-
-> 面试一句话总结：**数据平面 = kubelet（执行者：CRI 起容器、CSI 挂卷、探针探活、汇报状态）+ kube-proxy（Service 转发）+ CNI（Pod 网络）+ 容器运行时（containerd/CRI-O）——控制面做决策，节点侧做执行，全靠 watch + gRPC 接口解耦。**
-
----
-
-## 10. 一次 Pod 从创建到运行的完整流程（串讲 1~9）
-
-### 1. 现有问题
-
-把前面所有概念串成一条链路，面试必考。
-
-### 2. 方法论（全链路 8 步）
-
-```text
-① 用户：kubectl apply -f deploy.yaml
-② kube-apiserver：认证（你是谁）→ 授权（RBAC 允许吗）→ 准入（webhook 改/拒）
-   → schema 校验 → 写入 etcd → 返回成功 → 向 watch 客户端广播事件
-③ Deployment controller（controller-manager 内）：watch 到新 Deployment
-   → reconcile：创建 ReplicaSet（期望副本 3）
-④ ReplicaSet controller：watch 到 RS → reconcile：创建 3 个 Pod 对象（spec.nodeName 为空）
-⑤ kube-scheduler：watch 到未调度 Pod → 过滤（资源/亲和/污点）→ 打分 → 选 node2
-   → 写 Pod 的 spec.nodeName=node2（Binding）
-⑥ node2 的 kubelet：watch 到"本节点的 Pod" → 调 CRI 创建 sandbox（pause）
-   → CNI 分配 Pod IP → 调 CRI 创建业务容器 → CSI 挂卷 → 容器启动
-⑦ kubelet：运行探针（startup→readiness）→ 就绪后上报 Pod 状态 Running
-⑧ EndpointSlice controller：把 Pod IP 加入 Service 端点 → kube-proxy 更新转发规则
-   → 客户端访问 Service 名即可负载均衡到新 Pod
+# ⑥ 验证 GPU 已成为可调度资源（关键一步）
+kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu'
+# 期望：GPU 节点各显示 8，control-plane 显示 <none>
 ```
 
-**关键点**：
-- **全程事件驱动**（watch + workqueue + reconcile），不是轮询；
-- **每一层只负责一件事**（scheduler 只选节点、kubelet 只执行、controller 只收敛）；
-- 任何一步失败：controller 重试（指数退避），Pod 重启（restartPolicy），最终"现实=期望"。
+**常见坑**：`nvidia.com/gpu` 显示 `<none>` 说明 device plugin 没起来（`kubectl -n kube-system logs <plugin-pod>`）；显示 `0` 通常是 containerd 的 `SystemdCgroup` 或 toolkit 配置没生效。
 
-### 3. 具体数值样例
+### 1.3 没有 GPU 机器？用 kind 单机验证（可选）
 
-- 3 副本 Deployment 更新镜像：Deployment 滚动更新 → 新 RS 起 1 个新 Pod（maxSurge=1）→ 新 Pod 就绪 → 旧 RS 删 1 个 → 循环 3 次 → 全部替换，Service 全程可用；
-- 节点宕机：kubelet 心跳超时 → node 标记 NotReady → 控制器把该节点 Pod 标记失败 → 在其他节点重建（受 PodDisruptionBudget 约束）。
+只验证 CRD/Operator 逻辑时用 kind 就够了（`ray-cluster.complete.yaml` 的注释明确说它的资源配置就是为 "resource-constrained local Kubernetes testing environments such as **KinD and minikube**" 设计的，见该文件 54-55 行）：
 
-> 面试一句话总结：**一次 Pod 创建 = 用户写声明 → apiserver（认证授权准入+etcd）→ 控制器逐层收敛（Deployment→RS→Pod）→ scheduler 选节点 → kubelet 经 CRI/CNI/CSI 真正拉起 → 探针就绪 → Service 端点生效——全链路事件驱动、职责单一、失败自愈，这就是"声明式编排"的完整循环。**
+```bash
+kind create cluster --name kuberay-test
+kubectl cluster-info --context kind-kuberay-test
+```
 
 ---
 
-## 11. Controller 模式：reconcile loop（理解 Operator 的钥匙）
+## 2. 安装 KubeRay Operator
 
-### 1. 现有问题
+> ⚠️ **版本纠正（很重要）**：本地 `kuberay` 仓的 `helm-chart/*/Chart.yaml` 和 `docs/deploy/installation.md` 里写的都是 **`1.1.0`**，但**代码里的 feature gate 已经到 `v1.7`**，上游实际已发布 **v1.7.0**。**安装请用 `--version 1.7.0` 或 `?ref=v1.7.0`，不要照抄本地的 1.1.0。**
+>
+> 另外，官方最新推荐把 Operator 装进**专职的 `ray-system` namespace**（原文理由：*"isolate the operator's service account from workload pods"*），而不是默认 namespace。下面命令里的 `-n kuberay-system` 请按你实际安装的 namespace 调整。
 
-为什么叫"控制器"？"声明式"到底怎么实现"自动收敛"？
+**三种方式，任选一种**（命令来自 `kuberay/docs/deploy/installation.md`）。
 
-### 2. 方法论
+### 2.1 Helm（官方推荐）
 
-**reconcile 循环**（所有 controller/operator 的通用骨架）：
+```bash
+helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+helm repo update
 
-```text
-┌────────────────────────────────────────────────────┐
-│ 1. LIST/WATCH 目标资源（如 RayCluster CR）+ 依赖资源 │
-│    → informer 维护本地缓存（list 一次 + watch 增量）  │
-│ 2. 事件入 workqueue（去重、限速、重试）              │
-│ 3. Reconcile(key) 被调用：                          │
-│    a. GET 当前 CR（期望状态）                       │
-│    b. LIST 现实资源（现有 Deployment/Pod/Service）   │
-│    c. 对比期望 vs 现实 → 生成 diff 动作列表          │
-│    d. 执行动作（create/update/delete/status 更新）   │
-│    e. 返回 (requeueAfter 或 error)                  │
-│ 4. 出错 → 指数退避重试；成功 → 等待下次事件          │
-└────────────────────────────────────────────────────┘
+# 一条命令装 CRDs + Operator
+helm install kuberay-operator kuberay/kuberay-operator
+
+# 需要自定义时先看默认值
+helm show values kuberay/kuberay-operator > my-values.yaml
+helm install kuberay-operator kuberay/kuberay-operator -f my-values.yaml
 ```
 
-- **informer 模式**：`ListAndWatch` + **本地缓存**（读本地缓存、不直接打 apiserver）——这是控制器性能的关键；
-- **workqueue**：事件去重合并（同一对象的多个事件合成一个 reconcile）；
-- **Status 子资源**：reconcile 把"当前进展"写回 CR 的 `.status`（用户 `kubectl get raycluster -o yaml` 能看到），**spec 是期望、status 是现实**；
-- **事件（Events）**：reconcile 记录 `kubectl describe` 可见的事件（"Created head deployment"）。
+本地 helm chart 位置：`kuberay/helm-chart/kuberay-operator/`（含 `values.yaml`、`templates/`、`README.md`）；另外还有 `kuberay-apiserver`（REST API）和 `ray-cluster`（**用 Helm 直接起一个 RayCluster**，见第 3.3 节）。
 
-KubeRay 的 `RayClusterReconciler` 就是标准实现（`ray-operator/controllers/ray/raycluster_controller.go`）：
+### 2.2 Kustomize / kubectl（适合锁版本或离线）
 
-```go
-func (r *RayClusterReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
-    ...
-    return r.rayClusterReconcile(ctx, instance)
-}
+```bash
+# 稳定版：指定 tag
+kubectl create -k "github.com/ray-project/kuberay/ray-operator/config/default?ref=v1.1.0&timeout=90s"
 
-func (r *RayClusterReconciler) rayClusterReconcile(ctx context.Context, instance *rayv1.RayCluster) (ctrl.Result, error) {
-    // 依次收敛子资源：autoscaler 的 SA/Role/RoleBinding、head Service、head/worker Pods...
-    r.reconcileAutoscalerServiceAccount, r.reconcileAutoscalerRole, r.reconcileAutoscalerRoleBinding,
-    r.reconcilePods, ...
-}
+# 或者用本地仓（离线/改源码时）
+kubectl create -k kuberay/ray-operator/config/default
+
+# 夜间版
+export KUBERAY_VERSION=master
+kubectl create -k "github.com/ray-project/kuberay/ray-operator/config/default?ref=${KUBERAY_VERSION}&timeout=90s"
 ```
 
-### 3. 具体数值样例
+### 2.3 从源码构建部署（要改 Operator 时）
 
-- 用户把 RayCluster 的 `workerGroupSpecs[0].replicas` 从 2 改成 4：Operator 的 informer watch 到更新 → workqueue 入队 → reconcile 对比"期望 4 vs 现实 2" → 创建 2 个 worker Pod → 更新 status（`readyWorkerReplicas: 4`）；
-- 删 RayCluster：deletionTimestamp + Finalizer → reconcile 先删子资源（Pod/Service）→ 清 Finalizer → 真正删除；
-- **面试点：reconcile 必须"幂等"**（重放同一事件结果一致），且**一个对象一个请求**（workqueue 保证）。
+```bash
+cd kuberay/ray-operator
+make deploy IMG=quay.io/kuberay/operator:nightly   # 生成 image 并部署
+```
 
-> 面试一句话总结：**Controller 模式 = informer（list+watch+本地缓存）+ workqueue（去重限速）+ Reconcile（对比期望 spec 与现实资源、执行 diff 动作、写回 status）——幂等、事件驱动、失败退避重试；KubeRay 和任何自定义 Operator 都是这个骨架，理解它就能读懂一切 Operator。**
+### 2.4 验证安装
+
+```bash
+# ① Operator Pod 就绪
+kubectl get pods -n kuberay-system
+# NAME                                READY   STATUS
+# kuberay-operator-xxx                1/1     Running
+
+# ② CRD 已注册（应该看到 4 个）
+kubectl get crd | grep ray.io
+# rayclusters.ray.io
+# rayjobs.ray.io
+# rayservices.ray.io
+# raycronjobs.ray.io          ← 定时任务
+
+# ③ Operator 日志（排障第一步）
+kubectl -n kuberay-system logs deploy/kuberay-operator -f
+```
+
+**面试常问**：Operator 装完之后它在干什么？——它是一个 **controller-runtime 的 reconcile loop**：watch `RayCluster` 的增删改，按 spec 创建/删除 head Pod、worker Pod、Service、ConfigMap，并把实际状态写回 `status`。所以"改 YAML 就能改变集群"这件事的实现在 Operator 里，不在 K8s 本身。
 
 ---
 
-## 12. kube-apiserver 内部：认证→授权→准入→存储→watch（源码视角）
+## 3. 起第一个 RayCluster
 
-### 1. 现有问题
-
-apiserver 是"唯一入口"，它内部到底怎么处理一个请求？看源码怎么对应。
-
-### 2. 方法论（源码对应）
-
-- 入口：`cmd/kube-apiserver/app/server.go`（Cobra）→ `config.go`（构建配置）→ `CreateServerChain` 把三个 API 服务器串成一条链：**aggregator（聚合 API）→ apiextensions-apiserver（CRD）→ kube-apiserver（核心资源）**；
-- 请求处理管线（kube-apiserver 内）：`Authentication`（X.509/Bearer Token/Webhook）→ `Authorization`（RBAC/ABAC/Webhook）→ `Admission`（Mutating 先改、Validating 后拒）→ 存储层（`pkg/registry` 里每个资源的 REST 实现）→ etcd（`pkg/registry/.../storage.go` 用 `storage.Interface` 抽象）；
-- **watch 实现**：apiserver 维护 etcd watch → 转成 REST watch 流，客户端（informer）长连接接收；
-- 为什么 CRD 也走同一管线：apiextensions-apiserver 把 CRD 的 schema 编译成通用存储，复用同一套认证/授权/准入/watch 机制。
-
-### 3. 具体数值样例
-
-- 一次 `kubectl get rayclusters`：kubectl → apiserver（tls 认证 → RBAC 查 `ray.io/rayclusters` 的 get 权限 → 无 webhook）→ apiextensions-apiserver 从 etcd 读 CR → 返回；
-- 一次 `kubectl apply -f rayjob.yaml`：认证 → RBAC → MutatingWebhook（KubeRay 默认注入）→ ValidatingWebhook（校验字段）→ 写 etcd → watch 广播 → RayJob controller 收到事件开始工作。
-
-> 面试一句话总结：**apiserver = 统一网关：认证→授权→准入（Mutating/Validating）→schema 校验→etcd 存储→watch 广播，CRD 复用同一管线（apiextensions-apiserver 挂链）——所以 CR 与内置资源有完全一致的 API 体验。**
-
----
-
-# 三、KubeRay：把 Ray 变成 Kubernetes 原生资源
-
-## 13. KubeRay 架构：Operator + 四类 CRD
-
-### 1. 现有问题
-
-- Ray 集群（head + workers）直接裸机/容器起，生命周期、故障恢复、扩缩容、网络都要手动管；
-- 能不能"像声明 Deployment 一样声明一个 Ray 集群"？——这就是 KubeRay（ray-project/kuberay）。
-
-### 2. 方法论
-
-**KubeRay = Ray 的 Kubernetes Operator**（本地克隆 `kuberay`，HEAD `ffec815`）：
-
-```text
-┌─────────────────────────────────────────────────────────┐
-│ KubeRay Operator（ray-operator，controller-runtime 实现） │
-│   CRD（apis/ray/v1）：                                    │
-│   ├── RayCluster    —— 声明一个 Ray 集群（head+workers）   │
-│   ├── RayJob        —— 跑一个 Ray 训练/推理任务           │
-│   ├── RayService    —— Ray Serve 应用的高可用部署         │
-│   └── RayCronJob    —— 定时 RayJob                       │
-└─────────────────────────────────────────────────────────┘
-        │ reconcile
-        ▼
-  创建/管理：head Deployment + head Service、worker Deployment/StatefulSet、
-  autoscaler（SA/Role/RoleBinding）、NetworkPolicy、Ingress/Route...
-```
-
-- **控制器**（`ray-operator/controllers/ray/`）：`raycluster_controller.go`、`rayjob_controller.go`、`rayservice_controller.go`、`raycronjob_controller.go`、`networkpolicy_controller.go`；
-- **部署方式**：Helm chart（`helm-chart/kuberay-operator`）或 Kustomize（`config/`）；Operator 本身跑在 `kuberay-system` namespace；
-- **版本约定**：`ray.io` API 组，当前主版本 `v1`（旧 `v1alpha1` 已废弃迁移）。
-
-### 3. 具体数值样例
-
-- 装好 KubeRay 后 `kubectl apply -f raycluster.yaml`（1 head + 4 worker）→ Operator 在 ~1 分钟内拉起 head Pod（自动执行 `ray start --head`）与 worker Pod（`ray start --address=head:6379`），自动建 head Service（`<name>-head-svc`）；
-- 用户 `kubectl get rayclusters` 看集群状态（`state: ready`、`desiredWorkerReplicas/readyWorkerReplicas`）；
-- 扩展：`ray-operator` 的 `podpool/`（Pod 池预热）、`kubectl-plugin/`（`kubectl ray` 插件）、`dashboard/`（KubeRay dashboard）。
-
-> 面试一句话总结：**KubeRay 是 Ray 的 Operator：用 RayCluster/RayJob/RayService/RayCronJob 四类 CRD 声明式描述 Ray 集群与任务，Operator 的 reconcile 自动创建 head/worker 的 K8S 工作负载、Service、autoscaler RBAC、NetworkPolicy——用户从此"声明集群"而非"手动搭集群"。**
-
----
-
-## 14. RayCluster CRD 详解（head / worker group）
-
-### 1. 现有问题
-
-声明一个 Ray 集群要表达什么？head 和 worker 各是什么？GPU 怎么分配？自动扩缩容怎么开？
-
-### 2. 方法论（`ray-operator/apis/ray/v1/raycluster_types.go`）
-
-**RayClusterSpec 核心字段**：
-
-```go
-type RayClusterSpec struct {
-    HeadGroupSpec   HeadGroupSpec     `json:"headGroupSpec"`    // head 组
-    WorkerGroupSpecs []WorkerGroupSpec `json:"workerGroupSpecs"` // worker 组（可多个）
-    EnableInTreeAutoscaling *bool      `json:"enableInTreeAutoscaling,omitempty"` // 内置 autoscaler
-    // NetworkPolicy 配置、head Service annotations、升级策略（RayClusterUpgradeStrategy）...
-}
-
-type HeadGroupSpec struct {
-    Template corev1.PodTemplateSpec `json:"template"`        // 完整 Pod 模板（镜像/资源/命令）
-    RayStartParams map[string]string `json:"rayStartParams"` // ray start 参数（node-manager-port、object-store-memory...）
-    ServiceType corev1.ServiceType  `json:"serviceType,omitempty"` // head Service 类型
-}
-
-type WorkerGroupSpec struct {
-    GroupName  string             `json:"groupName"`          // 组名（-l ray.io/group=...）
-    Replicas   *int32             `json:"replicas,omitempty"`
-    MinReplicas *int32            `json:"minReplicas"`        // autoscaler 下界
-    MaxReplicas *int32            `json:"maxReplicas"`        // autoscaler 上界
-    Template   corev1.PodTemplateSpec `json:"template"`       // Pod 模板
-    RayStartParams map[string]string `json:"rayStartParams"`  // ray start 参数（address 自动指向 head）
-}
-```
-
-**要点**：
-- **head**：Ray 集群的 GCS/调度器（`ray start --head`），KubeRay 用 **Deployment** 承载（head 挂了重建）；head 的 Service（`<cluster>-head-svc`，默认 ClusterIP，可配 NodePort/LoadBalancer）是所有 worker 与外部访问的入口；
-- **worker**：一个 RayCluster 可有多个 worker group（不同规格：CPU 组 / GPU 组），每组是 Deployment 或 StatefulSet（`headless` worker 需要稳定身份时用 StatefulSet）；worker 的 `rayStartParams.address` 由 Operator 自动填 head FQDN；
-- **GPU 分配**：在 worker group 的 Pod 模板 `resources.limits."nvidia.com/gpu": 1` 声明，Ray 的 `num_gpus` 与 K8S GPU 配额对应；
-- **In-tree autoscaling**：`enableInTreeAutoscaling: true` + min/maxReplicas → Operator 自动部署 Ray autoscaler（复用第 6 点的 SA/Role/RoleBinding），按 Ray 的调度需求扩缩 worker；
-- **网络**：head Service FQDN（`<cluster>-head-svc.<ns>.svc`）+ NetworkPolicy（head/worker 各自的 ingress/egress 规则）。
-
-### 3. 具体数值样例
+### 3.1 完整 YAML 逐字段讲（`ray-cluster.complete.yaml`，120 行）
 
 ```yaml
-apiVersion: ray.io/v1
+apiVersion: ray.io/v1                 # KubeRay 的 API group（不是 apps/v1）
 kind: RayCluster
 metadata:
-  name: raycluster-sample
+  name: raycluster-complete
 spec:
+  rayVersion: "2.52.0"                # ★ 必须与镜像里的 Ray 版本一致
   headGroupSpec:
+    serviceType: ClusterIP            # head 的 Service 类型：ClusterIP / NodePort / LoadBalancer
+    rayStartParams:
+      dashboard-host: "0.0.0.0"       # ★ 不设 0.0.0.0，dashboard 在 Pod 外访问不到
+    template:                         # 这里往下全是标准 PodTemplateSpec
+      metadata:
+        labels: {}
+        # 注意：自定义 label 不要以 `raycluster` 开头，会和 Operator 的 label 冲突
+      spec:
+        containers:
+        - name: ray-head
+          image: rayproject/ray:2.52.0
+          ports:
+          - {containerPort: 6379,  name: gcs}        # GCS：Ray 的全局控制面
+          - {containerPort: 8265,  name: dashboard}  # Dashboard UI
+          - {containerPort: 10001, name: client}     # Ray Client / Job 入口
+          volumeMounts:
+          - {mountPath: /tmp/ray, name: ray-logs}
+          resources:
+            limits:   {cpu: "1", memory: "5Gi"}
+            requests: {cpu: "1", memory: "2Gi"}
+        volumes:
+        - name: ray-logs
+          emptyDir: {}
+  workerGroupSpecs:
+  - replicas: 1                       # 当前副本数
+    minReplicas: 1                    # ★ 开 autoscaler 时的下界
+    maxReplicas: 10                   # ★ 上界
+    groupName: small-group            # ★ 组名：Pod 名 = <cluster>-worker-<group>-<hash>
+    scaleStrategy:                    # 缩容时优先删哪些（可选）
+      workersToDelete:
+      - raycluster-complete-worker-small-group-bdtwh
+    rayStartParams: {}
     template:
       spec:
         containers:
-          - name: ray-head
-            image: rayproject/ray:latest
-            resources: {requests: {cpu: 4, memory: 16Gi}, limits: {cpu: 4, memory: 16Gi}}
-    rayStartParams:
-      dashboard-host: "0.0.0.0"
-  workerGroupSpecs:
-    - groupName: cpu-group
-      replicas: 2
-      template:
-        spec:
-          containers:
-            - name: ray-worker
-              image: rayproject/ray:latest
-              resources: {requests: {cpu: 8, memory: 32Gi}}
-      rayStartParams: {}
-    - groupName: gpu-group
-      replicas: 1
-      minReplicas: 1
-      maxReplicas: 4
-      enableInTreeAutoscaling: true
-      template:
-        spec:
-          containers:
-            - name: ray-worker-gpu
-              image: rayproject/ray:latest
-              resources: {limits: {"nvidia.com/gpu": 1}}
+        - name: ray-worker
+          image: rayproject/ray:2.52.0
+          volumeMounts:
+          - {mountPath: /tmp/ray, name: ray-logs}
+          resources:
+            limits:   {cpu: "1", memory: "1Gi"}
+            requests: {cpu: "1", memory: "1Gi"}
+        volumes:
+        - name: ray-logs
+          emptyDir: {}
 ```
 
-- 效果：Operator 创建 `raycluster-sample-head-xxx`（Deployment 1 副本）、`cpu-group`（Deployment 2 副本）、`gpu-group`（Deployment 1 副本，可自动扩到 4），head Service `raycluster-sample-head-svc`；
-- 删除 RayCluster：Finalizer 清理 → head/worker Pod 与 Service 全部级联删除。
+**三个字段级要点**（都写在样例注释里）：
 
-> 面试一句话总结：**RayCluster = 1 个 head（GCS/调度，Deployment 承载 + head Service 入口）+ N 个 worker group（按规格分组、各自 replicas、min/max 支持内置 autoscaler、GPU 在 Pod 模板里申请）；Operator 把"声明"翻译成 head/worker 的 K8S 工作负载 + Service + RBAC + NetworkPolicy——这就是"Ray 集群即代码"。**
+1. **`rayVersion` 与镜像 tag 必须一致**——head 和所有 worker 的 Ray 版本不同会连不上 GCS。
+2. **`dashboard-host: "0.0.0.0"`**——默认只绑 localhost，不设置的话 `kubectl port-forward` 也连不上。
+3. **不要用 `raycluster` 开头的自定义 label**——会和 Operator 的 label 冲突（注释原文）。
+
+### 3.2 生产环境的资源怎么配（样例注释里的三条建议，很值得背）
+
+`ray-cluster.complete.yaml` 的注释反复强调（第 41-46、93-98 行）：
+
+> - *"It is better to use **a few large Ray pod** than many small ones."*
+> - *"For production, it is ideal to **size each Ray pod to take up the entire Kubernetes node** on which it is scheduled."*
+> - *"For production use-cases, we recommend specifying **integer CPU requests and limits**. We also recommend setting **requests equal to limits** for both CPU and memory."*
+> - *"For production use-cases, we recommend allocating **at least 8Gb memory for each Ray container**."*
+
+**这条"少而大"的建议背后是 Ray 的架构**：Ray 的调度是**节点级**的——一个 worker Pod 就是 Ray 眼里的一个 node。如果 Pod 切得太碎（比如 1 CPU/Pod），Ray 会看到几百个"小节点"，调度开销和对象传输的跨节点概率都会上升。**所以生产上一个 GPU 节点 = 一个 Ray Pod 最省事。**
+
+### 3.3 部署与验证
+
+```bash
+# 部署
+kubectl apply -f kuberay/ray-operator/config/samples/ray-cluster.complete.yaml
+
+# ① Pod 起来了吗（head + worker）
+kubectl get pods -l ray.io/cluster=raycluster-complete
+# raycluster-complete-head-xxxxx              1/1  Running
+# raycluster-complete-worker-small-group-yyyy 1/1  Running
+
+# ② 看 RayCluster 的 status（Operator 写回来的实际状态）
+kubectl get raycluster raycluster-complete -o yaml | sed -n '/^status:/,$p'
+# 关注 state: ready、以及 head.serviceName、endpoints
+
+# ③ 看 Operator 是否给 head 自动建了 Service
+kubectl get svc -l ray.io/cluster=raycluster-complete
+
+# ④ 进 head 容器看 Ray 自己的视角
+kubectl exec -it $(kubectl get pod -l ray.io/node-type=head -o name | head -1) -- bash
+ray status          # 节点数、资源总量（CPU/GPU/内存）、autoscaler 状态
+ray list nodes      # Ray 眼里的 node（= 你的 Pod）
+exit
+
+# ⑤ Dashboard（本地浏览器）
+kubectl port-forward svc/raycluster-complete-head-svc 8265:8265
+# 打开 http://localhost:8265
+```
+
+**`ray status` 是排障第一现场**：它同时显示"K8s 期望的副本数"和"Ray 实际看到的资源"。如果两者不一致（比如 Pod Running 但 `ray status` 里没有该节点），基本是 `ray start` 失败或 GCS 连不上，去 `kubectl logs` 看。
 
 ---
 
-## 15. RayJob 与 RayService：任务与 Serve 应用
+## 4. 提交训练任务：RayJob 的四种 submissionMode + 复用已有集群
 
-### 1. 现有问题
+> **纠正一个常见说法**：RayJob 不是"三种模式"，而是 **4 种 `submissionMode`**（`apis/ray/v1/rayjob_types.go`）：**`K8sJobMode`（默认）/ `HTTPMode` / `InteractiveMode` / `SidecarMode`**；而"提交到已有集群"（`clusterSelector`）是**第 5 条路径**，不是 submissionMode。
+>
+> ⚠️ 另外注意：**`clusterSelector` 模式不支持 gang scheduling**（官方 v1.7 说明）——想用 gang 就得让 RayJob 自己建集群。
 
-光有集群不够——训练任务怎么提交？Serve 应用怎么声明式部署、滚动更新？
+手工 `kubectl apply` 一个 RayCluster 只适合调试。**跑生产任务应该用 `RayJob`**——它把"建集群 → 跑 entrypoint → 回收"打包成一个资源。
 
-### 2. 方法论
-
-**① RayJob**（`rayjob_types.go`）——跑一个 Ray 任务（训练/评估）：
-- 核心字段：`rayClusterSpec`（任务专用的 RayCluster 模板）+ `entrypoint`（要执行的 `ray job submit` 命令）+ `submitter` 配置 + `shutdownAfterJobFinishes`（任务结束是否自动删集群）+ `ttlSecondsAfterFinished`（保留多久）；
-- **两种提交模式**：`K8sJobMode`（submitter 是独立的 K8s Job，跑 `ray job submit`；默认）/ `SidecarMode`（submitter 与 head 同 Pod 的 sidecar）；
-- 生命周期：创建集群 → 提交任务 → 跟踪状态（`jobStatus: RUNNING/SUCCEEDED/FAILED`）→ 可选自动清理集群——**"任务即资源"**。
-
-**② RayService**（`rayservice_types.go`）——Ray Serve 应用：
-- 核心字段：`rayClusterConfig`（RayCluster 模板）+ `serveConfigV2`（Serve deployment graph 的 YAML）+ 滚动更新策略（`serveDeploymentGraphSpec` 的 autoscaling）；
-- 能力：部署新版本集群 → 验证 Serve 健康 → 切换流量 → 删除旧集群（**蓝绿/金丝雀式 Serve 发布**）。
-
-**③ RayCronJob**：按 cron 定时创建 RayJob（如周期评估）。
-
-### 3. 具体数值样例
+### 4.1 模式一：K8s Job 模式（最常用，集群随任务生灭）
 
 ```yaml
+# 基于 ray-job.sample.yaml
 apiVersion: ray.io/v1
 kind: RayJob
 metadata:
   name: rayjob-sample
 spec:
-  entrypoint: python /home/ray/samples/sample_code.py
-  shutdownAfterJobFinishes: true      # 跑完自动删 RayCluster（省钱）
-  ttlSecondsAfterFinished: 600        # 结果保留 10 分钟
-  rayClusterSpec:
-    headGroupSpec: {...}
-    workerGroupSpecs: [...]
+  entrypoint: |                     # ★ 真正跑的命令，在 head 上执行
+    python -c "
+    import ray; ray.init()
+    print(ray.get([f.remote() for f in [ray.remote(lambda: i) for i in range(4)]]))
+    "
+  # 三种前置行为（三选一）：
+  #   - 不写 rayClusterSpec：KubeRay 自动建一个默认 RayCluster
+  #   - 写 rayClusterSpec：用你自定义的集群（见下面）
+  #   - 写 clusterSelector：复用已有集群（模式三）
+  rayClusterSpec:                    # 自定义集群（字段与 RayCluster.spec 完全相同）
+    rayVersion: "2.52.0"
+    headGroupSpec:
+      rayStartParams: {dashboard-host: "0.0.0.0"}
+      template:
+        spec:
+          containers:
+          - name: ray-head
+            image: rayproject/ray:2.52.0
+            resources:
+              limits: {cpu: "2", memory: "4Gi"}
+              requests: {cpu: "2", memory: "4Gi"}
+    workerGroupSpecs:
+    - replicas: 1
+      minReplicas: 1
+      maxReplicas: 5
+      groupName: gpu-group
+      template:
+        spec:
+          containers:
+          - name: ray-worker
+            image: rayproject/ray:2.52.0
+            resources:
+              limits: {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}   # ★ GPU 就这样申请
+              requests: {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+  shutdownAfterJobFinishes: true     # ★ 任务结束就删集群（不设则集群保留，方便看现场）
+  ttlSecondsAfterFinished: 600       # 结束 10 分钟后清理，便于捞日志
+  # 失败重试与删除规则见 ray-job.deletion-rules.yaml
 ```
 
-- 提交后：Operator 建临时 RayCluster → submitter（K8s Job）执行 `ray job submit --address http://<cluster>-head-svc:8265 -- entrypoint ...` → 任务完成 → 状态 `SUCCEEDED` → 集群被清理；
-- **训练场景**：每次训练 = 一个 RayJob（自带独立集群），练完即删——但 AgenticRL 训练要"常驻引擎 + 多轮 rollout"，更适合自定义 CRD（第 21 点）。
+```bash
+kubectl apply -f my-rayjob.yaml
 
-> 面试一句话总结：**RayJob 把"训练/任务"声明成资源（集群模板 + entrypoint + 跑完自动清理），RayService 把 Serve 应用声明成资源（serveConfigV2 + 蓝绿切换），RayCronJob 定时触发——三者共享 RayCluster 作为底层集群模板。**
+# 看任务状态机
+kubectl get rayjob rayjob-sample -o jsonpath='{.status.jobStatus}{"\n"}'
+# PENDING → RUNNING → SUCCEEDED / FAILED
 
----
-
-## 16. KubeRay 控制器实现（reconcile 骨架，源码）
-
-### 1. 现有问题
-
-KubeRay 的 Operator 代码长什么样？reconcile 里具体做什么？
-
-### 2. 方法论（`ray-operator/controllers/ray/raycluster_controller.go`）
-
-```go
-// NewReconciler：用 controller-runtime 注册
-func NewReconciler(mgr manager.Manager, options RayClusterReconcilerOptions) *RayClusterReconciler {...}
-
-// Reconcile：标准入口，把请求转给内部实现
-func (r *RayClusterReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
-    instance := &rayv1.RayCluster{}
-    if err := r.Get(ctx, request.NamespacedName, instance); err != nil {
-        return ctrl.Result{}, client.IgnoreNotFound(err)   // 不存在则忽略
-    }
-    return r.rayClusterReconcile(ctx, instance)
-}
-
-// rayClusterReconcile：串起所有子资源收敛步骤
-func (r *RayClusterReconciler) rayClusterReconcile(ctx context.Context, instance *rayv1.RayCluster) (ctrl.Result, error) {
-    // 1. 清理孤儿 Pod（deleteAllPods：按 owner/label 清理不属于本集群的 Pod）
-    // 2. 收敛 autoscaler 相关资源：
-    r.reconcileAutoscalerServiceAccount, r.reconcileAutoscalerRole, r.reconcileAutoscalerRoleBinding,
-    // 3. 收敛 head Service（reconcileService）
-    // 4. 收敛 head/worker 的 Pods（reconcilePods：建 Deployment/StatefulSet）
-    // 5. 更新 status（headPodIP、readyWorkerReplicas、state...）
-    ...
-}
+# 看 entrypoint 的 stdout
+kubectl logs -l ray.io/cluster=... -c ray-head --tail=100
+# 或者直接
+kubectl get rayjob rayjob-sample -o jsonpath='{.status.jobDeploymentStatus}'
 ```
 
-**关键点**：
-- **幂等**：每次 reconcile 都是"全量对比期望 vs 现实"，重复执行结果一致；
-- **owner 关系**：创建的 head/worker Deployment 的 `OwnerReference` 指向 RayCluster → 级联删除；
-- **status 更新**：head Pod IP、worker 就绪数、集群 state（`pending/ready`）写回 CR 的 `.status`；
-- **事件**：`r.Recorder.Event(instance, corev1.EventTypeNormal, "Created", "Created head deployment")` 让 `kubectl describe` 可见。
-
-### 3. 具体数值样例
-
-- 首次 apply RayCluster：reconcile 创建 head Deployment + head Service + worker Deployment → status 更新 `state: ready`；
-- worker 手动被删：informer watch 到 Pod 删除 → 由于 Deployment 存在，其 controller 自动重建（K8S 自身收敛）——Operator 只管"声明了哪些 Deployment"，Pod 数量由 Deployment 管；
-- autoscaler 把 worker 从 1 扩到 4：KubeRay 直接更新 worker group 的 Deployment replicas。
-
-> 面试一句话总结：**KubeRay 控制器 = 标准 reconcile：Get CR → 清理孤儿 → 收敛 autoscaler RBAC/head Service/head-worker Pods → 更新 status；子资源挂 OwnerReference 实现级联删除，全部幂等——看懂了它就看懂了怎么写任何 Ray 相关的 Operator。**
-
----
-
-# 四、分离式 agent-lighting 在 K8S 上的部署（重点）
-
-## 17. agent-lighting 三件套回顾与通信矩阵
-
-### 1. 现有问题
-
-在 K8S 上编排 agent-lighting 之前，先固化"三件套各自是什么、谁和谁通信、走什么协议"。
-
-### 2. 方法论（回顾 + 通信矩阵）
-
-- **Algorithm（大脑）**：决定任务、学习、更新资源（模型/提示词）；VERL 集成 = `AgentLightningTrainer(RayPPOTrainer)` + `AgentModeDaemon`（v1 模式默认）；
-- **Runner（工人）**：从 store 取任务（`dequeue_rollout`）、跑 agent、流式回传 span（`add_span/add_otel_span`）、更新 attempt 状态；Runner→Agent 永远是**进程内**（LitAgentRunner 持有 agent）；
-- **LightningStore（数据库+队列）**：任务队列 + 资源 + span 存储，唯一"真相源"；接口 `enqueue_rollout/dequeue_rollout/add_span/get_latest_resources/wait_for_rollouts/query_spans/update_attempt`；
-- **LLMProxy**：Agent 与模型之间的 HTTP 桥（OpenAI 兼容），算法可动态换后端（RL 时换成刚训好的 vLLM 端点）；
-- **通信矩阵**（三机分离版，见 `Agent-Lighting.md`）：
-
-| 链路 | 协议 | 说明 |
-|---|---|---|
-| Runner ↔ Store | **HTTP**（`LightningStoreClient` → `LightningStoreServer`，`/v1/agl/*`，端口 4747） | 取任务/回传 span |
-| Algorithm ↔ Store | **HTTP**（server 内嵌 client 或直连） | 入队/查 span/更新资源 |
-| Runner → Agent | **进程内调用**（同进程） | 无网络 |
-| Agent → LLMProxy | **HTTP**（OpenAI 兼容端点） | 推理调用 |
-| LLMProxy → vLLM | **HTTP**（OpenAI 兼容 `/v1/chat/completions`） | 推理后端 |
-| Algorithm → vLLM | **HTTP**（注册为 proxy 后端 / 直连） | RL 训练引擎 |
-
-**三机分离形态**（对应"store 机 / algo 机 / agent 机"）：
-- store 机：`agl store --host 0.0.0.0 --port 4747`（`agentlightning/cli/store.py`：backend=memory/mongo、asyncio/mp 启动）；
-- algo 机：算法进程（含 Trainer/VERL/vLLM/LLMProxy），`server_host` 指向 store 机；
-- agent 机：runner 进程（`role="runner"`），`server_host=<store 机 IP> server_port=4747` 连 store。
-
-### 3. 具体数值样例
-
-- 一批 48 个任务：Algorithm `enqueue_rollout` ×48 → store 队列；12 个 runner 进程 `dequeue_rollout` 抢任务并行执行 → span 流式回写 → Algorithm `query_spans` 拉取 → `TracerTraceToTriplet` 转 `(prompt, response, reward)` → VERL 更新权重 → vLLM 引擎热更新 → 下一轮；
-- 全部跨机通信只有两类：**① 各组件↔store 的 HTTP（4747）② Agent↔LLMProxy/vLLM 的 HTTP**——这就是"分离式"的通信面，K8S 编排只需暴露这两个网络面。
-
-> 面试一句话总结：**agent-lighting 三件套的通信极简：Runner/Algorithm 与 LightningStore 之间走 HTTP（4747，唯一跨机数据面）、Agent 与 LLMProxy/vLLM 走 HTTP（OpenAI 兼容）、Runner→Agent 进程内——K8S 上要做的只是"把 store/algo/runner 各编排成一个工作负载 + 暴露这两个 HTTP 面"。**
-
----
-
-## 18. K8S 编排方案总览：一个 RayCluster 内部分工 vs 独立工作负载
-
-### 1. 现有问题
-
-三件套 + vLLM + 训练（VERL 依赖 Ray）在 K8S 上怎么摆？两种思路各有什么取舍？
-
-### 2. 方法论（两种方案对比）
-
-**方案 A：一个 RayCluster 内部分角色（推荐，贴合 VERL）**
-- VERL 的 `AgentLightningTrainer(RayPPOTrainer)` 本身就跑在 Ray 上，所以用**一个 RayCluster** 承载全部角色，靠 **Ray 的 worker group + 资源（num_gpus/num_cpus）** 区分职责：
-  - **head Pod**：GCS + Ray 控制面 + 训练入口（AgentLightningTrainer/AgentModeDaemon）；
-  - **algo 组**（worker group，GPU）：VERL 训练 worker + vLLM 引擎（`rollout.ray` 的 vLLMHttpServer actor）+ LLMProxy；
-  - **runner 组**（worker group，CPU/GPU）：跑 `LitAgentRunner`（`role="runner"`），agent 进程内执行；
-  - **store**：可以是 Ray 之外的独立 Deployment（更稳，或与 head 同 Pod sidecar）；
-- **优点**：复用 Ray 的资源调度/容错/扩缩容；VERL 原生集成；**缺点**：所有角色共用一个集群，故障域耦合。
-
-**方案 B：独立工作负载（服务化，最贴合"三机分离"语义）**
-- **LightningStore** → 独立 `Deployment + Service`（`agl store`，backend=mongo 持久化）；
-- **Algorithm/训练** → 独立 `Deployment`（或 RayJob/自定义 CRD）跑 `AgentLightningTrainer`，内含 vLLM + LLMProxy；
-- **Runner** → 独立 `Deployment/StatefulSet` + HPA（按队列深度扩缩容），`server_host=<store-svc>`；
-- **vLLM 引擎** → 独立 `Deployment + Service`（若 algo 与 vLLM 分离部署）；
-- **优点**：各角色独立扩缩容/升级/故障域（真正的"训练、推理、环境、奖励解耦"）；**缺点**：要自己编排跨组件依赖与网络。
-
-**选型建议**：小规模/单机调试用方案 A（一个 RayCluster）；生产/多租户/分离式平台用方案 B（各组件独立工作负载 + 自定义 CRD 编排，即实习的形态）。
-
-### 3. 具体数值样例
-
-- 方案 A：1 head + algo 组 2 GPU + runner 组 8 CPU，一个 `raycluster.yaml` 搞定；`ray status` 看到全部角色；
-- 方案 B：`store` Deployment 1 副本 + Service；`algo` Deployment 1 副本（2 GPU）；`runner` Deployment 12 副本（HPA min 4 max 32）；`vllm` Deployment 1 副本（1 GPU）+ Service；
-- 面试表述：**"分离式在 K8S 上的本质 = 每个角色一个工作负载 + 两个 HTTP 面（store 的 4747、模型端点）用 Service 打通，Runner 用 HPA 按队列深度弹性扩缩。"**
-
-> 面试一句话总结：**两种编排：一个 RayCluster 内用 worker group 分工（贴合 VERL，耦合紧）或独立工作负载（store/algo/runner/vllm 各一个 Deployment+Service，真正解耦可独立扩缩）；生产分离式平台选后者——store 用 ClusterIP 内网 + 需要时 LoadBalancer/Ingress 公网暴露，runner 用 HPA 弹性。**
-
----
-
-## 19. 分别起 store / algo / runner 的 K8S 编排（含 YAML）
-
-### 1. 现有问题
-
-把方案 B 落到具体的 K8S 资源上：每个角色需要什么工作负载、什么 Service、什么配置。
-
-### 2. 方法论（三个角色的完整编排）
-
-**① LightningStore（store 机 → Deployment + Service）**：
+### 4.2 模式二：Interactive 模式（交互式调试用）
 
 ```yaml
-# 01-store.yaml
+# ray-job.interactive-mode.yaml 的思路
+spec:
+  submissionMode: Interactive      # ★ 不把 entrypoint 交给 K8s Job，而是提交给已有的 Ray Job API
+  entrypoint: "python train.py"
+  shutdownAfterJobFinishes: false  # 任务结束保留集群，可以继续 exec 进去玩
+```
+
+**`Interactive` 与默认（`K8sJob` 模式）的区别**：默认模式把 entrypoint 包成一个 K8s Job 来跑（生命周期由 K8s 管）；`Interactive` 模式把 entrypoint 提交给 Ray 自己的 Job Submission API（**集群里可以同时提交多个 job**）。调试训练脚本时用后者更方便。
+
+### 4.3 模式三：复用已有 RayCluster（长期集群 + 多个任务）
+
+```yaml
+# ray-job.use-existing-raycluster.yaml
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: my-job
+spec:
+  clusterSelector:                 # ★ 用 label 选已有集群，不新建
+    ray.io/cluster: my-long-lived-cluster
+  entrypoint: "python train.py"
+  submissionMode: Interactive
+```
+
+**什么时候用**：集群启动慢（要拉镜像、装依赖），但任务频繁提交——保持一个常驻 `RayCluster`，用 `RayJob` 往上压任务。**代价**是任务之间会争抢资源，需要靠 Ray 的 `num_gpus`/自定义资源隔开。
+
+### 4.4 顺带：RayCronJob（定时任务）
+
+```yaml
+# ray-cronjob.sample.yaml / ray-cronjob-timezone.sample.yaml
+apiVersion: ray.io/v1
+kind: RayCronJob
+metadata: {name: nightly-eval}
+spec:
+  schedule: "0 2 * * *"
+  timeZone: "Asia/Shanghai"
+  jobTemplate: {spec: {...}}       # 内嵌一个 RayJob spec
+```
+
+**典型用途**：每天凌晨跑一次评测/数据生成——不需要人守着建集群。
+
+---
+
+## 5. 跑真实训练任务：verl on KubeRay
+
+### 5.1 一个真实的 verl 样例（`ray-cluster.verl.yaml`，全文 29 行）
+
+```yaml
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: verl-cluster
+spec:
+  rayVersion: "2.43.0"
+  headGroupSpec:
+    rayStartParams: {}
+    template:
+      spec:
+        containers:
+        - name: ray-head
+          image: hiyouga/verl:ngc-th2.6.0-cu126-vllm0.8.4-flashinfer0.2.2-cxx11abi0
+          resources:
+            limits:
+              cpu: "48"
+              memory: "192G"
+              nvidia.com/gpu: "4"          # ★ 4 张 GPU 直接给 head
+            requests:
+              cpu: "36"
+              memory: "144G"
+              nvidia.com/gpu: "4"
+          ports:
+          - {containerPort: 6379,  name: gcs-server}
+          - {containerPort: 8265,  name: dashboard}
+          - {containerPort: 10001, name: client}
+```
+
+**三个值得注意的点**：
+
+1. **`requests` 与 `limits` 不相等**（36/48 CPU、144G/192G）——这里有个**必须知道的确切语义**（KubeRay 官方 `config.md`）：**KubeRay 取的是容器的 `limits`；如果没设 limit，才回落到 CPU 的 request；CPU 会向上取整；而内存和 GPU 的 request 被完全忽略**。所以
+   - 这份样例的实际含义是"**Ray 看到 48C/192G，但 K8s 只按 36C/144G 来调度**"——这是一种**超卖写法**，Ray 以为自己有更多资源；
+   - **结论：内存和 GPU 的 `requests` 必须等于 `limits`**（否则写了也没用），CPU 可以留弹性但要清楚 Ray 按 limit 算。这跟 `complete.yaml` 里"requests = limits"的建议是一致的方向。
+2. **镜像名就是环境清单**：`ngc-th2.6.0`（NGC PyTorch 2.6 + CUDA 12.6）、`vllm0.8.4`、`flashinfer0.2.2`、`cxx11abi0`——**训练镜像的 tag 必须把框架版本写全**，这是复现的前提。
+3. **只有 head 没有 workerGroupSpecs**——单机 4 卡的场景，Ray 的 head 自己也是可调度节点。
+
+### 5.2 规模放大：从 1 机 4 卡到多机多卡
+
+KubeRay 样例里有一条极端的规模参考可直接引用：**`ray-cluster.tpu-v6e-256-multihost.yaml`**（256 主机多机 TPU），另外还有 `tpu-v4-multihost`、`tpu-v6e-16-multihost` 等。**多机 TPU/GPU 训练的关键是"一个 Pod 内的多卡 + 跨 Pod 的集合通信"**，需要：
+
+```yaml
+workerGroupSpecs:
+- groupName: gpu-workers
+  replicas: 8                    # 8 个 Pod × 8 卡 = 64 卡
+  minReplicas: 8
+  maxReplicas: 8                 # ★ 训练任务不设弹性（gang scheduling 要求整体起来）
+  template:
+    spec:
+      # ① 一个 Pod 独占整台机器
+      affinity:
+        podAntiAffinity:         # 同一个 group 的 Pod 不要挤在一台机器
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels: {ray.io/group: gpu-workers}
+            topologyKey: kubernetes.io/hostname
+      # ② 共享内存：NCCL 走 shm，默认 64MB 远远不够
+      volumes:
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 64Gi}
+      containers:
+      - name: ray-worker
+        image: <你的训练镜像>
+        volumeMounts: [{mountPath: /dev/shm, name: dshm}]
+        resources:
+          limits: {nvidia.com/gpu: "8", cpu: "96", memory: "1Ti"}
+          requests: {nvidia.com/gpu: "8", cpu: "96", memory: "1Ti"}
+        env:
+        - {name: NCCL_IB_DISABLE, value: "0"}            # 有 RDMA 就别关
+        - {name: NCCL_SOCKET_IFNAME, value: "eth0"}      # 指定通信网卡（多网卡时必须）
+        - {name: RAY_gcs_rpc_server_reconnect_timeout_s, value: "300"}
+```
+
+**五个必须配的东西**（缺一个都可能跑不起来）：
+
+| 配置 | 为什么 |
+|---|---|
+| `emptyDir{medium: Memory}` 挂 `/dev/shm` | NCCL/多进程共享内存；默认 64MB 会导致 `Bus error` |
+| `podAntiAffinity` + `hostname` | 一个 Pod 独占一台机（否则两个 8 卡 Pod 挤一台，调度不上） |
+| `NCCL_SOCKET_IFNAME` | 多网卡机器上 NCCL 可能选错网卡，跨机带宽暴跌 |
+| `memory` 给足（1Ti 级） | Ray object store 默认吃掉 30% 内存，训练进程还要用 |
+| **训练任务 `maxReplicas = replicas`** | 训练不能"缩到一半"——gate scheduling 要求整组就绪；弹性只适合无状态的推理/数据任务 |
+
+### 5.3 GPU 共享与 gang scheduling（大规模训练的核心难题）
+
+**问题**：8 个 worker Pod，每个要 8 张卡。如果集群只剩 7 台空闲机器，K8s 默认调度器会让 7 个 Pod 起来、1 个 Pending——**已经起来的 7 个 Pod 在空转等你，集群算力被死锁**。这就是需要 **gang scheduling（成组调度：要么全起，要么全等）** 的原因。
+
+KubeRay 样例里已经备好了四种调度器集成：
+
+| 样例文件 | 调度器 | 特点 |
+|---|---|---|
+| `ray-cluster.volcano-scheduler.yaml` / `...-queue.yaml` | **Volcano** | 国内最常用，支持 queue/quota/gang |
+| `ray-cluster.kai-scheduler.yaml` / `ray-cluster.kai-gpu-sharing.yaml` | **KAI Scheduler** | 支持 GPU 共享（一张卡切给多个 Pod） |
+| `ray-cluster.yunikorn-scheduler.yaml` | **YuniKorn** | Apache 项目，队列与公平调度 |
+| `ray-cluster.scheduler-plugins.yaml` | **K8s scheduler-plugins**（coscheduling） | 官方插件方案，改动最小 |
+
+用法（以 Volcano 为例）：
+
+```yaml
+spec:
+  headGroupSpec:
+    template:
+      spec:
+        schedulerName: volcano          # ★ 关键：指定调度器
+        containers: [...]
+  workerGroupSpecs:
+  - groupName: gpu-workers
+    replicas: 8
+    minReplicas: 8
+    maxReplicas: 8
+    template:
+      spec:
+        schedulerName: volcano
+        # Volcano 的 gang 语义靠 PodGroup；KubeRay 会按 group 自动生成
+```
+
+**面试表述**："多机训练必须 gang scheduling——8 个 Pod 要么全起要么全等，否则先起的 Pod 会占着 GPU 死等，整个集群被一个任务锁死。KubeRay 支持 Volcano / KAI / YuniKorn / scheduler-plugins 四种；GPU 切分用 KAI 的 sharing 样例。"
+
+---
+
+## 6. 关键特性逐个讲
+
+### 6.1 Autoscaler（弹性伸缩）
+
+```yaml
+# ray-cluster.autoscaler.yaml 的关键字段
+spec:
+  enableInTreeAutoscaling: true       # ★ 开了才会在 head Pod 里注入 autoscaler sidecar
+  autoscalerOptions:
+    upscalingMode: Default            # Conservative（限速，pending Pod 数 ≤ 集群规模）/ Default / Aggressive（同 Default）
+    idleTimeoutSeconds: 60            # ★ 空闲多久缩掉一个 worker
+    imagePullPolicy: IfNotPresent
+    env:
+    - {name: AUTOSCALER_UPDATE_INTERVAL_S, value: "5"}   # 默认 5s 检查一次
+    resources: {limits: {cpu: 500m, memory: 512Mi}, requests: {cpu: 500m, memory: 512Mi}}
+  headGroupSpec:
+    rayStartParams:
+      num-cpus: "0"                   # ★ head 不接业务任务（否则训练会跑到 head 上）
+  workerGroupSpecs:
+  - replicas: 0                       # ★ 可以从 0 开始（冷启动按需拉起）
+    minReplicas: 0
+    maxReplicas: 10
+```
+
+**机制**：autoscaler sidecar 跑在 head Pod 里，它看 Ray 层面的 resource demand（`ray status` 里的 "Demands"），再通过 K8s API 改 `RayCluster.spec.workerGroupSpecs[].replicas`。**所以扩容的本质是"改 CR"，再由 Operator 建 Pod**——两级 reconcile 协作。
+
+**四个关键点**：
+
+1. **`rayStartParams: {num-cpus: "0"}`** 是标配——不让 head 抢业务任务；
+2. **`idleTimeoutSeconds`** 决定缩容激进度（默认 60s），太小会抖动；
+3. **`replicas: 0` + `minReplicas: 0`** 支持"从零拉起"，省钱但要等 Pod 启动（拉镜像可能几分钟）；
+4. **训练任务不要开 autoscaler**（弹性只适合无状态的推理/数据/rollout 任务）——理由同 gang scheduling。
+
+### 6.2 GCS 高可用与容错（这块正在演进，样例里有明确的"废弃"标记）
+
+样例目录里同时存在三份相关文件，正好展示演进：
+
+| 样例 | 含义 |
+|---|---|
+| `ray-cluster.external-redis.yaml` | 老方案：head 连**外部 Redis** 做 GCS 容错（外部 Redis 不随集群销毁，重建集群可恢复） |
+| `ray-cluster.persistent-redis.yaml` / `persistent-redis-sidecar.yaml` | 折中：Redis 用 PVC 持久化（保留状态但不占外部资源） |
+| `ray-cluster.embedded-gcs-ft.yaml` | 新方向：**内嵌 GCS 容错**（不需要 Redis） |
+| **`ray-cluster.deprecate-gcs-ft.yaml`** | **废弃声明**——这个文件名本身就是结论：基于 Redis 的 GCS FT 已不再推荐 |
+
+**★ 核心机制：head 挂掉后 worker 还能不能跑？——能，靠一个环境变量。**
+
+KubeRay 在开 FT 时**只给 worker 注入 `RAY_gcs_rpc_server_reconnect_timeout_s=600`（head 保持默认 60s）**。源码注释原文：
+
+> *"By default, the value is 60s… Typically, the new GCS server will be available in 120 seconds, so we **set the timeout to 600s to avoid the worker nodes crashing**."*
+
+**不开 FT 的后果**（官方文档原文）：*"the worker Pods are perceived as **'unknown workers'** by the new head Pod"* —— 然后被全部干掉。
+
+**所以这道题的正确答案是**：
+
+> **head 重启后，worker 有 600 秒的重连窗口**（比新 GCS 起来的 ~120 秒更宽），窗口内重连上就继续跑；**不开 FT 则 worker 会被新 head 当成 "unknown workers" 清掉**，整个集群等于重建。这也是为什么长跑训练任务要理解这个字段——**它决定了"head 崩一次"是"抖动"还是"全灭"**。
+
+**新方案（v1.7 + Ray 2.57，alpha）**：`gcsFaultToleranceOptions.backend: rocksdb`（feature gate `GCSFaultToleranceEmbeddedStorage`），用 PVC `{cluster}-gcs-pvc` 挂 `/data/gcs`，单写者，可设 `Retain` 或自带 `claimName`——**这才是 `deprecate-gcs-ft.yaml` 这个文件名背后的演进方向**。
+
+**面试表述**："GCS 容错经历了两代：老方案外挂 Redis 存 GCS 状态（现在已标记废弃），新方案是 `backend: rocksdb` 的内嵌存储。但真正值得记的是那个环境变量——**KubeRay 给 worker 注入 600 秒重连超时（head 只有 60 秒默认值）**，所以 head 重启时 worker 有足够窗口重连而不被杀；**不开 FT 的话，新 head 会把老 worker 当成 'unknown workers' 全部清掉**。"
+
+### 6.3 监控与可观测
+
+| 样例 | 干什么 |
+|---|---|
+| `ray-cluster.embed-grafana.yaml` | 在 head Pod 里**内嵌 Grafana**，开箱能看指标 |
+| `ray-cluster.fluentbit.yaml` | 用 **Fluent Bit** sidecar 收集日志，推到外部（S3/ES 等） |
+| `ray-cluster.py-spy.yaml` | 注入 **py-spy**，可对运行中的 worker 采样 Python 栈（查卡死/热点） |
+| `install/prometheus/` | KubeRay 自带的 Prometheus 配置（ServiceMonitor/规则） |
+| Ray Dashboard（8265） | 节点/actor/task/对象/日志，`kubectl port-forward` 后浏览器看 |
+
+**`py-spy` 那个样例很实用**：分布式训练卡住时（比如 NCCL hang），能直接 `py-spy dump` 看所有 rank 卡在哪一行 —— 这是定位死锁的标准手段。
+
+### 6.4 安全：认证 / TLS / 网络隔离
+
+| 样例 | 作用 |
+|---|---|
+| `ray-cluster.auth.yaml` / `ray-cluster.auth-manual.yaml` / `ray-cluster.auth.secret-ref.yaml` | Ray 的 **token 认证**（凭据来自 Secret，或手动指定） |
+| `ray-cluster.tls.yaml` / `ray-cluster.mtls.yaml` | **TLS / 双向 TLS**（证书从 Secret 挂载） |
+| `ray-cluster.network-policy-deny-all.yaml` | 默认拒绝所有入站，再按需放行（最小权限） |
+| `ray-cluster.kubernetes.auth.yaml` | 从 K8s ServiceAccount 取认证信息 |
+
+**为什么训练集群也要管这个**：Ray 的 Client 端口（10001）和 Dashboard（8265）**默认没有任何鉴权**——一旦用 `LoadBalancer`/`Ingress` 暴露到公网，等于把集群的任意代码执行能力开放出去。所以生产上要么只走 ClusterIP、要么配 auth + TLS。
+
+### 6.5 存储
+
+| 样例 | 用途 |
+|---|---|
+| `ray-cluster.gke-bucket.yaml` | 挂 GCS bucket（GKE 的 CSI 驱动） |
+| `ray-cluster.historyserver.yaml` | Ray History Server（把已结束集群的日志/状态持久化后回看） |
+| `ray-cluster.complete.yaml` 的 `emptyDir: {}` | **注意**：`emptyDir` 随 Pod 销毁而丢——训练要存 checkpoint 必须换 PVC 或挂对象存储 |
+
+**训练任务的存储四件套**：`emptyDir`（`/dev/shm`、`/tmp/ray`，临时）、**PVC**（checkpoint）、**对象存储 CSI**（数据集/模型，多机共享）、以及 `/tmp/ray` 的显式挂载（按 KubeRay 指引，"没有明确挂载时默认值在不同 K8s 发行版上可能不同"，且挂载后 head 重启仍保留日志）。
+
+### 6.6 生态扩展：apiserver / kubectl-plugin / podpool
+
+本地仓里有三个额外的子项目，面试时能提一句说明"知道 KubeRay 的全貌"：
+
+| 组件 | 作用 |
+|---|---|
+| `apiserver/` | **REST/gRPC API**（`kuberay-apiserver` Helm chart），让不写 YAML 的系统（比如平台前端）也能创建集群 |
+| `kubectl-plugin/` | `kubectl ray` 子命令（`kubectl ray job submit` / `kubectl ray session`），免写 YAML |
+| `podpool/` | **预热 Pod 池**——提前把 Pod 拉起来待命，避免任务来了才拉镜像（对"冷启动几分钟"的直接解法） |
+| `benchmark/` | 基准测试脚本 |
+| `clients/` | Python/Go 客户端 |
+
+**`podpool` 值得单独说**：agentic RL 的训练任务经常是"批一批地来"，冷启动（拉镜像+装依赖）可能占掉几分钟。podpool 的思路是**保持一批已初始化的 Pod 待命**，任务来了直接接管——这和第 8 节要讲的 Polar 的 `READY` buffer 是同一个设计思想。
+
+### 6.7 其他值得知道的样例
+
+| 样例 | 场景 |
+|---|---|
+| `ray-cluster.label-selector.yaml` | 用 label 把 worker 绑到特定节点 |
+| `ray-cluster.resource-isolation.gke.yaml` | 资源隔离（GKE 特定） |
+| `ray-cluster.custom-head-service.yaml` / `ray-cluster.separate-ingress.yaml` | 自定义 head Service / 分别配 Ingress |
+| `ray-cluster.head-command.yaml` / `overwrite-command.yaml` | 覆盖容器启动命令（自定义初始化） |
+| `ray-cluster.sandbox.yaml` / `agent-sandbox` | 沙箱化执行（agent 场景常用） |
+| `ray-cluster.uv.yaml` | 用 `uv` 管理依赖 |
+| `ray-job.sidecar-mode.yaml` / `light-weight-submitter.yaml` | 提交器不进集群（轻量提交）/ sidecar 模式 |
+| `ray-job.kueue-toy-sample.yaml` | 与 **Kueue**（K8s 原生排队系统）集成 |
+| `vllm/` 目录、`ray-service.llm-serve.yaml` / `deepseek.yaml` / `high-throughput-llm.yaml` | **vLLM 在线推理**（RayService） |
+
+---
+
+## 7. 用 K8s 起"分离式 RL 服务"（以 agent-lighting 为例）
+
+前面讲的都是"起训练集群"。但分离式 RL 平台的形态是**多个常驻服务 + 一个训练作业**，需要的是 Deployment/Service 那一套。
+
+### 7.1 ★ 先分清版本：v0.3.x 没有 K8s，v1.0.0 才有原生 K8s
+
+必须纠正一个常见误解——**agent-lightning 的 K8s 支持是 v1.0.0 才有的，而且 v1.0.0 是一次彻底重构**：
+
+| | **v0.3.x** | **v1.0.0**（tag `8f8b8f95`，2026-08-17） |
+|---|---|---|
+| K8s 支持 | **没有**（`kubectl`/`helm`/`raycluster`/`kuberay`/`ServiceAccount`/`StatefulSet` 全仓 NOT FOUND） | **原生支持** |
+| 官方定位 | 3 进程模型（pip 安装） | "**Native Kubernetes support:** Run agents directly as Kubernetes Jobs **without relying on external sandbox services**" |
+| 三组件 | `store` / `runner` / `algo` | **API Gateway** / **Rollout Controller** / **Customized Trainer** |
+| CLI | `agl store` / `agl vllm` / `agl prometheus` | `agl-server` / `agl-controller`（v0.3 那几个子命令**已不存在**） |
+| 端口 | store `4747` | API Gateway `8080`（官方示例脚本里用 `8181`） |
+| 容器编排 | 只有 `docker/`（Dockerfile.dev + 5 个 compose） | `runner_type: k8s`，**每个 rollout 一个 K8s Job** |
+| Helm | 无 | **无**（命令式提交 Jinja 渲染出的 Job） |
+| 新增依赖 | — | `kr8s>=0.18.0` |
+
+> ⚠️ **本地工作树都 checkout 在 v0.3.x**，但 `agent-lightning-official` 的 git object 里**有 v1.0.0 的 tag**（`git tag` 可见、工作树没切过去）。所以"本地看不到 K8s 文件"≠"官方没有 K8s 方案"。
+
+**v1.0.0 的核心机制**（官方原文）：*"**Kubernetes mode:** creates **one Kubernetes Job for each rollout** from a user-provided template."*
+
+即：**Rollout Controller 不再自己起进程跑 agent，而是把 agent 包成一个 K8s Job 提交出去**——这正是 `Colocate-vs-Disaggregate.md` 里讲的 **rollout-as-a-service** 思路（Polar 用 API 网关、AGL 用 K8s Job，本质都是"把 agent 执行挪出训练进程"）。
+
+### 7.2 v1.0.0 的 minikube 实操（官方 `run_minikube.sh` 逐行）
+
+```bash
+# ① 起 Ray head（Trainer 侧要用 Ray）
+ray start --head --dashboard-host=0.0.0.0
+
+# ② 起 minikube（官方给了 64GB 内存 + 16 核）
+minikube start --memory=65536 --cpus=16 --driver=docker
+
+# ③ 把 agent 镜像 build 进 minikube 的镜像仓库（不 push registry）
+minikube image build -t calc-x-agent:dev -f Dockerfile .
+
+# ④ 起 API Gateway（对应 v0.3 的 store）
+agl-server port=8181 key=dummy \
+    default_proxy.model_name=Qwen/Qwen2.5-1.5B-Instruct &
+
+# ⑤ 等健康
+for _ in $(seq 1 60); do curl -sf "http://localhost:8181/healthz" && break; sleep 1; done
+
+# ⑥ 起 Rollout Controller —— 关键就一行：runner_type=k8s
+agl-controller \
+    runner_type=k8s \
+    agl_server.url="http://host.minikube.internal:8181" \
+    agl_server.key=dummy \
+    k8s_runner.ttl_after_finished=600 &
+
+# ⑦ 跑 Trainer
+python train_calc_agent.py --agl-base-url http://localhost:8181 --agl-key dummy --run-name minikube
+```
+
+**三个必须注意的坑**：
+
+1. **`host.minikube.internal`** —— minikube 里的 Pod 访问宿主机上的 `agl-server` 要用这个特殊 DNS；**真实集群必须换成 Service 名或 Ingress**（这就是"K8s 起服务"的核心工作，也正是实习做的"公网 URL 自动暴露"）；
+2. **`minikube image build`** —— 本地构建的镜像不 push registry，直接进 minikube 镜像存储；**真实集群要么 push registry、要么每个节点预拉**（这就是"Pod 冷启动慢"的根源，对应 KubeRay 的 `podpool` 解法）；
+3. **`runner_type` 是唯一开关** —— 改成 `local` 就退回本地进程模式（v0.3 的形态）。官方把"agent 在哪跑"抽象成一个配置项，这是很干净的设计。
+
+**安装（v1.0.0）**：`uv sync` → `bash scripts/setup_verl.sh 0.8.0 cu130`（支持 verl 0.7.1 + cu129 / 0.8.0 + cu130；两条路径都要**本地编译 flash-attn 2.8.3，视 CPU 核数 10–30 分钟**）；Quick Start 只需**单机 1×A100**。
+
+### 7.3 v0.3.x 的做法（本地工作树的实际状态）
+
+v0.3.x **没有 K8s 方案**，官方部署是 **3 进程模型**（`pip install agentlightning` 之后）：
+
+```bash
+# 终端 1：Store（唯一数据面）
+agl store --host 0.0.0.0 --port 4747
+
+# 终端 2：Runner（跑 agent，需要 OPENAI_API_KEY）
+AGL_SERVER_HOST=<store-ip> AGL_SERVER_PORT=4747 AGL_CURRENT_ROLE=runner python -m <runner>
+
+# 终端 3：Algorithm（训练侧）
+AGL_SERVER_HOST=<store-ip> AGL_SERVER_PORT=4747 AGL_CURRENT_ROLE=algorithm python -m <algorithm>
+```
+
+它自带的容器化只有 `docker/`：`Dockerfile.dev` + 5 个 compose（store 4747 / Prometheus 4748 / Grafana 9091 / Mongo 8.2 副本集）。**所以想在 K8s 上跑 v0.3.x，就是"把 3 个进程各包成一个 Deployment"**——这也是实习里做的形态。
+
+### 7.4 通信矩阵（v0.3.x，决定了要暴露几个网络面）
+
+| 链路 | 协议 | 端点 |
+|---|---|---|
+| Runner ↔ LightningStore | **HTTP** | `:4747`（`/v1/agl/*`） |
+| Algorithm ↔ LightningStore | **HTTP** | 同上（可内嵌 client） |
+| Runner → Agent | **进程内调用** | 无网络 |
+| Agent → LLMProxy | **HTTP**（OpenAI 兼容） | proxy 端口 |
+| LLMProxy → vLLM | **HTTP**（OpenAI 兼容） | `:8000` 或 vLLM 实际端口 |
+
+**结论**：**跨机通信只有两个 HTTP 面**——store 的 4747 和模型端点。K8s 编排要做的就是把这两个面用 Service 暴露出来，其余交给 Ray。
+
+### 7.5 store 的 backend 选择（决定 K8s 形态）
+
+v0.3.x 的 store CLI 在 `agentlightning/cli/store.py`，backend 由 `agentlightning/store/` 决定（`memory.py` / `mongo.py` / `sqlite.py` 是实现，`base.py` 是接口、`client_server.py` 是 C/S）。**backend 直接决定 K8s 上要不要给 store 配 PVC 或外部数据库**：
+
+| backend | K8s 形态 | 适用 |
+|---|---|---|
+| `memory` | Deployment，无持久化 | 调试 |
+| `sqlite` | Deployment + **PVC**（单副本，不能水平扩） | 小规模 |
+| `mongo` | Deployment + 外部 MongoDB（或 StatefulSet） | 生产（可多副本） |
+
+### 7.6 三种编排方案（v0.3.x）
+
+**方案 A：一个 RayCluster 内部分角色**（贴合 verl）
+
+```
+head Pod        → GCS + 训练入口（AgentLightningTrainer / AgentModeDaemon）
+algo worker 组  → verl 训练 worker + vLLM 引擎 + LLMProxy（GPU）
+runner worker 组→ LitAgentRunner（CPU 为主）
+store           → 独立 Deployment 或 head 的 sidecar
+```
+
+优点：复用 Ray 的调度/容错/扩缩容，verl 原生集成；缺点：**所有角色共用一个集群，故障域耦合**。
+
+**方案 B：独立工作负载**（真正的分离式平台形态，也是实习采用的形态）
+
+```yaml
+# ① store：Deployment + Service（唯一的数据面）
 apiVersion: apps/v1
 kind: Deployment
-metadata:
-  name: agl-store
-  labels: {app: agl-store}
+metadata: {name: agl-store, labels: {app: agl-store}}
 spec:
   replicas: 1
   selector: {matchLabels: {app: agl-store}}
@@ -755,473 +774,330 @@ spec:
     metadata: {labels: {app: agl-store}}
     spec:
       containers:
-        - name: store
-          image: agentlightning:0.3.0        # 镜像内含 agl CLI
-          command: ["agl", "store"]
-          args: ["--host", "0.0.0.0", "--port", "4747",
-                 "--backend", "mongo", "--mongo-uri", "mongodb://mongo:27017/?replicaSet=rs0"]
-          ports: [{containerPort: 4747}]
-          resources: {requests: {cpu: "2", memory: 4Gi}, limits: {cpu: "4", memory: 8Gi}}
-          readinessProbe: {httpGet: {path: /health, port: 4747}}
-          volumeMounts: [{name: store-data, mountPath: /data}]   # span 持久化
+      - name: store
+        image: <你的 agent-lightning 镜像>     # 镜像里要有 agl CLI
+        command: ["agl", "store"]
+        args: ["--host", "0.0.0.0", "--port", "4747",
+               "--backend", "mongo", "--mongo-uri", "mongodb://mongo:27017/?replicaSet=rs0"]
+        ports: [{containerPort: 4747}]
+        resources: {requests: {cpu: "2", memory: 4Gi}, limits: {cpu: "4", memory: 8Gi}}
+        readinessProbe: {httpGet: {path: /health, port: 4747}}
+        volumeMounts: [{name: data, mountPath: /data}]
       volumes:
-        - name: store-data
-          persistentVolumeClaim: {claimName: agl-store-pvc}
+      - name: data
+        persistentVolumeClaim: {claimName: agl-store-pvc}
 ---
 apiVersion: v1
 kind: Service
-metadata:
-  name: agl-store
+metadata: {name: agl-store}
 spec:
   selector: {app: agl-store}
-  ports: [{port: 4747, targetPort: 4747}]      # 集群内 ClusterIP
-  # 需要公网访问时改 type: LoadBalancer（对应实习"TrajStore 公网 URL 自动暴露"）
+  ports: [{port: 4747, targetPort: 4747}]
+  type: ClusterIP          # ★ 需要公网时改 LoadBalancer / 加 Ingress
 ```
 
-**② Algorithm（algo 机 → Deployment，含 VERL 训练 + vLLM + LLMProxy）**：
-
 ```yaml
-# 02-algo.yaml
+# ② runner：Deployment + HPA（按队列深度弹性）
 apiVersion: apps/v1
 kind: Deployment
-metadata:
-  name: agl-algo
-  labels: {app: agl-algo}
+metadata: {name: agl-runner}
 spec:
-  replicas: 1                                   # 算法侧单进程（复杂并行交给 VERL/DeepSpeed）
-  selector: {matchLabels: {app: agl-algo}}
-  template:
-    metadata: {labels: {app: agl-algo}}
-    spec:
-      containers:
-        - name: algo
-          image: agentlightning:0.3.0
-          command: ["agl", "train"]             # 或 python -m 训练入口
-          env:
-            - name: AGL_STORE_URL
-              value: "http://agl-store:4747/v1/agl"   # ← store 的 Service 名（DNS 自动解析）
-            - name: ROLE
-              value: "algorithm"
-            - name: VLLM_ENDPOINT
-              value: "http://agl-vllm:8000/v1"       # vLLM 引擎 Service
-          resources: {limits: {"nvidia.com/gpu": "2"}}   # VERL 训练 + vLLM 共享/分离
-      serviceAccountName: agl-algo-sa           # RBAC（如需要操作 Ray/CRD）
----
-apiVersion: v1
-kind: Service
-metadata: {name: agl-algo}                      # 可选：算法侧暴露的端点（如 LLMProxy）
-spec:
-  selector: {app: agl-algo}
-  ports: [{port: 8000, targetPort: 8000}]       # LLMProxy / vLLM OpenAI 兼容端口
-```
-
-**③ Runner（agent 机 → Deployment + HPA）**：
-
-```yaml
-# 03-runner.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: agl-runner
-  labels: {app: agl-runner}
-spec:
-  replicas: 12
+  replicas: 4
   selector: {matchLabels: {app: agl-runner}}
   template:
     metadata: {labels: {app: agl-runner}}
     spec:
       containers:
-        - name: runner
-          image: agentlightning:0.3.0
-          command: ["agl", "run"]
-          args: ["--role", "runner"]            # agent 机
-          env:
-            - name: AGL_STORE_URL
-              value: "http://agl-store:4747/v1/agl"     # ← 指向 store Service（三机分离的 HTTP 面）
-            - name: SERVER_HOST
-              value: "agl-store"
-            - name: SERVER_PORT
-              value: "4747"
-            - name: LLM_PROXY_URL
-              value: "http://agl-algo:8000/v1"          # Agent → LLMProxy（HTTP）
-            - name: SANDBOX_TOKEN                # 腾讯沙箱密钥
-              valueFrom: {secretKeyRef: {name: sandbox-cred, key: token}}
-          resources: {requests: {cpu: "4", memory: 8Gi}}
+      - name: runner
+        image: <你的 agent 镜像>
+        command: ["python", "-m", "your_runner"]
+        env:
+        - {name: AGL_SERVER_HOST, value: "agl-store"}     # ★ 用 Service 名，不用 IP
+        - {name: AGL_SERVER_PORT, value: "4747"}
+        resources: {requests: {cpu: "4", memory: 8Gi}}
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
-metadata: {name: agl-runner-hpa}
+metadata: {name: agl-runner}
 spec:
   scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: agl-runner}
   minReplicas: 4
   maxReplicas: 32
   metrics:
-    - type: Pods
-      pods:
-        metric: {name: agl_runner_queue_depth}   # 按 store 队列深度扩缩 runner（Prometheus adapter）
+  - type: External        # 按 store 队列深度扩缩（需要 prometheus-adapter）
+    external:
+      metric: {name: agl_pending_rollouts}
+      target: {type: AverageValue, averageValue: "8"}
 ```
-
-**④ 配套**：vLLM 引擎独立 Deployment + Service（`agl-vllm:8000`）；MongoDB（store 后端）StatefulSet + PVC；Secret（沙箱/云密钥）；NetworkPolicy（只放行 store 4747 与模型 8000）。
-
-### 3. 具体数值样例
-
-- 网络面：所有组件只用两个 Service——`agl-store:4747`（数据面）与 `agl-algo:8000` / `agl-vllm:8000`（推理面）；Runner 不需要对外暴露（纯消费者）；
-- 扩缩容：队列积压 100 个任务 → HPA 把 runner 从 4 扩到 32 → 队列清空 → 缩回 4（`behavior.scaleDown.stabilizationWindowSeconds` 防抖）；
-- 故障：runner Pod 崩溃 → Deployment 重建（新 Pod 从 store 重新 `dequeue_rollout`，attempt 语义保证不丢任务）；store 崩溃 → readiness 探针失败 → Service 摘除 → 重建后 mongo 数据仍在；
-- 公网：`agl-store` Service 改 `type: LoadBalancer` → 云平台分配公网 IP → 用户 agent（任意位置）通过公网 URL 连 store——**这就是实习"TrajStore 公网 URL 自动暴露与生命周期管理"的 K8S 落点**。
-
-> 面试一句话总结：**分离式三件套在 K8S 上 = store 一个 Deployment+Service（4747，mongo 持久化，可 LoadBalancer 公网暴露）、algo 一个 Deployment（VERL+vLLM+LLMProxy，GPU）、runner 一个 Deployment+HPA（按队列深度弹性）——所有跨机通信收敛到两个 HTTP 面（store 4747、模型 8000），用 Service 名解耦 IP，这就是"分离式架构的 K8S 化"。**
-
----
-
-## 20. 与实习对照：RayCluster Head + TrajStore 双网络链路
-
-### 1. 现有问题
-
-实习亮点原话："在作业运行态时**并行创建 RayCluster Head 和 TrajStore 两条网络访问链路**，实现 TrajStore 公网 URL 的自动暴露与生命周期管理，使用户通过公网即可查看训练产生的轨迹数据"——这句话对应的 K8S 机制是什么？
-
-### 2. 方法论（逐句拆解）
-
-| 简历表述 | K8S 机制 |
-|---|---|
-| AgenticRL 训练作业（Kubernetes CRD 资源） | 训练作业 = 自定义 CRD（第 21 点），Operator 管理其生命周期 |
-| RayCluster Head 链路 | RayCluster 的 head Service（`<cluster>-head-svc`）+ NodePort/LoadBalancer/Ingress → 用户访问 Ray dashboard（8265）/提交任务（8265 API）|
-| TrajStore 链路 | 轨迹存储服务（agent-lighting LightningStore / TQ TrajStore）的 Service + LoadBalancer/Ingress → 公网 URL |
-| 并行创建两条链路 | 作业创建时 Operator 同时 reconcile head Service 与 TrajStore Service（`createHeadSvc + createTrajStoreSvc` 并行），各自暴露独立端点 |
-| 公网 URL 自动暴露 | Service type=LoadBalancer（云 LB）或 Ingress + TLS；自动分配公网 IP/域名 |
-| 生命周期管理 | 作业删除时级联清理 Service/Ingress/LB；Finalizer 保证清理顺序；TTL/自动释放 |
-
-**网络拓扑示意**：
-
-```text
-用户（任意位置）
-  │ HTTPS
-  ├──► Ingress/LB ──► RayCluster Head Service（8265 dashboard / 10001 任务提交）
-  └──► Ingress/LB ──► TrajStore Service（4747 /v1/agl/*，公网查看轨迹）
-                                        │
-                              ┌─────────┴─────────┐
-                              │ AgenticRL 训练作业 CR │
-                              │   └─ RayCluster（head+workers）│
-                              │   └─ TrajStore Deployment     │
-                              └──────────────────────────┘
-```
-
-### 3. 具体数值样例
-
-- 作业创建：Operator reconcile 顺序 = 建 head Service（ClusterIP，供 worker 内网）+ 建 TrajStore Service（`type: LoadBalancer`）→ 云平台分配公网 IP `1.2.3.4:4747` → 写入 CR status（`trajStoreUrl: http://1.2.3.4:4747`）→ 用户拿到 URL 即可看轨迹；
-- 安全：Ingress 配 TLS + NetworkPolicy 只放行 4747/8265；公网只暴露 TrajStore 与 dashboard，训练内网（GPU 通信）不暴露；
-- 生命周期：作业完成/删除 → Finalizer 依次删除 TrajStore Service（释放公网 IP）→ 删 RayCluster → 清 Finalizer——**公网 URL 与作业同生命周期**。
-
-> 面试一句话总结：**实习的"双网络链路"= 作业 CR 的 Operator 并行创建两个 Service：RayCluster Head Service（dashboard/任务提交）与 TrajStore Service（轨迹数据），后者配 LoadBalancer/Ingress 自动分配公网 URL 并写回 CR status；作业删除时 Finalizer 级联清理、释放公网资源——这就是"公网访问轨迹数据"的完整 K8S 实现。**
-
----
-
-# 五、自定义 CRD 训练作业（AgenticRL 作业的 Operator 化）
-
-## 21. 为什么训练作业要用 CRD + Operator（而不是裸 Deployment/Job）
-
-### 1. 现有问题
-
-训练作业不就是"起几个 Pod 跑训练吗"？为什么值得做成 CRD？
-
-### 2. 方法论（CRD/Operator 的优势，逐条对应训练痛点）
-
-| 训练痛点 | 裸 Deployment/Job | 自定义 CRD + Operator |
-|---|---|---|
-| 生命周期状态机（Pending→Running→Succeeded/Failed） | 靠 Job 的 status（粗糙） | CR 的 `.status.phase` 自定义（含 checkpoint 轮次、评估结果） |
-| 子资源多且联动（RayCluster + TrajStore + vLLM + 数据卷 + 网络链路） | 手动逐个 apply/删，易漏 | Operator reconcile 统一创建/更新/级联删除 |
-| 长时运行 + 断点续训（训练 25 步 7 小时） | Job 重跑全部重来 | CR 记录 step/checkpoint 进度，重建续训 |
-| 需要外部资源（GPU 配额、云盘、公网 LB、密钥） | 手动管理 | Operator 统一申请/回收 |
-| 多实例/多租户（同时多个训练作业） | YAML 复制粘贴 | 每个 CR 一个隔离作业，配额/调度统一 |
-| 训练与推理/环境解耦（AgenticRL 分离式） | 各组件分散难管 | 一个 CR 声明整条链（store/algo/runner/vllm） |
-| 团队协作/审计 | 无版本概念 | CR 声明式 + git 化（GitOps），status/events 可审计 |
-
-**本质**：训练作业是"**有状态、长时、多子资源、需要外部协调**"的领域资源——正是 Operator 模式的典型场景（KubeRay 的 RayJob 就是官方先例，但 AgenticRL 作业需要更多定制：TrajStore 链路、轨迹库、黑/白盒配置、评估阶段）。
-
-### 3. 具体数值样例
-
-- 裸 Job：训练到第 12/25 步时节点故障 → Job 重跑 → 25 步重来（数小时浪费）；
-- CRD 作业：status 记录 `currentStep: 12, checkpoint: s3://.../step12` → Pod 重建后 Operator 从 checkpoint 续训（对应 verl `resume` 语义）；
-- 3 个同时进行的训练作业 = 3 个 CR，Operator 统一管理各自的 RayCluster/TrajStore/GPU 配额。
-
-> 面试一句话总结：**训练作业 = 有状态、长时、多子资源、需外部协调的领域资源，裸 Job 表达不了"状态机/续训/子资源联动/公网链路"；CRD 把训练作业变成一等资源（spec 期望 + status 现实），Operator 统一 reconcile——这就是实习"训练作业（Kubernetes CRD 资源）"的原因。**
-
----
-
-## 22. 设计一个 AgenticRLTrainJob CRD（spec / status 设计）
-
-### 1. 现有问题
-
-如果我来设计训练作业 CRD，字段怎么定？参考 RayJob 但加上 AgenticRL 语义。
-
-### 2. 方法论（完整字段设计）
-
-```go
-// 概念：apis/agenticrl/v1/agenticrltrainjob_types.go
-type AgenticRLTrainJobSpec struct {
-    // 训练算法与模型
-    Algorithm   AlgorithmConfig   `json:"algorithm"`            // GRPO/PPO 超参、lr、rollout_n、batch...
-    Model       ModelConfig       `json:"model"`                // base model 路径、LoRA rank、dtype
-    Dataset     DatasetConfig     `json:"dataset"`              // train/val 数据源（S3/NFS/内置）
-
-    // 分离式组件（对应第 19 点三件套）
-    Store       StoreConfig       `json:"store"`                // backend(memory/mongo)、副本、持久化
-    AlgorithmDeploy AlgorithmDeployConfig `json:"algorithmDeploy"` // GPU 数、vLLM 引擎配置
-    Runner      RunnerConfig      `json:"runner"`               // 初始副本、min/max（HPA）、agent 类型（白盒/黑盒）
-    Sandbox     SandboxConfig     `json:"sandbox"`              // 腾讯 E2B / 本地 WSL 沙箱配置
-
-    // 训练运行参数
-    Rounds      int               `json:"rounds"`               // 训练轮数（如 25）
-    Resume      bool              `json:"resume,omitempty"`     // 断点续训
-    StopAt      *metav1.Time      `json:"stopAt,omitempty"`     // 时间截止（对应 run_loop_opt 的 STOP_AT）
-    EvalAfter   bool              `json:"evalAfter"`            // 训练完自动官方评估
-
-    // 网络与安全
-    ExposeTrajStore bool          `json:"exposeTrajStore"`      // 是否公网暴露轨迹（对应实习双链路）
-    TrajStoreAuth   *SecretRef    `json:"trajStoreAuth,omitempty"` // 轨迹库访问鉴权
-}
-
-type AgenticRLTrainJobStatus struct {
-    Phase        string   `json:"phase"`         // Pending|Creating|Rollout|Training|Evaluating|Succeeded|Failed
-    CurrentStep  int      `json:"currentStep"`   // 已训练步数（续训依据）
-    TotalSteps   int      `json:"totalSteps"`
-    ReadyRunners int      `json:"readyRunners"`  // 就绪 runner 数
-    HeadURL      string   `json:"headUrl,omitempty"`      // RayCluster Head 访问地址（链路 1）
-    TrajStoreURL string   `json:"trajStoreUrl,omitempty"` // TrajStore 公网 URL（链路 2）
-    Checkpoint   string   `json:"checkpoint,omitempty"`   // 最新权重路径
-    Conditions   []metav1.Condition `json:"conditions,omitempty"` // Ready/Completed/Evicted...
-    LastEval     *EvalResult `json:"lastEval,omitempty"`  // 最近一次评估（通过率 83.23% 等）
-}
-```
-
-**设计要点**：
-- **spec 全声明**（要什么），**status 全现实**（现在到哪了）——用户只看 status 就知道作业进展；
-- 子资源列表（Operator 要管的）：RayCluster、TrajStore Deployment+Service(+LB)、vLLM Deployment、runner Deployment+HPA、PVC、Secret、NetworkPolicy、Ingress；
-- 与 KubeRay 的关系：**RayCluster 部分直接内嵌 `rayClusterSpec`（复用 KubeRay CRD 做"集群"层），本 CRD 管"作业"层**——两层 Operator 协作（也可以用 `RayJob` 扩展而非自研）。
-
-### 3. 具体数值样例
 
 ```yaml
-apiVersion: agenticrl.example.io/v1
-kind: AgenticRLTrainJob
-metadata: {name: humanevalfix-spec-run1}
+# ③ algo / 训练：RayJob 或自定义 CRD（因为训练要 Ray + GPU + gang scheduling）
+apiVersion: ray.io/v1
+kind: RayJob
+metadata: {name: agl-train}
 spec:
-  algorithm: {type: GRPO, lr: 5e-6, rolloutN: 4, clipEpsilon: 0.2, klBeta: 0.01}
-  model: {base: qwen/Qwen3-8B, loraRank: 32, speculative: {method: eagle3, draftModel: Qwen3-8B-speculator.eagle3}}
-  dataset: {source: nfs://data/humanevalfix_train164.jsonl}
-  store: {backend: mongo, replicas: 1}
-  runner: {replicas: 12, min: 4, max: 32, agentType: whitebox, sandbox: tencent-e2b}
-  rounds: 25
-  resume: true
-  stopAt: "2026-08-19T17:00:00Z"
-  evalAfter: true
-  exposeTrajStore: true
+  entrypoint: "python train.py"
+  submissionMode: Interactive
+  clusterSelector: {ray.io/cluster: agl-training-cluster}   # 复用常驻训练集群
+  shutdownAfterJobFinishes: false
 ```
 
-- 提交后 `kubectl get agenticrltrainjob humanevalfix-spec-run1 -o jsonpath='{.status}'` 看到 `phase: Training, currentStep: 12/25, trajStoreUrl: http://1.2.3.4:4747`；
-- 训练完成 → `phase: Succeeded, lastEval: {passRate: 83.23, tasks: 161}`。
+**方案 B 的四个要点**：
 
-> 面试一句话总结：**训练作业 CRD = spec 声明算法/模型/数据/三件套配置/轮数/续训（期望）+ status 报告阶段/步数/就绪数/Head 与 TrajStore URL/评估结果（现实）；"作业层"CRD 可内嵌 KubeRay 的 rayClusterSpec 做"集群层"——两层 Operator 协作，把 AgenticRL 训练全链路变成声明式资源。**
+1. **Service 名做 DNS**（`agl-store`），不用 IP——Pod 重建 IP 会变；
+2. **`readinessProbe` 指向 store 的健康端点**，否则 runner 会在 store 没就绪时连上去失败重启；
+3. **runner 用 HPA 按队列深度扩缩**（不是 CPU——agent 任务是 IO 密集的，CPU 利用率低但排队很长）；
+4. **训练部分交给 RayJob / CRD**，不要用裸 Deployment（训练需要 Ray 集群 + gang scheduling + 生命周期管理）。
 
----
+### 7.7 与实习的对照：RayCluster Head + TrajStore 双网络链路
 
-## 23. 写一个最小 Operator（controller-runtime reconcile 骨架）
+实习做的"轨迹数据公网访问能力"就是把上面的方案 B 往前推了一步——**在作业运行态并行创建两条网络链路**：
 
-### 1. 现有问题
-
-CRD 定义了，谁来干活？——写 Operator。最小实现长什么样？
-
-### 2. 方法论（可运行的骨架，参照 KubeRay RayClusterReconciler）
-
-```go
-// controllers/agenticrltrainjob_controller.go（骨架）
-package controllers
-
-import (
-    "context"
-    ctrl "sigs.k8s.io/controller-runtime"
-    "sigs.k8s.io/controller-runtime/pkg/client"
-    agenticrlv1 "example.io/api/agenticrl/v1"
-    rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
-)
-
-type AgenticRLTrainJobReconciler struct {
-    client.Client
-    Scheme *runtime.Scheme
-}
-
-// Reconcile：核心入口（KubeRay 同款骨架）
-func (r *AgenticRLTrainJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-    job := &agenticrlv1.AgenticRLTrainJob{}
-    if err := r.Get(ctx, req.NamespacedName, job); err != nil {
-        return ctrl.Result{}, client.IgnoreNotFound(err)   // 已删则忽略
-    }
-
-    // 1. 阶段状态机
-    switch job.Status.Phase {
-    case "", "Pending":
-        return r.createSubResources(ctx, job)             // 建 RayCluster + TrajStore + runner...
-    case "Rollout", "Training":
-        return r.tickTraining(ctx, job)                   // 轮次推进/续训/检查 stopAt
-    case "Evaluating":
-        return r.checkEval(ctx, job)
-    case "Succeeded", "Failed":
-        return ctrl.Result{}, nil                         // 终态：静默
-    }
-
-    // 2. 子资源收敛（幂等：期望 vs 现实）
-    //    - reconcileRayCluster（若不存在则创建，并设 OwnerReference）
-    //    - reconcileTrajStore（Deployment + Service + 可选 LoadBalancer/Ingress）
-    //    - reconcileRunnerHPA（min/max/指标）
-    //    - reconcileExpose（head svc + trajstore svc，写 status.HeadURL/TrajStoreURL）
-
-    // 3. 更新 status（写回 phase/currentStep/readyRunners/...）
-    return ctrl.Result{RequeueAfter: 30 * time.Second}, nil // 定期 tick（配合事件驱动）
-}
+```
+┌──────────────── K8s 集群 ────────────────┐
+│  ┌─────────────────┐  ┌────────────────┐ │
+│  │ RayCluster Head │  │ TrajStore      │ │
+│  │ Service         │  │ Service        │ │
+│  │ (dashboard/提交) │  │ (轨迹数据)      │ │
+│  └────────┬────────┘  └───────┬────────┘ │
+│           │ ClusterIP         │ ClusterIP│
+└───────────┼───────────────────┼──────────┘
+            │                   │
+      ┌─────▼─────┐      ┌──────▼──────┐
+      │ Ingress / │      │ Ingress /   │
+      │ LoadBalancer│    │ LoadBalancer│  ← 公网 URL 自动分配
+      └───────────┘      └─────────────┘
+            │                   │
+        用户看训练面板        用户看轨迹数据
 ```
 
-**配套**：
-- **SetupWithManager**：`ctrl.NewControllerManagedBy(mgr).For(&agenticrlv1.AgenticRLTrainJob{}).Owns(&rayv1.RayCluster{}).Owns(&appsv1.Deployment{}).Complete(r)`——自动 watch 子资源变化触发 reconcile（`Owns` 实现"子资源变了父资源也收敛"）；
-- **Finalizer**：`AddFinalizer`（删除时先清 TrajStore LB/Ingress、删 RayCluster、释放公网 IP）再移除 Finalizer；
-- **RBAC**（controller 的 ClusterRole）：`rayclusters`、`deployments`、`services`、`horizontalpodautoscalers`、`ingresses`、`persistentvolumeclaims`、`secrets` 的 get/list/watch/create/update/patch/delete；
-- **生成工具**：`kubebuilder` / `operator-sdk` 脚手架（`kubebuilder create api --group agenticrl --version v1 --kind AgenticRLTrainJob`），自动生成 CRD 清单与 RBAC。
+**Operator 要做的事**：作业 CR 被创建时，`reconcile` 里**并行**创建这两个 Service/Ingress，把分配到的公网 URL 写回 `status`；作业删除时用 **Finalizer** 先释放公网资源（Ingress/LB）再删集群，避免留下悬空的 LB 计费。
 
-### 3. 具体数值样例
-
-- 首次 reconcile：建 RayCluster（KubeRay Operator 再收敛 head/worker）→ 建 TrajStore Deployment + Service → 建 runner Deployment + HPA → 更新 status `phase: Creating`；
-- `stopAt` 到达：reconcile 检测时间 → 停止 rollout、进入 Evaluating → 评估完成写 `lastEval` → `phase: Succeeded`；
-- 手动删 CR：Finalizer 清理（释放公网 LB）→ 移除 Finalizer → 级联删除所有子资源。
-
-> 面试一句话总结：**最小训练 Operator = 标准 reconcile：按 phase 状态机推进（Pending→Rollout→Training→Evaluating→终态），幂等收敛子资源（RayCluster/TrajStore/runner/HPA），Owns 注册子资源触发，Finalizer 保证删除清理（先释放公网链路再删集群）——Kubebuilder 脚手架 + controller-runtime，与 KubeRay 同构。**
+**面试表述**："轨迹数据的公网访问不是'开个端口'，而是**作业级生命周期管理**——Operator 在作业运行态并行建两条链路（RayCluster Head 给训练面板、TrajStore 给轨迹数据），把公网 URL 写回 CR status，删除时用 Finalizer 有序回收。这里的关键设计是**两条链路的生命周期必须和作业绑定**，否则作业删了 LB 还在计费。"
 
 ---
 
-## 24. CRD 作业生命周期：从提交到完成的完整时序
+## 8. 大规模集群的真实案例（能直接引用的硬数字）
 
-### 1. 现有问题
+前面讲的是"怎么配"。这一节是**别人在真集群上跑出来的数字和踩过的坑**——面试里讲这些，比讲 YAML 更显深度。
 
-一个 AgenticRL 训练作业从提交到完成的完整时序，把前面所有内容串起来。
+### 8.1 五组必背的硬数字
 
-### 2. 方法论（完整时序）
-
-```text
-① 用户 kubectl apply -f humanevalfix-spec-run1.yaml（AgenticRLTrainJob CR）
-② apiserver：认证 → RBAC → ValidatingWebhook（校验字段）→ 写 etcd → watch 广播
-③ AgenticRLTrainJob Operator：watch 到新 CR → reconcile
-   ├─ phase: Pending → 建子资源（幂等）：
-   │    ├─ RayCluster CR（KubeRay Operator 再收敛 head/worker Pod）
-   │    ├─ TrajStore Deployment + Service（exposeTrajStore=true → LoadBalancer/Ingress）
-   │    ├─ runner Deployment + HPA
-   │    └─ PVC / Secret / NetworkPolicy
-   └─ status: phase=Creating, headUrl/trajStoreUrl 填充
-④ KubeRay Operator：watch RayCluster → 建 head/worker → head Service → 集群 ready
-   （实习：并行创建 Head 与 TrajStore 两条链路，公网 URL 写回 status）
-⑤ 训练循环（AgentLightningTrainer 在 Ray head 上）：
-   rollout（runner 从 store 取任务）→ span 入库 → VERL 更新权重 → vLLM 热更新
-   → status.currentStep 每步 +1（Operator 定期 tick 同步）
-⑥ stopAt / rounds 达到 → phase=Evaluating → 官方评估 → status.lastEval
-⑦ phase=Succeeded → 可选保留 TrajStore 数据（TTL）→ 删除作业 → Finalizer 清理
-```
-
-**关键点**：
-- **两层 Operator 协作**：作业 Operator（管作业层）owns RayCluster CR（管集群层），各自 reconcile 各自职责；
-- **状态机幂等**：任何一步失败，reconcile 重试（指数退避），从 status 恢复；
-- **可观测**：`kubectl get agenticrltrainjob -w` 实时看 phase/step；Events 记录关键动作；
-- **与 verl 训练脚本对应**：CR 的 `rounds/stopAt/resume` 对应 `run_loop_opt.sh` 的 `ROUNDS/STOP_AT/START_ROUND`；`speculative` 配置对应 `speculative_config` JSON。
-
-### 3. 具体数值样例
-
-- 作业"humanevalfix-spec-run1"：25 轮 GRPO + EAGLE-3 + 双机，7:11:40 完成——CR 上看到 `currentStep: 25/25, lastEval.passRate: 83.23%`；
-- 中途节点故障：runner Pod 重建（Deployment 收敛），训练从 checkpoint 续（resume=true），CR 状态不丢；
-- 删除作业：Finalizer 先释放 TrajStore 公网 IP → 删 RayCluster（KubeRay Finalizer 再清 head/worker）→ 清 CR——**两级 Finalizer 有序清理**。
-
-> 面试一句话总结：**训练作业生命周期 = 提交 CR → 作业 Operator 建子资源（RayCluster/TrajStore/runner/HPA + 网络链路）→ KubeRay Operator 收敛集群 → 训练循环推进（status.currentStep 实时同步）→ 评估 → 终态；两层 Operator + 幂等状态机 + Finalizer 有序清理，让"7 小时的训练作业"变成可声明、可观测、可续训、可审计的 K8S 资源。**
-
----
-
-# 六、面试问答与速查
-
-## 25. 高频追问速答
-
-**Q1：Pod 的生命周期与探针？**
-Pending→Running→Succeeded/Failed；CrashLoopBackOff（反复崩溃）；探针：liveness（存活，失败重启）、readiness（就绪，失败摘除 Service）、startup（启动保护，慢启动容器）。
-
-**Q2：etcd 怎么保证一致性？**
-Raft 共识：多数派（2N+1 节点容忍 N 故障）写入；线性一致性读（可选）；apiserver 是唯一写入口，天然串行化。
-
-**Q3：Deployment 滚动更新原理？**
-新旧两个 RS：maxSurge（额外起的）、maxUnavailable（允许不可用的），逐个替换；`kubectl rollout undo` 回滚到历史 revision。
-
-**Q4：Service 的负载均衡怎么实现的？**
-kube-proxy 两种模式：iptables（随机 DNAT，规则多时性能差）、ipvs（内核态 LB，支持轮询等算法）；EndpointSlice 维护后端 Pod 列表。
-
-**Q5：Operator 和 Helm 的区别？**
-Helm 是"打包/渲染模板"（安装时一次性）；Operator 是"运行时持续收敛"（CR 变化驱动 reconcile）；两者互补（Helm 装 Operator，Operator 管应用）。
-
-**Q6：为什么训练用 KubeRay 而不是原生 K8S Job？**
-训练需要 Ray 的分布式运行时（GCS/调度/actor 资源组/对象存储），K8S Job 只给"进程组"；KubeRay 把两者桥接：K8S 管生命周期/网络/GPU，Ray 管分布式执行/容错/扩缩容。
-
-**Q7：CRD 的 status 子资源有什么用？**
-spec 与 status 分离：用户只写 spec（期望），Operator 写 status（现实）；避免用户误改 status、支持条件等待（watch status 变化）。
-
-**Q8：Finalizer 卡住怎么办？**
-`kubectl patch <res> -p '{"metadata":{"finalizers":[]}}' --type=merge` 强制移除（危险，生产慎用）；正常应等 Operator 清理完成。
-
-**Q9：GPU 在 K8S 里怎么分配？**
-设备插件（DaemonSet）上报扩展资源 `nvidia.com/gpu`；Pod `limits` 声明；scheduler 按节点可用数分配；多卡用 `nvidia.com/gpu: 8` + 显存/算力调度（MIG/时间片可选）。
-
-**Q10：分离式训练中"环境/推理/训练解耦"在 K8S 怎么体现？**
-三个独立工作负载（runner=环境+agent、vllm=推理、algo=训练），各自 Deployment 独立扩缩容/升级/故障域，只通过 Service 通信——解耦是架构属性，K8S 把它变成部署属性。
-
-## 26. 面试一句话总结（背诵版）
-
-- **K8S 本质**："声明式 + 控制器收敛"——用户写"要什么"，apiserver 存期望，控制器让现实向期望收敛；
-- **架构**：控制面（apiserver/etcd/scheduler/controller-manager）+ 数据面（kubelet/kube-proxy/CRI/CNI/CSI）；
-- **工作负载**：Deployment（无状态）/StatefulSet（有状态）/DaemonSet（系统）/Job（批任务）；
-- **网络**：CNI 发 IP、kube-proxy 做 Service、Ingress 管 7 层、NetworkPolicy 管隔离；
-- **扩展**：CRD 定义资源、Operator（reconcile）实现领域逻辑、Webhook 拦截注入；
-- **KubeRay**：RayCluster/RayJob/RayService 四 CRD + Operator，声明式管 Ray 集群；
-- **分离式 agent-lighting 在 K8S**：store/algo/runner 各一个工作负载，两个 HTTP 面（4747/8000）用 Service 打通，runner HPA 弹性，TrajStore 可 LoadBalancer 公网暴露；
-- **训练作业 CRD**：spec 期望 + status 现实，两层 Operator（作业层 + KubeRay 集群层）协作，Finalizer 有序清理，断点续训。
-
----
-
-# 附：速查表
-
-## K8S 资源速查
-
-| 资源 | kind | 一句话 |
+| 公司 / 来源 | 规模与数字 | 值得注意的点 |
 |---|---|---|
-| 最小调度单元 | Pod | 共享网络/存储的容器组，临时 |
-| 无状态应用 | Deployment→RS→Pod | 滚动更新/回滚 |
-| 有状态应用 | StatefulSet | 稳定身份/稳定存储/有序部署 |
-| 系统组件 | DaemonSet | 每节点一个 |
-| 批任务 | Job/CronJob | 跑完即结束/定时 |
-| 服务入口 | Service/Ingress | 4 层 LB / 7 层路由 |
-| 配置/密钥 | ConfigMap/Secret | 键值注入 |
-| 存储 | PV/PVC/StorageClass | 持久化 + 动态供给 |
-| 身份/授权 | SA/Role/ClusterRole/Binding | RBAC |
-| 弹性 | HPA | 按指标扩缩容 |
-| 自定义资源 | CRD/CR | 定义/实例 |
-| 领域逻辑 | Operator | CRD+reconcile |
-| 拦截 | Mutating/ValidatingWebhook | 改/拒请求 |
+| **Uber**（第一方） | *"we run **several hundreds of Ray clusters at a time**"*；*"**1.5- to 4-times improvement in training speed**"* | 因为用 host networking，**不用 K8s Service 做 head 发现**，而是**自研 init container**；治理策略是"**准入通过但 25 分钟还没调度上就杀掉**"（防止资源被长期占住） |
+| **Microsoft AI RELAY**（GCS 瓶颈的最强证据） | actor 创建 **42.6s @8k → 89.4s @32k**；P99 RPC **18.3s → 55.3s**；优化后 **32.7–34.5s（2.85×）/ ~3.6s（16.4×）** | **集群越大，GCS 越成为瓶颈**——这是"Ray 的 GCS 是单点"的量化证明 |
+| **Anyscale 10k 节点** | PG ready **303×@10k**、**6.5×@2k** 启动 actor；**10k 节点 40,000 actor**；**GCS 主线程空转 61%（2.51）→ 38%（nightly）**；syncer **200s**；**发布锁占调度循环 17.4%** | "GCS 主线程空转 61%"是很有冲击力的数字——说明 GCS 大量时间在空转而非干活 |
+| **NVIDIA Nemotron 3 Ultra** | 550B 总参 / 55B 激活、**>20T tokens**、**>3,000 GPU on Ray Core**；GB300 在**同一 NVLink 域内放置 → RL 迭代吞吐 +13%（零硬件改动）** | "纯调度优化 +13%"说明**放置策略（placement）本身就是性能变量** |
+| **Capital One**（唯一 KubeRay + Ray Data + Ray Train + RayTune 全套数字） | 500M+ 记录 / 3.5TB / 512 timesteps；**单 epoch 32 小时且瓶颈在数据加载**；**TorchTrainer 64 GPU worker**；200 并发 HPO；**3–5 天 → ~4 小时（16×）**；**no S3 hand-off** | **瓶颈在数据加载不在 GPU** —— 这是大规模训练最常被忽略的一类瓶颈 |
 
-## KubeRay 速查
+### 8.2 其他可引用案例
 
-| CRD | 用途 | 关键字段 |
-|---|---|---|
-| RayCluster | 声明 Ray 集群 | headGroupSpec / workerGroupSpecs / enableInTreeAutoscaling |
-| RayJob | 跑任务 | rayClusterSpec + entrypoint + shutdownAfterJobFinishes |
-| RayService | Serve 应用 | rayClusterConfig + serveConfigV2 |
-| RayCronJob | 定时任务 | schedule + rayJobSpec |
-
-## 简历亮点 ↔ 本文章节映射
-
-| 实习亮点 | 对应章节 |
+| 来源 | 数字 / 要点 |
 |---|---|
-| AgenticRL 训练作业（Kubernetes CRD 资源） | 第 7、21~24 点（CRD/Operator/作业设计） |
-| 基于 Ray 分布式框架的管控面 | 第 13~16 点（KubeRay）+ `Ray.md` |
-| 并行创建 RayCluster Head 和 TrajStore 两条网络访问链路 | 第 20 点（双链路） |
-| TrajStore 公网 URL 自动暴露与生命周期管理 | 第 19~20 点（Service/LB/Ingress/Finalizer） |
-| 分离式 RL（agent 任意位置部署、仅填 TrajStore 地址） | 第 17~19 点（三件套 K8S 化） |
-| 昇腾 NPU 单/双机全链路 | `Communication.md`（HCCL/HCCS/RoCE）+ `Parallel.md` |
+| **腾讯**（中文第一方，最详细的超大规模工程叙事） | 单个 Ray 集群 **>10,000 GPU**；联邦了上百个 K8s 集群；**Virtual Kubelet 在 >100 节点时失效** |
+| **Spotify** | Ray **2.2.0**、每 Pod **15 CPU / 48Gi**、T4、**一个 worker 一个 GKE 节点**；**镜像拉取从分钟级降到秒级** |
+| **Pinterest**（Ray Data 调优阶梯，很实用） | **880k → 4M examples/s**；**第一次上 Ray 只有 1.1M，比单机还差**；靠 **zstd 对象存储 patch 减少 >10× 传输**、**单缓冲把 unpickle 从 400ms 降到 <20ms** |
+| **ByteDance**（抢占场景） | 唯一公开的 actor_pool 抢占修复：**`actor_pool` 里的 actor 设 `max_restarts=0`** |
+| **Alpa** | **1024×A100 训练 175B**，**57.5% MFU / 179 TFLOPs/GPU** |
+
+### 8.3 坑清单（全部带 issue 号，面试追问时能报出来）
+
+| 坑 | issue / 现象 |
+|---|---|
+| **GCS 内存泄漏** | ~598KB/h 持续泄漏（#45338） |
+| **head OOM** | 内存涨到 11.4GB 被 OOMKill，**而且加内存反而更快挂**（#64241） |
+| **actor handle 解析风暴** | 15.8M 次解析（#65782） |
+| **KubeRay 写死 200m CPU** | 卡在 worker 启动的关键路径上（#5138） |
+| **object store 默认吃 30% 内存** | 且上限 200GB——大内存机器上这是浪费 |
+| **driver RSS 线性泄漏** | 且不可调优（#66016） |
+| **Volcano gang 在 suspend 时泄漏队列资源** | #4939 |
+| **scheduler-plugins 的 PodGroup 只建不更新** | 导致**扩容失效**（#5205） |
+| **autoscaler hang** | 导致 **180+ Pod 空转 14 小时**（#60566） |
+| **head 永不缩容** | 设计如此（#4768）——head 是常驻的 |
+
+**本地 Kuberay benchmark 的真实数字**（`kuberay/benchmark/perf-tests/*/results/junit.xml`，GKE + KubeRay v1.1.1）：
+
+| 操作 | 耗时 |
+|---|---|
+| 10,000 个 RayCluster（= **40,000 Pod**）总耗时 | **6459s** |
+| 创建 10,000 CR | 88.8s |
+| 等全部 ready | 1515s |
+| **镜像预热** | **1613s（占比最大）** |
+
+**结论**：**规模化的瓶颈不在"创建 CR"（88.8s），而在"等 ready + 镜像预热"（3128s，占 48%）**——这直接解释了为什么 KubeRay 要做 **`podpool`（预热 Pod 池）**：把镜像和运行时准备好，任务来了直接接管。
+
+### 8.4 ⚠️ 引用这些材料时**不能编**的东西（负面清单）
+
+调研中明确确认的"不存在"：
+
+1. **没有任何一家公司同时公布过「节点数 + GPU 型号卡数 + 网络 + 并行策略 + tokens/s + 版本」**——都是零零散散的；
+2. **`tokens/s/GPU` 从未被任何组织或 Ray Summit 公布过**；
+3. **没有任何组织公布过自己的 RayCluster YAML**；
+4. **没有任何组织提过 `NCCL_IB_DISABLE` / `NCCL_SOCKET_IFNAME` / `NCCL_DEBUG` / `NCCL_ALGO` / `NCCL_IB_HCA`**——所以"大厂在 KubeRay 上怎么配 NCCL"没有公开答案（我前面写的 NCCL 建议是从"多网卡 + RDMA"的通用工程实践推的，**不是**引用的公开案例）；
+5. `ray.io/blog` **404**；**不存在** KubeRay production guidance 页；
+6. **OpenAI 的 7,500 节点 K8s 与 Ray 无关**（那是 MPI/SSH 方案）——别拿它当 KubeRay 案例；
+7. **Ray 官方 K8s 文档里完全没有 sysctl / swap / kernel 参数**——我第 1 节写的那些是标准 K8s 节点前置要求（来自 K8s 侧一般实践），**不是** Ray 官方要求。
+
+> 面试一句话总结：**大规模集群的硬数字是——Uber 同时跑几百个 Ray 集群、训练速度提升 1.5~4×；Microsoft AI RELAY 证明 GCS 是大集群瓶颈（actor 创建 42.6s@8k→89.4s@32k，P99 RPC 18.3s→55.3s）；Anyscale 10k 节点 40,000 actor、GCS 主线程空转 61%；NVIDIA 3,000+ GPU 上纯放置优化让 RL 吞吐 +13%；Capital One 16× 提速但瓶颈在数据加载。规模化真正的成本在"等 ready + 镜像预热"（本地 benchmark：10,000 集群 40,000 Pod 总 6459s，其中预热 1613s）——这才是 podpool 存在的理由。**
+
+---
+
+## 9. 大规模集群的坑与调优清单
+
+| 类别 | 坑 | 解法 |
+|---|---|---|
+| **调度** | 8 个 Pod 起 7 个，剩下的 Pending，已起的空转 | **gang scheduling**（Volcano/KAI/YuniKorn/coscheduling） |
+| **调度** | 一个 8 卡 Pod 调度不上（机器被碎片占用） | `podAntiAffinity` + `hostname` 让 Pod 独占机器；或整机预留 |
+| **显存/资源** | Pod 起来了但 Ray 看不到 GPU | 检查 `nvidia.com/gpu` 是否被 device plugin 暴露、`limits` 是否写了 GPU |
+| **通信** | 多机 NCCL 带宽远低于线速 | `NCCL_SOCKET_IFNAME` 指定网卡；确认 RDMA/IB 可用；`/dev/shm` 挂够 |
+| **共享内存** | 训练进程 `Bus error` / 随机崩 | `/dev/shm` 默认 64MB，必须 `emptyDir{medium: Memory}` 放大到几十 GB |
+| **内存** | Pod 被 OOMKilled | Ray object store 默认吃 30% 容器内存，训练还要用；把 memory 给足或调 `--object-store-memory` |
+| **存储** | checkpoint 随 Pod 消失 | `emptyDir` 换成 PVC 或对象存储 CSI |
+| **冷启动** | 拉镜像 + 装依赖几分钟 | **podpool 预热池**；或提前 `docker pull`（`uniagent-lighting` 实测："`docker run` 隐式拉镜像超 120 秒会被判超时，先 pull 再跑"） |
+| **长跑** | 训练跑几小时，head 是单点 | 关注 GCS FT（新方案是 `embedded-gcs-ft`，Redis 方案已标记废弃）；训练侧靠 checkpoint 续训 |
+| **弹性** | 训练任务被 autoscaler 缩容 | 训练任务 `maxReplicas = replicas`（不设弹性） |
+| **安全** | Dashboard/Client 端口裸暴露 | 只走 ClusterIP，或配 `auth` + `tls/mtls` + NetworkPolicy |
+| **可观测** | 卡住不知道卡在哪 | `ray-cluster.py-spy.yaml` 注入 py-spy；Dashboard + Prometheus + Grafana |
+
+**一个很实用的排障顺序**（从外到内）：
+
+```
+① kubectl get pods            → Pod 起来了没？状态是什么（Pending/ImagePullBackOff/CrashLoop）？
+② kubectl describe pod        → 调度失败原因（资源不足/亲和性冲突/污点）
+③ kubectl logs <pod> -c ray-head  → Ray 启动日志（GCS 连不上、版本不匹配都在这）
+④ kubectl exec ... -- ray status  → Ray 自己看到的资源与 demand
+⑤ Dashboard / py-spy          → 进到任务内部看谁在卡
+```
+
+**环境变量的一个硬坑**（`uniagent-lighting` 实测记录，很有代表性）：
+
+> **"Ray worker 的环境变量在 `ray start` 时固定，不继承训练脚本内的 `export`。凡 agent/沙箱/Gateway 运行需要的变量，必须在 `ray start` 之前 `export`，否则 Ray task 内拿不到。"**
+
+排查现场是"`E2B_API_KEY` 未传入，24 个会话全部 `AuthenticationException`"——**类型症状是"任务全失败但代码逻辑没错"，根因是环境变量没进 Ray 运行时**。在 K8s 上对应的做法是：**环境变量必须写在 Pod spec 的 `env` 里**（因为我们没法控制 Operator 内部 `ray start` 的时机），而不是靠 entrypoint 里 `export`。
+
+---
+
+### 9.1 四个容易漏但很关键的点
+
+**① Ray 的日志不写 stdout，写 `/tmp/ray/session_latest/logs`。**
+
+所以 **`kubectl logs` 默认看不到 Ray 的业务日志**（只能看到 `ray start` 那几行）。官方 helm values 里甚至把这个路径拼错成 `session_latests`。**解法**：给 `/tmp/ray` 挂卷（否则 Pod 重建日志就没了）+ 用 FluentBit sidecar 收集（样例 `ray-cluster.fluentbit.yaml`）。
+
+**② KubeRay 会自动注入 `ulimit`。**
+
+官方文档原文：*"If you don't set the annotation, **KubeRay automatically injects the `ulimit` command into the container**"*（`ulimit -n 65536`）。所以"文件描述符不够导致大量连接失败"这个问题**默认已经被处理**；要改得用 annotation 覆盖。
+
+**③ gang scheduling 的开关就是一个 label。**
+
+```
+ray.io/gang-scheduling-enabled: "true"
+```
+
+**Volcano 的 PodGroup 由 operator 自动创建**（不需要你手写），命名 `ray-<name>-pg`，**size = desiredReplicas（或 minReplicas）+ 1**——那个 **+1 是给 head 留的**。这个细节能体现"真的读过源码"。
+
+**④ Autoscaler 的 RBAC 是 per-cluster 动态创建的（最小权限的好例子）。**
+
+Operator 会为**每个 RayCluster 动态建一个同名 namespaced Role**，只给：`pods` 的 `get/list/watch/patch`、`pods/resize` 的 `patch`、`rayclusters` 的 `get/patch`，然后绑到 **head 的专用 ServiceAccount**。即：autoscaler 只能改"自己这个集群"的副本数，动不了别的集群——**这就是"每个集群一套凭证"的最小权限设计**。
+
+**⑤ v1.7 的升级能力：只支持改 `replicas`。**
+
+官方文档明确：*"only modifications to the **`replicas`** field in RayCluster/RayJob CR are supported"*。想改镜像/资源/命令，得**重建集群**。v1.7 为此新增了 `upgradeStrategy.type: Recreate`——它的实现很巧：**哈希时排除 `replicas` 和 `workersToDelete`**（这样单纯扩缩容不会触发重建），**且 KubeRay 自身版本变化时跳过重建**（避免升级 Operator 就把所有集群重建一遍）。
+
+---
+
+## 10. 速查表
+
+### 端口
+
+| 端口 | 用途 |
+|---|---|
+| **6379** | GCS（Ray 全局控制面） |
+| **8265** | Ray Dashboard |
+| **10001** | Ray Client / Job 入口 |
+| **4747** | agent-lightning LightningStore 的 HTTP API |
+
+### 常用命令
+
+```bash
+# 安装
+helm install kuberay-operator kuberay/kuberay-operator
+kubectl create -k "github.com/ray-project/kuberay/ray-operator/config/default?ref=v1.1.0&timeout=90s"
+
+# 起集群 / 看状态
+kubectl apply -f ray-cluster.complete.yaml
+kubectl get raycluster,rayjob,rayservice
+kubectl get pods -l ray.io/cluster=<name>
+kubectl exec -it <head-pod> -- ray status
+
+# Dashboard
+kubectl port-forward svc/<cluster>-head-svc 8265:8265
+
+# 提交任务
+kubectl apply -f my-rayjob.yaml
+kubectl get rayjob <name> -o jsonpath='{.status.jobStatus}'
+
+# 排障
+kubectl -n kuberay-system logs deploy/kuberay-operator -f
+kubectl describe pod <pod>
+kubectl logs <pod> -c ray-head
+```
+
+### 四种 CRD 的定位
+
+| CRD | 用途 | 生命周期 |
+|---|---|---|
+| **RayCluster** | 一个 Ray 集群 | 手动建/删（或 CRD 删除） |
+| **RayJob** | 一次性任务（建集群→跑→回收） | 任务结束按 `shutdownAfterJobFinishes`/`ttlSecondsAfterFinished` 处理 |
+| **RayService** | 在线服务（Ray Serve + 零停机升级） | 常驻 |
+| **RayCronJob** | 定时任务 | 按 cron 周期 |
+
+### 本地样例文件速查（`kuberay/ray-operator/config/samples/`）
+
+| 我想做的事 | 看哪个样例 |
+|---|---|
+| 最完整的 RayCluster 参考 | `ray-cluster.complete.yaml` |
+| 自动扩缩容 | `ray-cluster.autoscaler.yaml` / `autoscaler-v2.yaml` |
+| **跑 verl 训练** | `ray-cluster.verl.yaml` |
+| 多机大规模（TPU） | `ray-cluster.tpu-v6e-256-multihost.yaml` |
+| gang scheduling | `volcano-scheduler` / `kai-scheduler` / `yunikorn-scheduler` / `scheduler-plugins` |
+| 提交任务（三种模式） | `ray-job.sample.yaml` / `interactive-mode` / `use-existing-raycluster` |
+| 在线推理 | `ray-service.llm-serve.yaml` / `deepseek.yaml` |
+| 监控 | `embed-grafana` / `fluentbit` / `py-spy` |
+| 安全 | `auth` / `tls` / `mtls` / `network-policy-deny-all` |
+| 容器沙箱（agent 场景） | `ray-cluster.sandbox.yaml` / `agent-sandbox/` |
+| vLLM 示例 | `vllm/` 目录 |
+
+---
+
+## 附：高频追问速答
+
+**Q1：KubeRay Operator 到底做了什么？**
+一个 controller-runtime 的 reconcile loop：watch `RayCluster`/`RayJob`/`RayService`/`RayCronJob` 四类 CRD，按 spec 创建/删除 head Pod、worker Pod、Service、ConfigMap，把实际状态写回 `status`。所以"改 YAML 就能改集群"的能力在 Operator 里，不在 K8s 本身。
+
+**Q2：为什么生产上建议"少而大的 Ray Pod"？**
+Ray 的调度是**节点级**的，一个 Pod = Ray 眼里的一个 node。Pod 切太碎会让 Ray 看到几百个"小节点"，调度开销上升、对象跨节点传输概率上升。样例注释原话："It is better to use a few large Ray pod than many small ones."
+
+**Q3：多机训练为什么必须 gang scheduling？**
+8 个 Pod 要 8 张卡，如果只剩 7 台机器，默认调度器会让 7 个起来、1 个 Pending——已起的 7 个占着 GPU 死等，整个集群被这个任务锁死。gang scheduling（Volcano/KAI/YuniKorn/coscheduling）保证"要么全起、要么全等"。
+
+**Q4：`/dev/shm` 为什么要挂？**
+NCCL 和多进程共享内存都走 `/dev/shm`，容器默认只有 64MB，训练时会 `Bus error` 或随机崩。解法是 `emptyDir: {medium: Memory, sizeLimit: 64Gi}` 挂到 `/dev/shm`。
+
+**Q5：RayJob 和直接 apply RayCluster 有什么区别？**
+RayCluster 只管"建集群"；RayJob 把"建集群 → 跑 entrypoint → 按策略回收"打包，并跟踪 `jobStatus` 状态机（PENDING/RUNNING/SUCCEEDED/FAILED）。跑任务用 RayJob，调环境用 RayCluster。
+
+**Q6：RayJob 的三种提交模式？**
+① 默认（K8sJob 模式）：entrypoint 包成 K8s Job 跑，集群随任务生灭；② `Interactive`：把 entrypoint 提交给 Ray 自己的 Job Submission API，同一集群可并存多个 job；③ `clusterSelector`：复用已有集群，不新建。
+
+**Q7：autoscaler 扩容的本质是什么？**
+autoscaler sidecar（跑在 head Pod 里）读 Ray 层面的 resource demand，然后**改 `RayCluster.spec.workerGroupSpecs[].replicas`**，再由 Operator 建 Pod——两级 reconcile 协作。所以扩容是"改 CR"而不是"直接建 Pod"。
+
+**Q8：为什么训练任务不该开 autoscaler？**
+训练不能"缩到一半"（gang scheduling 要求整组就绪），弹性只适合无状态任务（推理、数据生成、rollout）。训练任务应设 `maxReplicas = replicas`。
+
+**Q9：怎么定位"训练卡住"？**
+顺序：`kubectl get pods` → `describe pod` → `logs -c ray-head` → `exec -- ray status` → Dashboard → **`ray-cluster.py-spy.yaml` 注入 py-spy dump 所有 rank 的栈**（定位 NCCL 死锁的标准手段）。
+
+**Q10：环境变量为什么不生效？**
+**Ray worker 的环境变量在 `ray start` 时固定，不继承训练脚本里的 `export`。** 必须写在 Pod spec 的 `env`（或 `rayStartParams` 之前的启动脚本）里。实测症状是"任务全失败但代码没错"（如 24 个会话全部 `AuthenticationException`，根因是 API key 没传进 Ray 运行时）。
